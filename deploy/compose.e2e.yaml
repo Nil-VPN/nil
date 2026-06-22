@@ -95,6 +95,9 @@ services:
     command: ["sleep", "infinity"]
     environment:
       - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+      # The Portal/Coordinator are reached over plaintext http on this trusted private bridge;
+      # opt into an insecure control plane (dev/test only — production requires https/loopback).
+      - NW_INSECURE_CONTROL_PLANE=1
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun"]
     depends_on: [portal, coordinator, entry, middle, exit]

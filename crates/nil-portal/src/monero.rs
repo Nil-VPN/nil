@@ -101,20 +101,10 @@ pub fn parse_confirmed(
 /// (Digest `--rpc-login` for a genuinely remote wallet is a follow-up — it needs challenge/response
 /// auth reqwest doesn't do natively; loopback binding is the real mitigation today.)
 pub fn validate_rpc_url(url: &str) -> anyhow::Result<()> {
-    let u = url.trim();
-    let (scheme, rest) = u
-        .split_once("://")
-        .ok_or_else(|| anyhow::anyhow!("NW_MONERO_RPC must be an http(s) URL"))?;
-    let host = rest.split(['/', ':']).next().unwrap_or("");
-    let is_loopback =
-        host == "localhost" || host == "::1" || host.starts_with("127.");
-    if scheme.eq_ignore_ascii_case("https") || is_loopback {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "refusing plaintext monero-wallet-rpc to non-loopback host {host:?}: bind the wallet to \
-         loopback or use https — the RPC is unauthenticated"
-    )
+    // Shared guard (exact-host loopback check — not a `127.` prefix match, which a host like
+    // `127.0.0.1.evil.com` would have slipped past). The RPC is unauthenticated, so a plaintext
+    // non-loopback endpoint is an exposure: bind the wallet to loopback or front it with TLS.
+    nil_core::net::require_tls_or_loopback(url).map_err(|e| anyhow::anyhow!("NW_MONERO_RPC: {e}"))
 }
 
 /// Watches a self-hosted `monero-wallet-rpc`: a background loop polls `get_transfers` and marks

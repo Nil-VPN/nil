@@ -10,6 +10,8 @@
 //! blinded locally, so the Portal's signature cannot be linked to the token the Coordinator later
 //! sees (Pillar 4). Nothing identifying is printed — only the opaque token bytes.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use nil_crypto::token;
 use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
@@ -18,15 +20,22 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// Decode hex, operating on BYTES (not `&str` indexing) so a malformed multi-byte response field
+/// returns an error instead of panicking on a codepoint boundary.
 fn unhex(s: &str) -> Result<Vec<u8>> {
-    let s = s.trim();
-    if s.len() % 2 != 0 {
+    let b = s.trim().as_bytes();
+    if b.len() % 2 != 0 {
         anyhow::bail!("odd-length hex");
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).context("invalid hex"))
-        .collect()
+    fn nib(c: u8) -> Result<u8> {
+        match c {
+            b'0'..=b'9' => Ok(c - b'0'),
+            b'a'..=b'f' => Ok(c - b'a' + 10),
+            b'A'..=b'F' => Ok(c - b'A' + 10),
+            _ => anyhow::bail!("invalid hex"),
+        }
+    }
+    b.chunks_exact(2).map(|p| Ok((nib(p[0])? << 4) | nib(p[1])?)).collect()
 }
 
 #[tokio::main]
@@ -35,7 +44,18 @@ async fn main() -> Result<()> {
     let payment_id =
         std::env::var("NW_PAYMENT_ID").context("NW_PAYMENT_ID (a confirmed payment id) is required")?;
     let portal = portal.trim_end_matches('/');
-    let http = reqwest::Client::builder().build().context("build http client")?;
+    // The blinded request, the blind signature, and the payment id are sensitive — never send them
+    // in cleartext to a non-loopback Portal. Require TLS unless loopback, or an explicit dev opt-in.
+    if !nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
+        nil_core::net::require_tls_or_loopback(portal)
+            .map_err(|e| anyhow::anyhow!("NW_PORTAL_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local network)"))?;
+    }
+    // Bound the round-trips so a hung Portal can't block provisioning forever.
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build http client")?;
 
     // 1. Fetch the issuer's public key (needed to blind locally).
     let pk: PubKeyResponse = http

@@ -81,8 +81,13 @@ fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
 }
 
 /// Whether the environment configures a real node/path (vs. nothing → the GUI uses loopback).
+/// Includes `NW_COORDINATOR_URL` (the production source): `from_env` treats it as the
+/// top-priority path source, so the GUI must not silently fall back to the loopback mock when
+/// only the Coordinator URL is set.
 pub fn is_configured() -> bool {
-    std::env::var("NW_NODE_HOST").is_ok() || std::env::var("NW_PATH").is_ok()
+    std::env::var("NW_NODE_HOST").is_ok()
+        || std::env::var("NW_PATH").is_ok()
+        || std::env::var("NW_COORDINATOR_URL").is_ok()
 }
 
 /// The pinned attestation expectation (`NW_EXPECTED_MEASUREMENT` hex + `NW_EXPECTED_TEE`).
@@ -151,8 +156,10 @@ pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
     // Fail-closed by default: a MASQUE hop with no pinned measurement refuses to connect unless
-    // NW_ALLOW_UNATTESTED is explicitly set (dev/loopback only). See `MasqueConfig::allow_unattested`.
-    let allow_unattested = std::env::var("NW_ALLOW_UNATTESTED").is_ok();
+    // NW_ALLOW_UNATTESTED is explicitly TRUE (dev/loopback only). `env_flag` accepts only "1"/"true"
+    // — so `NW_ALLOW_UNATTESTED=0` keeps the gate ON (not the `is_ok()` footgun where any value,
+    // including `0`, would loosen it). See `MasqueConfig::allow_unattested`.
+    let allow_unattested = nil_core::net::env_flag("NW_ALLOW_UNATTESTED");
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
     // Path priority: (1) redeem a Privacy Pass token at the Coordinator for a real, per-hop-attested
