@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let (transport, cfg) = launch::from_env()?;
+    let (transport, cfg) = launch::from_env().await?;
     tracing::info!("nil-cli connecting…");
     let tunnel = Tunnel::up(transport, cfg).await?;
     tracing::info!("nil-cli connected — tunnel up. Ctrl-C to disconnect.");

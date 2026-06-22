@@ -79,8 +79,23 @@ async fn main() -> Result<()> {
     // for confirmed transfers), else a dev mock.
     let watcher: Arc<dyn PaymentWatcher> = match std::env::var("NW_MONERO_RPC") {
         Ok(url) => {
-            tracing::info!(%url, "watching self-hosted monero-wallet-rpc for confirmed payments");
-            let w = Arc::new(MoneroRpcWatcher::new(url));
+            // Refuse a plaintext, non-loopback (unauthenticated) wallet-rpc before we ever poll it.
+            monero::validate_rpc_url(&url)?;
+            // Minimum accepted payment, atomic units (1 XMR = 1e12). Unset ⇒ accept any confirmed
+            // amount (dev only) + a loud warning — the founder sets the per-plan price.
+            let min_atomic = match std::env::var("NW_MONERO_MIN_ATOMIC").ok().map(|s| s.parse::<u64>()) {
+                Some(Ok(v)) => v,
+                Some(Err(_)) => anyhow::bail!("NW_MONERO_MIN_ATOMIC must be a u64 of atomic units"),
+                None => {
+                    tracing::warn!(
+                        "NW_MONERO_MIN_ATOMIC unset — accepting ANY confirmed amount (dev only; set \
+                         the per-plan minimum in atomic units, 1 XMR = 1_000_000_000_000)"
+                    );
+                    0
+                }
+            };
+            tracing::info!("watching self-hosted monero-wallet-rpc for confirmed payments");
+            let w = Arc::new(MoneroRpcWatcher::new(url, min_atomic));
             tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
             w
         }

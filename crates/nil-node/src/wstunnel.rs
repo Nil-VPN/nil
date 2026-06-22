@@ -10,6 +10,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Bound on the TLS+WS+preface handshake. A peer that connects and then stalls (slowloris) or
+/// never sends its pubkey preface must not occupy the single-client slot indefinitely.
+const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -34,25 +38,40 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
     let mut tun_buf = vec![0u8; 65535];
 
     loop {
+        // Accept the next connection while staying responsive to ctrl_c.
+        let accepted = tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("nil-node (wstunnel) shutting down");
+                break;
+            }
+            r = listener.accept() => r,
+        };
+        let Ok((tcp, _)) = accepted else { continue };
+
+        // Bound the TLS + WS upgrade so a peer that stalls mid-handshake (slowloris) can't wedge
+        // the node. TLS/WS accept errors are dropped silently — they are attacker-triggerable
+        // (TLS is no-client-auth) and the data plane keeps no connection logs.
+        let upgrade = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
+            let tls = acceptor.accept(tcp).await.ok()?;
+            tokio_tungstenite::accept_async(tls).await.ok()
+        })
+        .await;
+        let ws = match upgrade {
+            Ok(Some(ws)) => ws,
+            _ => continue, // timed out or failed → drop, keep serving
+        };
+
+        // Serve this client to completion (single-client Phase 1), then accept the next — but keep
+        // ctrl_c responsive so a long-lived (or stuck) session never starves shutdown. The preface
+        // read inside `serve` is itself bounded, so a connected-but-silent peer frees the slot.
         tokio::select! {
             biased;
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("nil-node (wstunnel) shutting down");
                 break;
             }
-            r = listener.accept() => {
-                let Ok((tcp, _)) = r else { continue };
-                let tls = match acceptor.accept(tcp).await {
-                    Ok(t) => t,
-                    Err(e) => { tracing::warn!("wstunnel tls accept: {e}"); continue; }
-                };
-                let ws = match tokio_tungstenite::accept_async(tls).await {
-                    Ok(w) => w,
-                    Err(e) => { tracing::warn!("wstunnel ws accept: {e}"); continue; }
-                };
-                // Serve this client to completion (single-client Phase 1), then accept the next.
-                serve(ws, &node_secret, &tun, &mut tun_buf).await;
-            }
+            _ = serve(ws, &node_secret, &tun, &mut tun_buf) => {}
         }
     }
     Ok(())
@@ -68,14 +87,15 @@ async fn serve<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    // Frame 1: the client's WG static pubkey.
-    let client_pub = match recv_binary(&mut ws).await {
-        Some(b) if b.len() == 32 => {
+    // Frame 1: the client's WG static pubkey. Bounded — a peer that completes the WS upgrade but
+    // never sends the preface must not hold the single-client slot forever.
+    let client_pub = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, recv_binary(&mut ws)).await {
+        Ok(Some(b)) if b.len() == 32 => {
             let mut k = [0u8; 32];
             k.copy_from_slice(&b);
             k
         }
-        _ => return, // no/short preface → drop the connection
+        _ => return, // timed out / no / short preface → drop the connection
     };
     let mut core = PqWgCore::without_psk(node_secret.clone(), PublicKey::from(client_pub), 2);
     let (mut sink, mut stream) = ws.split();

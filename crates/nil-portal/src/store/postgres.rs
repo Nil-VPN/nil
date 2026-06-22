@@ -9,21 +9,54 @@
 //! reaches the table; a full database compromise yields no personal identity for an anonymous
 //! account.
 //!
-//! **Transport security is the deployment's responsibility.** [`PgStore::new`] takes an
-//! already-connected `tokio_postgres::Client`, so production wires a rustls TLS connector (e.g.
-//! `tokio-postgres-rustls`, matching the project's TLS standard) before handing the client over.
-//! The convenience [`PgStore::connect`] uses `NoTls` and is for **local/loopback dev only** — it
-//! is documented as such and must not be used across an untrusted network.
+//! **Transport security is enforced, not promised.** The account row key is `account_number =
+//! H(secret)` — the *bearer credential* a client presents — so the link to the DB must never be
+//! plaintext on an untrusted path. [`PgStore::connect`] uses `NoTls` and therefore **refuses any
+//! non-loopback host at runtime** (mirroring `monero::validate_rpc_url`): it is for a co-located
+//! (loopback / unix-socket) database only. A remote/clustered database MUST use [`PgStore::new`]
+//! with an already-`rustls`-TLS-connected `tokio_postgres::Client` (e.g. via `tokio-postgres-rustls`,
+//! the project's TLS standard). There is no code path that sends credentials in cleartext across a
+//! network.
 //!
-//! **Integration status:** compiles and the row↔record mapping is unit-tested; the live-database
-//! query path is exercised against a real Postgres in deployment (no DB image in the build
-//! sandbox), exactly as the file store is the durable default until then.
+//! **Integration status:** compiles, the row↔record mapping and the loopback guard are
+//! unit-tested; the live-database query path is exercised against a real Postgres in deployment
+//! (no DB image in the build sandbox), exactly as the file store is the durable default until then.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_postgres::Client;
 
 use super::{ent_from, ent_str, hex32, unhex32, Store, StoreError};
 use crate::account::model::AccountRecord;
+
+/// Bound every DB round-trip: a reachable-but-stalled database (lock contention, slow failover)
+/// must surface as a clean `Backend` error, not hang the request task indefinitely.
+const DB_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Refuse a `NoTls` connection to anything but a loopback / unix-socket host — credentials must
+/// never cross an untrusted network in cleartext (a remote DB must use [`PgStore::new`] with a
+/// TLS-connected client). Mirrors `monero::validate_rpc_url`.
+pub(crate) fn ensure_loopback_for_notls(conn_str: &str) -> Result<(), StoreError> {
+    let cfg: tokio_postgres::Config = conn_str
+        .parse()
+        .map_err(|e| StoreError::Backend(format!("invalid postgres connection string: {e}")))?;
+    for host in cfg.get_hosts() {
+        if let tokio_postgres::config::Host::Tcp(h) = host {
+            let loopback = h == "localhost"
+                || h.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false);
+            if !loopback {
+                return Err(StoreError::Backend(format!(
+                    "refusing NoTls Postgres connection to non-loopback host {h:?}: co-locate the \
+                     database on loopback, or use PgStore::new(client) with a rustls-TLS-connected \
+                     client for a remote/clustered database"
+                )));
+            }
+        }
+        // Unix-socket (and any future local transport) hosts are local — allowed.
+    }
+    Ok(())
+}
 
 /// The accounts table. Idempotent so `connect` can run it on startup.
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS accounts (\
@@ -49,9 +82,11 @@ impl PgStore {
         Self { client }
     }
 
-    /// Connect over **`NoTls`** (local/loopback dev only — see the module docs) and ensure the
-    /// schema exists. Spawns the connection's background driver task.
+    /// Connect over **`NoTls`** to a **loopback-only** database (see the module docs) and ensure
+    /// the schema exists. Refuses a non-loopback host so credentials are never sent in cleartext
+    /// across a network. Spawns the connection's background driver task.
     pub async fn connect(conn_str: &str) -> Result<Self, StoreError> {
+        ensure_loopback_for_notls(conn_str)?;
         let (client, connection) = tokio_postgres::connect(conn_str, tokio_postgres::NoTls)
             .await
             .map_err(|e| StoreError::Backend(format!("postgres connect: {e}")))?;
@@ -88,10 +123,9 @@ fn from_columns(account_hex: &str, recovery_hex: &str, ent: &str) -> Option<Acco
 impl Store for PgStore {
     async fn insert(&self, record: AccountRecord) -> Result<(), StoreError> {
         let [acct, recovery, ent] = columns(&record);
-        let affected = self
-            .client
-            .execute(INSERT_SQL, &[&acct, &recovery, &ent])
+        let affected = tokio::time::timeout(DB_TIMEOUT, self.client.execute(INSERT_SQL, &[&acct, &recovery, &ent]))
             .await
+            .map_err(|_| StoreError::Backend("postgres insert timed out".into()))?
             .map_err(|e| StoreError::Backend(format!("postgres insert: {e}")))?;
         if affected == 0 {
             return Err(StoreError::Duplicate); // ON CONFLICT DO NOTHING → row already existed
@@ -101,15 +135,20 @@ impl Store for PgStore {
 
     async fn get(&self, account_number: &[u8; 32]) -> Result<Option<AccountRecord>, StoreError> {
         let acct = hex32(account_number);
-        let row = self
-            .client
-            .query_opt(GET_SQL, &[&acct])
+        let row = tokio::time::timeout(DB_TIMEOUT, self.client.query_opt(GET_SQL, &[&acct]))
             .await
+            .map_err(|_| StoreError::Backend("postgres get timed out".into()))?
             .map_err(|e| StoreError::Backend(format!("postgres get: {e}")))?;
         match row {
             Some(row) => {
-                let recovery: String = row.get(0);
-                let ent: String = row.get(1);
+                // try_get (not get) — a non-TEXT/NULL column must fail closed as a Backend error,
+                // not panic the request task (no unwrap-like panics in non-test code).
+                let recovery: String = row
+                    .try_get(0)
+                    .map_err(|e| StoreError::Backend(format!("accounts.recovery_code_hash: {e}")))?;
+                let ent: String = row
+                    .try_get(1)
+                    .map_err(|e| StoreError::Backend(format!("accounts.entitlement: {e}")))?;
                 from_columns(&acct, &recovery, &ent)
                     .ok_or_else(|| StoreError::Backend("malformed row in accounts table".into()))
                     .map(Some)
@@ -144,5 +183,16 @@ mod tests {
         // a silently-wrong record).
         assert!(from_columns("dead", &"1".repeat(64), "active").is_none());
         assert!(from_columns(&"a".repeat(64), &"b".repeat(64), "bogus").is_none());
+    }
+
+    #[test]
+    fn notls_connect_refuses_non_loopback() {
+        // Loopback / localhost / unix-socket are allowed for NoTls; a remote host is refused so
+        // bearer-credential rows never cross a network in cleartext.
+        assert!(ensure_loopback_for_notls("postgres://u@127.0.0.1:5432/db").is_ok());
+        assert!(ensure_loopback_for_notls("postgres://u@localhost/db").is_ok());
+        assert!(ensure_loopback_for_notls("host=/var/run/postgresql user=u dbname=db").is_ok());
+        assert!(ensure_loopback_for_notls("postgres://u@db.internal:5432/db").is_err(), "remote refused");
+        assert!(ensure_loopback_for_notls("postgres://u@10.0.0.5/db").is_err(), "remote IP refused");
     }
 }

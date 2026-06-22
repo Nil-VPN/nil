@@ -8,6 +8,15 @@
 //! Framing: the first WebSocket binary frame is the client's 32-byte WG static pubkey (the
 //! responder needs the initiator's static key up front); every subsequent binary frame is one
 //! WireGuard datagram. WS-over-TLS is reliable + ordered, so no junk/obfuscation codec is needed.
+//!
+//! **PQ status (honest limitation):** this rung currently runs *classical* WireGuard
+//! (`PqWgCore::without_psk`, X25519 only) — it does NOT carry the post-quantum hybrid PSK that the
+//! default MASQUE transport (`PqWgTransport`) does. Unlike the AmneziaWG rung (whose raw-UDP
+//! channel genuinely cannot ship the ~512 KiB McEliece offer), this rung's reliable WS channel
+//! *could* carry the PQ exchange (exactly as `PqWgTransport` does over MASQUE), so the downgrade
+//! here is incidental, not fundamental. TODO: run the PQ hybrid PSK exchange over the WS control
+//! frames before the WG handshake to make wstunnel PQ-by-default like the primary transport. Until
+//! then, treat this last-resort rung as classical-crypto only.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -138,7 +147,9 @@ impl Transport for WstunnelTransport {
         let (mut ws, _resp) =
             tokio_tungstenite::connect_async_tls_with_config(&url, None, false, Some(connector))
                 .await
-                .map_err(|e| Error::Transport(format!("wstunnel connect {url}: {e}")))?;
+                // Don't embed the node endpoint (host:port) in the error — the cascade logs this
+                // string at WARN on step-down, and node IPs must never reach a log line.
+                .map_err(|e| Error::Transport(format!("wstunnel connect failed: {e}")))?;
 
         // Frame 1: our WG static pubkey. Then the WireGuard handshake as binary frames.
         let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
@@ -206,6 +217,15 @@ impl Transport for WstunnelTransport {
 
     fn fingerprint_profile(&self) -> Profile {
         Profile::WebSocketTls
+    }
+
+    fn tunnel_mtu(&self, _session: &Session) -> Option<usize> {
+        // Conservative inner-TUN MTU for the WireGuard-over-WebSocket-over-TLS-over-TCP path.
+        // The carrier is TCP, so an oversized inner packet only costs extra segmentation (it does
+        // not blackhole the way it would over UDP/QUIC), but advertising a value avoids inheriting
+        // the primary rung's larger MTU when this rung wins. 1280 (the IPv6 minimum) is safely
+        // below any path MSS once WG (~32B) + WS framing + TLS records are accounted for.
+        Some(1280)
     }
 }
 

@@ -229,11 +229,12 @@ impl AmneziaWgTransport {
 }
 
 async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
-    let hp = format!("{host}:{port}");
-    let mut addrs = tokio::net::lookup_host(&hp)
+    // Don't put the node host:port in the error — the cascade logs rung errors at WARN, and a node
+    // endpoint must never reach a log line.
+    let mut addrs = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| Error::Transport(format!("resolve {hp}: {e}")))?;
-    addrs.next().ok_or_else(|| Error::Transport(format!("no address for {hp}")))
+        .map_err(|e| Error::Transport(format!("amneziawg node resolve failed: {e}")))?;
+    addrs.next().ok_or_else(|| Error::Transport("amneziawg node did not resolve".into()))
 }
 
 #[async_trait]

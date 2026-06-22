@@ -72,6 +72,11 @@ pub struct MasqueConfig {
     /// Must lie inside the relaying nodes' tunnel CIDR. `None` ⇒ the default. Only relevant when
     /// this transport is used as the inner of a [`crate::path::PathTransport`].
     pub nested_client_ip: Option<Ipv4Addr>,
+    /// Permit a connection with NO pinned attestation measurement (dev/loopback only).
+    /// **Defaults to `false` — fail closed (PD-2/Pillar 2):** without a pinned measurement the
+    /// tunnel refuses to come up, so a forgotten `NW_EXPECTED_MEASUREMENT` cannot silently carry
+    /// traffic unattested. Set `true` (e.g. `NW_ALLOW_UNATTESTED=1`) only for local dev.
+    pub allow_unattested: bool,
 }
 
 /// Heavy per-session state, owned by the transport and keyed by [`SessionId`].
@@ -197,8 +202,8 @@ impl MasqueTransport {
         let shutdown = CancellationToken::new();
 
         let driver = tokio::spawn(driver_run(
-            chan, peer, authority, nonce, policy, max_udp_payload, to_rx, from_tx, ctrl_to_rx,
-            ctrl_from_tx, ready_tx, shutdown.clone(),
+            chan, peer, authority, nonce, policy, self.config.allow_unattested, max_udp_payload,
+            to_rx, from_tx, ctrl_to_rx, ctrl_from_tx, ready_tx, shutdown.clone(),
         ));
 
         let ready = match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
@@ -415,6 +420,7 @@ async fn driver_run(
     authority: String,
     nonce: [u8; 32],
     policy: Option<AppraisalPolicy>,
+    allow_unattested: bool,
     max_udp_payload: usize,
     mut to_rx: mpsc::Receiver<IpPacket>,
     from_tx: mpsc::Sender<IpPacket>,
@@ -560,7 +566,7 @@ async fn driver_run(
                                     // THE attestation gate: appraise the node's RA-TLS cert
                                     // before signaling ready. This is the only ready-Ok site,
                                     // so a failed/absent appraisal can never yield a tunnel.
-                                    match attest_peer(&conn, &list, policy.as_ref(), &nonce) {
+                                    match attest_peer(&conn, &list, policy.as_ref(), allow_unattested, &nonce) {
                                         Ok(()) => {
                                             if let Some(tx) = ready_tx.take() {
                                                 let mdp = conn.dgram_max_writable_len().unwrap_or(1200);
@@ -715,17 +721,17 @@ fn build_client_config(max_udp_payload: usize) -> Result<quiche::Config> {
 
 /// The single attestation gate. With a pinned policy, appraise the node's attestation
 /// evidence (from the CONNECT-IP response header) against it — bound to the node's TLS key
-/// (`peer_cert()` SPKI) and the client nonce. Without a policy the connection is unattested
-/// and we warn loudly (dev/loopback only — a real endpoint always carries a policy).
+/// (`peer_cert()` SPKI) and the client nonce. With NO policy the decision is delegated to
+/// [`unattested_gate`], which **fails closed** unless `allow_unattested` was explicitly set.
 fn attest_peer(
     conn: &quiche::Connection,
     headers: &[quiche::h3::Header],
     policy: Option<&AppraisalPolicy>,
+    allow_unattested: bool,
     nonce: &[u8; 32],
 ) -> Result<()> {
     let Some(policy) = policy else {
-        tracing::warn!("MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only");
-        return Ok(());
+        return unattested_gate(allow_unattested);
     };
     let cert = conn
         .peer_cert()
@@ -740,6 +746,22 @@ fn attest_peer(
         .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
     tracing::info!(tee = ?verdict.tee, "node attestation verified");
     Ok(())
+}
+
+/// Fail-closed gate for a connection with no pinned measurement. Refuses the tunnel unless the
+/// caller explicitly opted into unattested mode (dev/loopback). This is the fix for the
+/// fail-OPEN bug where a missing `NW_EXPECTED_MEASUREMENT` silently carried traffic unattested
+/// (PD-2 / Pillar 2: "no attestation pass → kill-switch holds → no traffic"). Pure + unit-tested.
+fn unattested_gate(allow_unattested: bool) -> Result<()> {
+    if allow_unattested {
+        tracing::warn!("MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only");
+        return Ok(());
+    }
+    Err(Error::Transport(
+        "refusing to bring up an unattested MASQUE tunnel: no pinned measurement. Set \
+         NW_EXPECTED_MEASUREMENT (production), or NW_ALLOW_UNATTESTED=1 for local dev/loopback only."
+            .into(),
+    ))
 }
 
 /// Find an H3 header value by (lowercase) name.
@@ -780,5 +802,19 @@ mod tests {
         let t = MasqueTransport::new();
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
+    }
+
+    #[test]
+    fn default_config_is_fail_closed() {
+        // Secure by default: a transport built with no explicit opt-out must require attestation.
+        assert!(!MasqueConfig::default().allow_unattested, "default must fail closed");
+    }
+
+    #[test]
+    fn unattested_gate_fails_closed_unless_explicitly_allowed() {
+        // No pinned measurement + not allowed → tunnel refused (the fix for the fail-open bug).
+        assert!(unattested_gate(false).is_err(), "missing measurement must refuse the tunnel");
+        // Explicit dev opt-in → permitted (loopback/dev).
+        assert!(unattested_gate(true).is_ok(), "explicit opt-in permits unattested dev use");
     }
 }

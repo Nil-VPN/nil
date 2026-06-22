@@ -44,7 +44,13 @@ fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("NW_NODE_AMNEZIA_WG_PUB must be 32 bytes"))?;
     let host = std::env::var("NW_NODE_AMNEZIA_HOST").ok();
-    let port = std::env::var("NW_NODE_AMNEZIA_PORT").ok().and_then(|p| p.parse().ok());
+    // Fail loudly on a present-but-invalid port (matching NW_NODE_PORT) rather than silently
+    // falling back to the target port — an operator who typo'd a custom obfuscation port must hear
+    // about it, not dial 443 by surprise.
+    let port = std::env::var("NW_NODE_AMNEZIA_PORT")
+        .ok()
+        .map(|p| p.parse::<u16>().context("NW_NODE_AMNEZIA_PORT"))
+        .transpose()?;
     Ok(Some(AmneziaWgTransport::new(wg_pub, host, port)))
 }
 
@@ -66,7 +72,11 @@ fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
         .try_into()
         .map_err(|_| anyhow::anyhow!("NW_NODE_WSTUNNEL_WG_PUB must be 32 bytes"))?;
     let host = std::env::var("NW_NODE_WSTUNNEL_HOST").ok();
-    let port = std::env::var("NW_NODE_WSTUNNEL_PORT").ok().and_then(|p| p.parse().ok());
+    // Fail loudly on a present-but-invalid port (see NW_NODE_AMNEZIA_PORT).
+    let port = std::env::var("NW_NODE_WSTUNNEL_PORT")
+        .ok()
+        .map(|p| p.parse::<u16>().context("NW_NODE_WSTUNNEL_PORT"))
+        .transpose()?;
     Ok(Some(WstunnelTransport::new(wg_pub, host, port)))
 }
 
@@ -128,7 +138,7 @@ fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<Node
 
 /// Build the transport and a [`TunnelConfig`] from the environment. The returned `node` is the
 /// directly-reachable hop (a single node, or a path's entry) the kill-switch excepts.
-pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let host = env_or("NW_NODE_HOST", "node");
     let port: u16 = env_or("NW_NODE_PORT", "443").parse().context("NW_NODE_PORT")?;
     let tun_name = env_or("NW_TUN", "nil0");
@@ -140,9 +150,18 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
         .map(|s| s.trim().parse::<IpAddr>().map_err(|e| anyhow::anyhow!("NW_DNS {s}: {e}")))
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
+    // Fail-closed by default: a MASQUE hop with no pinned measurement refuses to connect unless
+    // NW_ALLOW_UNATTESTED is explicitly set (dev/loopback only). See `MasqueConfig::allow_unattested`.
+    let allow_unattested = std::env::var("NW_ALLOW_UNATTESTED").is_ok();
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
-    let path = path_from_env(&expected)?;
+    // Path priority: (1) redeem a Privacy Pass token at the Coordinator for a real, per-hop-attested
+    // trust-split path (production); (2) a static NW_PATH onion (dev); (3) a single node.
+    let path = if let Ok(url) = std::env::var("NW_COORDINATOR_URL") {
+        Some(crate::redeem::redeem_path_from_env(&url).await?)
+    } else {
+        path_from_env(&expected)?
+    };
 
     let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) =
         if let Some(hops) = path {
@@ -155,6 +174,7 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
             // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
             let inner = MasqueTransport::with_config(MasqueConfig {
                 nested_client_ip: Some(client_ip),
+                allow_unattested,
                 ..Default::default()
             });
             (Arc::new(PathTransport::new(Arc::new(inner), hops)), entry, 1280)
@@ -162,9 +182,10 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
             let node = NodeEndpoint { host: host.clone(), port, kind: TransportKind::Masque, wg_pub, expected };
             // Primary rung: PQ-WireGuard-over-MASQUE if a node WG key is pinned, else plain MASQUE.
             let (primary, base_mtu): (Arc<dyn Transport>, u16) = if wg_pub.is_some() {
-                (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), 1232)
+                let inner = MasqueTransport::with_config(MasqueConfig { allow_unattested, ..Default::default() });
+                (Arc::new(PqWgTransport::new(Arc::new(inner))), 1232)
             } else {
-                (Arc::new(MasqueTransport::new()), 1280)
+                (Arc::new(MasqueTransport::with_config(MasqueConfig { allow_unattested, ..Default::default() })), 1280)
             };
             // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
             // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
@@ -202,14 +223,23 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     // each fallback host to the primary host (a rung reuses it when its *_HOST is unset), so the
     // except/allow covers all ports of that node regardless of port config. Dedup so we don't pin
     // the same host twice.
+    // Only except hosts that an ACTUALLY-ASSEMBLED fallback rung reaches — gated on the same key
+    // vars that gate the rungs above (lines 185/188). Otherwise NW_CASCADE alone would punch an
+    // all-ports kill-switch hole for a fallback host even in a wstunnel-only (or AmneziaWG-only)
+    // deployment, widening the fail-closed surface beyond any live rung.
     let mut also_except: Vec<String> = Vec::new();
     if std::env::var("NW_CASCADE").is_ok() {
-        also_except.push(std::env::var("NW_NODE_AMNEZIA_HOST").unwrap_or_else(|_| host.clone()));
-        if std::env::var("NW_NODE_WSTUNNEL_WG_PUB").is_ok() {
-            let wh = std::env::var("NW_NODE_WSTUNNEL_HOST").unwrap_or_else(|_| host.clone());
-            if !also_except.contains(&wh) {
-                also_except.push(wh);
+        let mut except_host = |env_key: &str| {
+            let h = std::env::var(env_key).unwrap_or_else(|_| host.clone());
+            if !also_except.contains(&h) {
+                also_except.push(h);
             }
+        };
+        if std::env::var("NW_NODE_AMNEZIA_WG_PUB").is_ok() {
+            except_host("NW_NODE_AMNEZIA_HOST");
+        }
+        if std::env::var("NW_NODE_WSTUNNEL_WG_PUB").is_ok() {
+            except_host("NW_NODE_WSTUNNEL_HOST");
         }
     }
 

@@ -63,8 +63,12 @@ struct Responder {
     node_secret: StaticSecret,
     obfs: ObfsParams,
     clients: HashMap<SocketAddr, Client>,
-    /// Inner tunnel IP → owning client's UDP address (so the shared exit TUN routes replies).
-    routes: HashMap<Ipv4Addr, SocketAddr>,
+    /// Inner tunnel IP → (owning client's UDP address, that client's `seq`). The `seq` pins the
+    /// route to the *specific* client instance that created it, so a stale route left behind by a
+    /// disconnected client can never silently re-bind to a different client that later reuses the
+    /// same UDP address (e.g. via carrier-grade-NAT port reuse) — that would deliver one user's
+    /// traffic to another, a per-user-boundary violation.
+    routes: HashMap<Ipv4Addr, (SocketAddr, u64)>,
     next_seq: u64,
 }
 
@@ -101,8 +105,9 @@ impl Responder {
             match client.core.decapsulate(&input) {
                 WgStep::Ip(ip) => {
                     client.established = true;
+                    let seq = client.seq;
                     if let Some(src) = ipv4_src(&ip) {
-                        self.routes.insert(src, from);
+                        self.routes.insert(src, (from, seq));
                     }
                     out.push(Action::ToTun(ip));
                     break;
@@ -120,11 +125,20 @@ impl Responder {
     /// A reply arriving on the shared exit TUN → route to the owning client by destination IP.
     fn handle_tun(&mut self, ip: &[u8]) -> Vec<Action> {
         let Some(dst) = ipv4_dst(ip) else { return Vec::new() };
-        let Some(&addr) = self.routes.get(&dst) else { return Vec::new() };
-        let Some(client) = self.clients.get_mut(&addr) else { return Vec::new() };
-        match client.core.encapsulate(ip) {
-            Ok(wire) => vec![Action::SendTo(addr, self.obfs.obfuscate(&wire))],
-            Err(_) => Vec::new(),
+        let Some(&(addr, seq)) = self.routes.get(&dst) else { return Vec::new() };
+        // Forward ONLY if the client currently at `addr` is the same instance that created the
+        // route (`seq` match). Otherwise the original owner disconnected/was replaced: drop the
+        // packet — never encapsulate one user's reply under another user's session — and purge the
+        // now-stale route.
+        match self.clients.get_mut(&addr) {
+            Some(client) if client.seq == seq => match client.core.encapsulate(ip) {
+                Ok(wire) => vec![Action::SendTo(addr, self.obfs.obfuscate(&wire))],
+                Err(_) => Vec::new(),
+            },
+            _ => {
+                self.routes.remove(&dst);
+                Vec::new()
+            }
         }
     }
 
@@ -140,14 +154,22 @@ impl Responder {
         out
     }
 
-    /// Admit (or refresh) the client for `from`. At capacity, evict the oldest *non-established*
-    /// client so a flood of never-completing prefaces cannot lock out real peers.
+    /// Admit (or refresh) the client for `from`. An unauthenticated preface must never disturb an
+    /// **established** peer (a key change requires a real WireGuard handshake, not a bare public
+    /// magic header — otherwise an on-path/spoofed preface to a live client's address would tear
+    /// its session down), and a duplicate same-key preface must not reset an in-progress
+    /// handshake. At capacity, evict the oldest *non-established* client: this protects
+    /// already-established peers from a preface flood, but does NOT protect a client still
+    /// mid-handshake (a sustained flood of spoofed prefaces can evict a just-admitted joiner
+    /// before it completes — WireGuard cookie/rate-limiting is the proper fix, out of scope here).
     fn admit(&mut self, client_pub: [u8; 32], from: SocketAddr) {
         if let Some(existing) = self.clients.get(&from) {
-            // Same address re-prefacing with the same key: don't reset an in-progress handshake.
-            if existing.pubkey == client_pub {
+            if existing.established || existing.pubkey == client_pub {
                 return;
             }
+            // Replacing a not-yet-established, different-key entry at this address: purge any
+            // routes the old occupant left so they cannot outlive it (stale-route misroute guard).
+            self.routes.retain(|_, v| v.0 != from);
         } else if self.clients.len() >= MAX_CLIENTS {
             let victim = self
                 .clients
@@ -158,6 +180,7 @@ impl Responder {
             match victim {
                 Some(a) => {
                     self.clients.remove(&a);
+                    self.routes.retain(|_, v| v.0 != a); // purge the evicted client's routes
                 }
                 None => {
                     tracing::warn!(
@@ -315,8 +338,8 @@ mod tests {
             assert_eq!(to_tun.len(), 1, "one inner packet reaches the TUN");
             assert_eq!(ipv4_src(&to_tun[0]), Some(Ipv4Addr::from(ip)));
         }
-        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_a)), Some(&addr_a));
-        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_b)), Some(&addr_b));
+        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_a)).map(|v| v.0), Some(addr_a));
+        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_b)).map(|v| v.0), Some(addr_b));
 
         // A reply addressed to client B's inner IP must encapsulate to B (not A), and decapsulate
         // cleanly on B's core — proving the shared-TUN dispatch picks the correct client.
@@ -369,5 +392,55 @@ mod tests {
         assert_eq!(r.clients.len(), MAX_CLIENTS, "stays bounded at capacity");
         assert!(!r.clients.contains_key(&addr(0)), "oldest non-established evicted");
         assert!(r.clients.contains_key(&addr(MAX_CLIENTS)), "new client admitted");
+    }
+
+    #[test]
+    fn established_session_survives_a_same_addr_different_key_preface() {
+        let node_kp = WgKeypair::generate().unwrap();
+        let node_pub = node_kp.public;
+        let mut r = Responder::new(node_kp.secret);
+        let addr: SocketAddr = "203.0.113.7:51820".parse().unwrap();
+        let mut core = establish(&mut r, node_pub, addr, 201);
+        let obfs = ObfsParams::default();
+
+        // A data packet flips the client to "established" (handshake alone does not).
+        let data = core.encapsulate(&ipv4([10, 74, 0, 2], [1, 1, 1, 1])).unwrap();
+        r.handle_udp(&obfs.obfuscate(&data), addr);
+        let (real_key, was_established) = {
+            let c = r.clients.get(&addr).expect("client present");
+            (c.pubkey, c.established)
+        };
+        assert!(was_established);
+
+        // An unauthenticated preface from the SAME address with a DIFFERENT key must NOT tear down
+        // or re-key the established session (off-path DoS guard).
+        r.handle_udp(&obfs.obfuscate_preface(&[0x99u8; 32]), addr);
+
+        let c = r.clients.get(&addr).expect("client still present");
+        assert!(c.established, "established flag preserved");
+        assert_eq!(c.pubkey, real_key, "a bare preface cannot swap an established peer's key");
+    }
+
+    #[test]
+    fn stale_route_with_mismatched_seq_is_dropped_and_purged() {
+        let node_kp = WgKeypair::generate().unwrap();
+        let node_pub = node_kp.public;
+        let mut r = Responder::new(node_kp.secret);
+        let addr: SocketAddr = "203.0.113.8:51820".parse().unwrap();
+        let mut core = establish(&mut r, node_pub, addr, 202);
+        let obfs = ObfsParams::default();
+        let ip = [10, 74, 0, 2];
+
+        // A real route is learned when the client sends from its inner IP.
+        let data = core.encapsulate(&ipv4(ip, [1, 1, 1, 1])).unwrap();
+        r.handle_udp(&obfs.obfuscate(&data), addr);
+        assert!(r.routes.contains_key(&Ipv4Addr::from(ip)));
+
+        // Simulate a stale route: the instance that owned this inner IP is gone (its `seq` no
+        // longer matches the client now at `addr`). A reply for that IP must be DROPPED — never
+        // encapsulated under a different client's session — and the stale route purged.
+        r.routes.insert(Ipv4Addr::from(ip), (addr, 9999));
+        assert!(r.handle_tun(&ipv4([1, 1, 1, 1], ip)).is_empty(), "stale-seq reply dropped");
+        assert!(!r.routes.contains_key(&Ipv4Addr::from(ip)), "stale route purged");
     }
 }
