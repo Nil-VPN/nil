@@ -1,11 +1,16 @@
-//! Shared domain types for NIL VPN — no I/O, no async, no wire obligations.
+//! Shared domain types for NIL VPN — no async, no wire obligations.
 //!
 //! These are the in-process types that the [`Transport`](../nil_transport/trait.Transport.html)
 //! trait passes between the engine and any tunnel implementation. Serialized wire
 //! formats and API DTOs live in `nil-proto`; this crate stays free of serde framing
 //! decisions so the transport seam never recompiles when the wire format evolves.
+//!
+//! The one I/O-touching module is [`durable`] — a small, self-contained, restart-safe key set
+//! shared by the control and business planes (the Coordinator nullifier set and the Portal
+//! one-token-per-payment set). It is plain `std::fs`, no async, no new dependencies.
 
 pub mod checksum;
+pub mod durable;
 
 use serde::{Deserialize, Serialize};
 

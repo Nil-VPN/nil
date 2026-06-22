@@ -1,6 +1,7 @@
 //! Coordinator configuration from the environment.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use nil_crypto::Verifier;
 
@@ -15,6 +16,9 @@ pub struct CoordConfig {
     /// The Privacy Pass token verifier (public key only). `None` → `/v1/redeem` is disabled
     /// because no issuer public key was configured.
     pub verifier: Option<Verifier>,
+    /// Where to durably persist the spent-token nullifier set (`NW_NULLIFIER_PATH`). `None` ⇒
+    /// volatile in-memory nullifiers (dev only — a restart re-permits double-spend).
+    pub nullifier_path: Option<PathBuf>,
 }
 
 impl CoordConfig {
@@ -39,7 +43,8 @@ impl CoordConfig {
             },
             Err(_) => None,
         };
-        Ok(Self { addr, registry: NodeRegistry::dev_default(), path_hops, verifier })
+        let nullifier_path = std::env::var("NW_NULLIFIER_PATH").ok().map(PathBuf::from);
+        Ok(Self { addr, registry: NodeRegistry::dev_default(), path_hops, verifier, nullifier_path })
     }
 }
 

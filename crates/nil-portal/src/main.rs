@@ -16,13 +16,14 @@ mod tokens;
 use std::sync::Arc;
 
 use anyhow::Result;
+use nil_core::durable::DurableSet;
 use nil_crypto::Issuer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 use crate::monero::{MockWatcher, MoneroRpcWatcher, PaymentWatcher};
 use crate::state::AppState;
-use crate::store::{memory::InMemoryStore, Store};
+use crate::store::{file::FileStore, memory::InMemoryStore, Store};
 use crate::tokens::{token_router, TokenState};
 
 #[tokio::main]
@@ -31,9 +32,19 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    // Phase 0 store is in-memory (volatile). A Postgres-backed `Store` slots in behind
-    // the same trait in Phase 1 — see ADR-0003.
-    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+    // Account store: durable (JSON file) when NW_PORTAL_STORE is set; otherwise volatile
+    // in-memory + a warning (dev only). Both keep only PII-free records (ADR-0003).
+    let store: Arc<dyn Store> = match std::env::var("NW_PORTAL_STORE") {
+        Ok(path) => {
+            let s = FileStore::open(&path).map_err(|e| anyhow::anyhow!("open account store {path}: {e}"))?;
+            tracing::info!(%path, "durable account store loaded");
+            Arc::new(s)
+        }
+        Err(_) => {
+            tracing::warn!("NW_PORTAL_STORE unset — accounts are VOLATILE (dev only; lost on restart)");
+            Arc::new(InMemoryStore::new())
+        }
+    };
 
     // Privacy Pass issuer: reload from NW_TOKEN_SECRET (hex DER) or mint a fresh key. The
     // PUBLIC key is logged so the operator can pin it in the Coordinator (NW_TOKEN_PUBKEY).
@@ -47,8 +58,22 @@ async fn main() -> Result<()> {
         Err(_) => Arc::new(MockWatcher::with_paid(std::iter::empty())),
     };
 
+    // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning
+    // (a restart with a volatile set could re-issue a token for an already-spent payment).
+    let token_state = match std::env::var("NW_ISSUED_PATH") {
+        Ok(path) => {
+            let s = DurableSet::open(&path).map_err(|e| anyhow::anyhow!("open issued store {path}: {e}"))?;
+            tracing::info!(%path, issued = s.len(), "durable one-token-per-payment set loaded");
+            TokenState::with_issued(issuer, watcher, Arc::new(s))
+        }
+        Err(_) => {
+            tracing::warn!("NW_ISSUED_PATH unset — the one-token-per-payment set is VOLATILE (dev only; a restart can re-issue a paid token)");
+            TokenState::new(issuer, watcher)
+        }
+    };
+
     let app = app::router(AppState { store })
-        .merge(token_router(TokenState::new(issuer, watcher)))
+        .merge(token_router(token_state))
         .layer(TraceLayer::new_for_http());
 
     let addr = std::env::var("NW_PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

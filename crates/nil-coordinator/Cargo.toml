@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "NIL VPN Control plane: node registry, trust-split path selection, token verifier."
 
 [dependencies]
+nil-core = { workspace = true }     # durable nullifier set (restart-safe single-use)
 nil-proto = { workspace = true }
 nil-crypto = { workspace = true }   # Privacy Pass token verifier (public key only)
 axum = { workspace = true }

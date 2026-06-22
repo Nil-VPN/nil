@@ -4,13 +4,13 @@
 //! cannot link a redemption back to the purchase. The *verifier* lives in `nil-coordinator`, a
 //! separate trust domain that only ever holds the public key.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use nil_core::durable::DurableSet;
 use nil_crypto::Issuer;
 use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
 
@@ -22,13 +22,22 @@ use crate::monero::PaymentWatcher;
 pub struct TokenState {
     pub issuer: Arc<Issuer>,
     pub watcher: Arc<dyn PaymentWatcher>,
-    /// Payment ids already used to issue a token — one token per payment.
-    pub issued: Arc<Mutex<HashSet<String>>>,
+    /// Payment ids already used to issue a token — one token per payment. Durable across
+    /// restarts (file-backed in production), or a restart would re-permit a double-issue for an
+    /// already-spent payment. Payment ids are non-identifying (they index a Monero payment, not
+    /// a person), so this stays PII-free.
+    pub issued: Arc<DurableSet>,
 }
 
 impl TokenState {
+    /// Dev/test state with a volatile (in-memory) one-token-per-payment set.
     pub fn new(issuer: Arc<Issuer>, watcher: Arc<dyn PaymentWatcher>) -> Self {
-        Self { issuer, watcher, issued: Arc::new(Mutex::new(HashSet::new())) }
+        Self { issuer, watcher, issued: Arc::new(DurableSet::in_memory()) }
+    }
+
+    /// Production state with a caller-provided (durable) one-token-per-payment set.
+    pub fn with_issued(issuer: Arc<Issuer>, watcher: Arc<dyn PaymentWatcher>, issued: Arc<DurableSet>) -> Self {
+        Self { issuer, watcher, issued }
     }
 }
 
@@ -47,6 +56,9 @@ pub enum IssueError {
     AlreadyIssued,
     /// The blinded message wasn't valid hex.
     Malformed,
+    /// The one-token-per-payment record could not be made durable — fail closed (issue nothing)
+    /// rather than risk a double-issue on the next restart.
+    Unavailable,
     /// The blind signature operation failed.
     Issuer(String),
 }
@@ -58,10 +70,13 @@ pub fn issue_logic(state: &TokenState, req: &IssueRequest) -> Result<Vec<u8>, Is
         return Err(IssueError::Unpaid);
     }
     let blind_msg = from_hex(&req.blind_msg).ok_or(IssueError::Malformed)?;
-    {
-        let mut issued = state.issued.lock().expect("issued mutex");
-        if !issued.insert(req.payment_id.clone()) {
-            return Err(IssueError::AlreadyIssued);
+    // Durably record one-token-per-payment BEFORE signing. Fail closed if it can't be persisted.
+    match state.issued.insert(&req.payment_id) {
+        Ok(true) => {}                                       // first token for this payment
+        Ok(false) => return Err(IssueError::AlreadyIssued),  // already issued
+        Err(e) => {
+            tracing::error!("issued-set persist failed: {e}");
+            return Err(IssueError::Unavailable);
         }
     }
     state.issuer.blind_sign(&blind_msg).map_err(|e| IssueError::Issuer(format!("{e}")))
@@ -76,6 +91,7 @@ async fn issue(
         Err(IssueError::Unpaid) => Err(StatusCode::PAYMENT_REQUIRED),
         Err(IssueError::AlreadyIssued) => Err(StatusCode::CONFLICT),
         Err(IssueError::Malformed) => Err(StatusCode::BAD_REQUEST),
+        Err(IssueError::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(IssueError::Issuer(e)) => {
             tracing::error!("blind-sign failed: {e}");
             Err(StatusCode::INTERNAL_SERVER_ERROR)
@@ -139,5 +155,45 @@ mod tests {
 
         // Same payment id again → refused (one token per payment).
         assert!(matches!(issue_logic(&state, &paid), Err(IssueError::AlreadyIssued)));
+    }
+
+    #[test]
+    fn one_token_per_payment_survives_a_portal_restart() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nil-portal-issued-{}-{}.log",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // The issuer key and the confirmed payment persist across the restart; only the
+        // one-token-per-payment set is reloaded from disk.
+        let issuer = Arc::new(Issuer::generate().unwrap());
+        let pub_der = issuer.public_der().unwrap();
+        let watcher = Arc::new(MockWatcher::with_paid(["pay-1".to_string()]));
+        let msg = b"token-nonce-0123456789abcdef0123".to_vec();
+        let req = token::blind(&pub_der, &msg).unwrap();
+        let paid = IssueRequest { payment_id: "pay-1".into(), blind_msg: to_hex(&req.blind_msg) };
+
+        // Boot 1: file-backed issued set. First issuance for pay-1 succeeds.
+        let boot1 = TokenState::with_issued(
+            issuer.clone(),
+            watcher.clone(),
+            Arc::new(DurableSet::open(&path).unwrap()),
+        );
+        assert!(issue_logic(&boot1, &paid).is_ok(), "first issuance for the payment succeeds");
+        drop(boot1); // simulate a Portal restart
+
+        // Boot 2: same issuer/payment, issued set reloaded from the SAME file. The paid id is
+        // already spent — re-issuing must be refused (regression guard for double-issue).
+        let boot2 = TokenState::with_issued(issuer, watcher, Arc::new(DurableSet::open(&path).unwrap()));
+        assert!(
+            matches!(issue_logic(&boot2, &paid), Err(IssueError::AlreadyIssued)),
+            "a payment that already minted a token must not mint a second one after a restart"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }

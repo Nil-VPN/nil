@@ -7,6 +7,7 @@ rust-version.workspace = true
 description = "NIL VPN Business plane: Axum REST API — accounts, billing, Privacy Pass issuer."
 
 [dependencies]
+nil-core = { workspace = true }     # durable one-token-per-payment + account stores
 nil-crypto = { workspace = true }
 nil-proto = { workspace = true }
 axum = { workspace = true }

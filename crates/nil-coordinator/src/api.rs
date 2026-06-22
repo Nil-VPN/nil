@@ -5,28 +5,37 @@
 //! paths. It never imports the Portal (issuer) and never sees traffic.
 
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use nil_core::durable::DurableSet;
 use nil_proto::path::{MeasurementsResponse, PathRequest, PathResponse, PinnedMeasurement};
 use nil_proto::token::RedeemRequest;
 
 use crate::config::{from_hex, CoordConfig};
 
-/// Shared state: the immutable config + the mutable spent-token nullifier set.
+/// Shared state: the immutable config + the durable spent-token nullifier set.
 #[derive(Clone)]
 pub struct CoordState {
     pub cfg: Arc<CoordConfig>,
     /// Spent token messages (hex). Identity-free — just "this token was already redeemed".
-    pub nullifiers: Arc<Mutex<HashSet<String>>>,
+    /// Durable across restarts (file-backed in production), or a restart would re-permit a
+    /// double-spend of every already-redeemed token.
+    pub nullifiers: Arc<DurableSet>,
 }
 
 impl CoordState {
+    /// Dev/test state with a volatile (in-memory) nullifier set.
     pub fn new(cfg: Arc<CoordConfig>) -> Self {
-        Self { cfg, nullifiers: Arc::new(Mutex::new(HashSet::new())) }
+        Self { cfg, nullifiers: Arc::new(DurableSet::in_memory()) }
+    }
+
+    /// Production state with a caller-provided (durable) nullifier set.
+    pub fn with_nullifiers(cfg: Arc<CoordConfig>, nullifiers: Arc<DurableSet>) -> Self {
+        Self { cfg, nullifiers }
     }
 }
 
@@ -49,6 +58,9 @@ pub enum RedeemError {
     BadToken,
     /// The token was already redeemed (nullifier hit) — double-spend.
     AlreadyRedeemed,
+    /// The nullifier could not be durably recorded — fail closed (grant nothing) rather than
+    /// risk a double-spend on the next restart.
+    Unavailable,
     /// No operator/jurisdiction-diverse path of the requested length exists right now.
     NoPath,
 }
@@ -63,12 +75,16 @@ pub fn redeem_logic(state: &CoordState, req: &RedeemRequest) -> Result<PathRespo
     if !verifier.verify(&token, &msg) {
         return Err(RedeemError::BadToken);
     }
-    // Single-use: reject if this token message was already spent, else record it. The key is
-    // the token itself — there is no account or identity in the nullifier set.
-    {
-        let mut spent = state.nullifiers.lock().expect("nullifier mutex");
-        if !spent.insert(req.msg.clone()) {
-            return Err(RedeemError::AlreadyRedeemed);
+    // Single-use: durably record this token message, rejecting it if already spent. The key is
+    // the token itself — there is no account or identity in the nullifier set. We persist BEFORE
+    // selecting a path, and fail closed if the record can't be made durable (a path granted on
+    // an unpersisted nullifier would be double-spendable after a restart).
+    match state.nullifiers.insert(&req.msg) {
+        Ok(true) => {}                                        // newly spent — proceed
+        Ok(false) => return Err(RedeemError::AlreadyRedeemed), // replay
+        Err(e) => {
+            tracing::error!("nullifier persist failed: {e}");
+            return Err(RedeemError::Unavailable);
         }
     }
     let hops = state.cfg.registry.select_path(state.cfg.path_hops).ok_or(RedeemError::NoPath)?;
@@ -85,6 +101,7 @@ async fn redeem(
         Err(RedeemError::Malformed) => Err(StatusCode::BAD_REQUEST),
         Err(RedeemError::BadToken) => Err(StatusCode::UNAUTHORIZED),
         Err(RedeemError::AlreadyRedeemed) => Err(StatusCode::CONFLICT),
+        Err(RedeemError::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(RedeemError::NoPath) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
@@ -142,6 +159,7 @@ mod tests {
             registry: NodeRegistry::dev_default(),
             path_hops: 3,
             verifier: Some(verifier),
+            nullifier_path: None,
         };
         let redeem = RedeemRequest { msg: hex(&msg), token: hex(&tok) };
         (CoordState::new(Arc::new(cfg)), redeem)
@@ -162,6 +180,39 @@ mod tests {
     }
 
     #[test]
+    fn redeemed_token_stays_spent_across_a_coordinator_restart() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nil-coord-nullifier-{}-{}.log",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        // The same config (and thus the same token verifier) persists across the restart; only
+        // the nullifier set is reloaded from disk.
+        let (state0, req) = state_and_token();
+        let cfg = state0.cfg.clone();
+        drop(state0);
+
+        // Boot 1: file-backed nullifier. First redemption of this token succeeds.
+        let boot1 = CoordState::with_nullifiers(cfg.clone(), Arc::new(DurableSet::open(&path).unwrap()));
+        assert!(redeem_logic(&boot1, &req).is_ok(), "first redemption succeeds");
+        drop(boot1); // simulate a Coordinator crash/restart
+
+        // Boot 2: same verifier, nullifier reloaded from the SAME file. The replayed token must
+        // be rejected — this is the regression guard for the volatile-state double-spend bug.
+        let boot2 = CoordState::with_nullifiers(cfg, Arc::new(DurableSet::open(&path).unwrap()));
+        assert!(
+            matches!(redeem_logic(&boot2, &req), Err(RedeemError::AlreadyRedeemed)),
+            "a token redeemed before the restart must stay spent after it"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn forged_token_is_rejected() {
         let (state, mut req) = state_and_token();
         req.token = hex(&vec![0u8; 256]); // not the issuer's signature
@@ -175,6 +226,7 @@ mod tests {
             registry: NodeRegistry::dev_default(),
             path_hops: 3,
             verifier: None,
+            nullifier_path: None,
         };
         let state = CoordState::new(Arc::new(cfg));
         let req = RedeemRequest { msg: "00".into(), token: "00".into() };

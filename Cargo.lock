@@ -3209,6 +3209,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "nil-core",
  "nil-crypto",
  "nil-proto",
  "serde",
@@ -3285,6 +3286,7 @@ dependencies = [
  "async-trait",
  "axum",
  "http-body-util",
+ "nil-core",
  "nil-crypto",
  "nil-proto",
  "serde",
