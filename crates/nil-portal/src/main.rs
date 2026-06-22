@@ -9,11 +9,14 @@
 mod account;
 mod app;
 mod monero;
+mod ratelimit;
 mod state;
 mod store;
 mod tokens;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use nil_core::durable::DurableSet;
@@ -52,9 +55,15 @@ async fn main() -> Result<()> {
     if let Ok(pk) = issuer.public_der() {
         tracing::info!(token_pubkey = %hex(&pk), "Privacy Pass issuer ready — pin this as the Coordinator's NW_TOKEN_PUBKEY");
     }
-    // Payment watcher: real monero-wallet-rpc if NW_MONERO_RPC is set, else a dev mock.
+    // Payment watcher: real monero-wallet-rpc if NW_MONERO_RPC is set (a background task polls it
+    // for confirmed transfers), else a dev mock.
     let watcher: Arc<dyn PaymentWatcher> = match std::env::var("NW_MONERO_RPC") {
-        Ok(url) => Arc::new(MoneroRpcWatcher::new(url)),
+        Ok(url) => {
+            tracing::info!(%url, "watching self-hosted monero-wallet-rpc for confirmed payments");
+            let w = Arc::new(MoneroRpcWatcher::new(url));
+            tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
+            w
+        }
         Err(_) => Arc::new(MockWatcher::with_paid(std::iter::empty())),
     };
 
@@ -79,7 +88,9 @@ async fn main() -> Result<()> {
     let addr = std::env::var("NW_PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(%addr, "nil-portal listening (Business plane: accounts + Privacy Pass issuer)");
-    axum::serve(listener, app).await?;
+    // ConnectInfo so the issuer endpoint can rate-limit by client IP (the IP is used transiently
+    // for the limiter only — never stored or tied to an account).
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 

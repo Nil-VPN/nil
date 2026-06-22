@@ -4,9 +4,11 @@
 //! cannot link a redemption back to the purchase. The *verifier* lives in `nil-coordinator`, a
 //! separate trust domain that only ever holds the public key.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -15,6 +17,12 @@ use nil_crypto::Issuer;
 use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
 
 use crate::monero::PaymentWatcher;
+use crate::ratelimit::RateLimiter;
+
+/// Per-IP cap on token-issue attempts, and the window it applies over. Issuance is a paid,
+/// infrequent operation, so this is generous but still caps a minting flood.
+const ISSUE_RATE_MAX: u32 = 30;
+const ISSUE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// The issuer's signing capability, abstracted so the RSA private key can live in an HSM/KMS in
 /// production rather than process memory (runbook §9 names it the single most sensitive secret).
@@ -42,6 +50,8 @@ impl TokenSigner for Issuer {
 pub struct TokenState {
     pub issuer: Arc<dyn TokenSigner>,
     pub watcher: Arc<dyn PaymentWatcher>,
+    /// Abuse control on `/v1/tokens/issue`, keyed by client IP.
+    pub limiter: Arc<RateLimiter>,
     /// Payment ids already used to issue a token — one token per payment. Durable across
     /// restarts (file-backed in production), or a restart would re-permit a double-issue for an
     /// already-spent payment. Payment ids are non-identifying (they index a Monero payment, not
@@ -50,9 +60,13 @@ pub struct TokenState {
 }
 
 impl TokenState {
+    fn limiter() -> Arc<RateLimiter> {
+        Arc::new(RateLimiter::new(ISSUE_RATE_MAX, ISSUE_RATE_WINDOW))
+    }
+
     /// Dev/test state with a volatile (in-memory) one-token-per-payment set.
     pub fn new(issuer: Arc<dyn TokenSigner>, watcher: Arc<dyn PaymentWatcher>) -> Self {
-        Self { issuer, watcher, issued: Arc::new(DurableSet::in_memory()) }
+        Self { issuer, watcher, issued: Arc::new(DurableSet::in_memory()), limiter: Self::limiter() }
     }
 
     /// Production state with a caller-provided (durable) one-token-per-payment set.
@@ -61,7 +75,7 @@ impl TokenState {
         watcher: Arc<dyn PaymentWatcher>,
         issued: Arc<DurableSet>,
     ) -> Self {
-        Self { issuer, watcher, issued }
+        Self { issuer, watcher, issued, limiter: Self::limiter() }
     }
 }
 
@@ -107,9 +121,15 @@ pub fn issue_logic(state: &TokenState, req: &IssueRequest) -> Result<Vec<u8>, Is
 }
 
 async fn issue(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<TokenState>,
     Json(req): Json<IssueRequest>,
 ) -> Result<Json<IssueResponse>, StatusCode> {
+    // Abuse control: cap issue attempts per client IP. The IP is used transiently for the
+    // counter only — never stored, logged, or tied to an account.
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     match issue_logic(&state, &req) {
         Ok(sig) => Ok(Json(IssueResponse { blind_sig: to_hex(&sig) })),
         Err(IssueError::Unpaid) => Err(StatusCode::PAYMENT_REQUIRED),
