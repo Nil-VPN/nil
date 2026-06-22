@@ -12,8 +12,14 @@
 //!     ▼  VLESS + REALITY (borrows a real TLS handshake)
 //! ```
 //!
-//! The `Transport` trait is the only seam, so the cascade is just "try `connect`, and on
-//! failure try the next rung." A blocked transport surfaces as a `connect` error/timeout.
+//! The `Transport` trait is the only seam, so the cascade is "try `connect`, verify the tunnel
+//! is actually alive, and on failure try the next rung."
+//!
+//! A real DPI block rarely surfaces as a prompt `connect` error — it usually **hangs** (the
+//! handshake packets are silently dropped), or lets the handshake complete and then drops the
+//! data. So stepping down only on an immediate error would wedge on the first rung. The cascade
+//! therefore (1) bounds each rung's `connect` with a **timeout** and (2) optionally runs a
+//! post-connect **liveness probe** before committing to a rung.
 //!
 //! MASQUE is fully implemented (the `masque` feature). The lower rungs are **Phase-4
 //! scaffolds**: they carry the correct `kind()`/`fingerprint_profile()` and slot into the
@@ -22,27 +28,56 @@
 //! ([`crate::pqwg`]); wstunnel is WebSocket-over-TLS; REALITY borrows a real TLS handshake.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, TransportKind};
 
 use crate::Transport;
 
+/// Default per-rung `connect` timeout. A backstop for a rung that hangs (DPI dropping the
+/// handshake) — it is intentionally longer than MASQUE's own internal handshake timeout, so a
+/// working rung's own error fires first and only a truly wedged rung hits this.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// A post-connect check that the chosen rung actually carries traffic. A rung can complete its
+/// handshake and then have its data silently dropped (a common censor behaviour); a `false`
+/// verdict makes the cascade close that rung and step down.
+#[async_trait]
+pub trait LivenessProbe: Send + Sync {
+    async fn is_alive(&self, transport: &Arc<dyn Transport>, session: &Session) -> bool;
+}
+
 /// An ordered set of transports to try, most-preferred first.
 pub struct Cascade {
     rungs: Vec<Arc<dyn Transport>>,
+    connect_timeout: Duration,
+    probe: Option<Arc<dyn LivenessProbe>>,
 }
 
 impl Cascade {
-    /// Build a cascade from an ordered rung list (e.g. `[masque, amnezia, wstunnel, reality]`).
+    /// Build a cascade from an ordered rung list (e.g. `[masque, amnezia, wstunnel, reality]`),
+    /// with the default connect timeout and no liveness probe.
     pub fn new(rungs: Vec<Arc<dyn Transport>>) -> Self {
-        Self { rungs }
+        Self { rungs, connect_timeout: DEFAULT_CONNECT_TIMEOUT, probe: None }
     }
 
-    /// Try each rung in order; return the first that connects, along with its transport so the
-    /// caller can pump packets through the rung that won. Steps down on any rung's failure
-    /// (a blocked transport surfaces as a `connect` error/timeout). Errors only if every rung
-    /// fails — at which point the kill-switch holds (no session is returned).
+    /// Override the per-rung connect timeout.
+    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Run `probe` after each rung connects; step down if it reports the tunnel dead.
+    pub fn with_liveness_probe(mut self, probe: Arc<dyn LivenessProbe>) -> Self {
+        self.probe = Some(probe);
+        self
+    }
+
+    /// Try each rung in order; return the first that connects **and** passes the liveness probe,
+    /// along with its transport so the caller can pump packets through the rung that won. Steps
+    /// down when a rung errors, **times out**, or connects but fails the probe. Errors only if
+    /// every rung fails — at which point the kill-switch holds (no session is returned).
     pub async fn connect(
         &self,
         target: NodeEndpoint,
@@ -50,16 +85,38 @@ impl Cascade {
     ) -> Result<(Arc<dyn Transport>, Session)> {
         let mut last: Option<Error> = None;
         for rung in &self.rungs {
-            match rung.connect(target.clone(), creds.clone()).await {
-                Ok(session) => {
-                    tracing::info!(kind = ?rung.kind(), "cascade connected");
-                    return Ok((rung.clone(), session));
-                }
-                Err(e) => {
-                    tracing::warn!(kind = ?rung.kind(), "cascade rung blocked, stepping down: {e}");
+            let kind = rung.kind();
+            let session = match tokio::time::timeout(
+                self.connect_timeout,
+                rung.connect(target.clone(), creds.clone()),
+            )
+            .await
+            {
+                Ok(Ok(session)) => session,
+                Ok(Err(e)) => {
+                    tracing::warn!(?kind, "cascade rung blocked, stepping down: {e}");
                     last = Some(e);
+                    continue;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(?kind, timeout = ?self.connect_timeout, "cascade rung timed out, stepping down");
+                    last = Some(Error::Transport(format!("{kind:?} connect timed out")));
+                    continue;
+                }
+            };
+
+            // Connected — verify it actually carries traffic before committing.
+            if let Some(probe) = &self.probe {
+                if !probe.is_alive(rung, &session).await {
+                    tracing::warn!(?kind, "cascade rung connected but failed liveness, stepping down");
+                    let _ = rung.close(session).await;
+                    last = Some(Error::Transport(format!("{kind:?} connected but failed the liveness probe")));
+                    continue;
                 }
             }
+
+            tracing::info!(?kind, "cascade connected");
+            return Ok((rung.clone(), session));
         }
         Err(last.unwrap_or_else(|| Error::Transport("cascade has no rungs".into())))
     }
@@ -68,6 +125,56 @@ impl Cascade {
     pub fn rung_kinds(&self) -> Vec<TransportKind> {
         self.rungs.iter().map(|r| r.kind()).collect()
     }
+}
+
+/// A built-in liveness probe: send a DNS query through the tunnel and treat any inbound packet
+/// within the timeout as "alive". The query rides the tunnel exactly like real traffic (the
+/// node NATs it to the resolver), so it exercises the full data path — not just the handshake.
+pub struct DnsLivenessProbe {
+    resolver: std::net::SocketAddrV4,
+    client: std::net::SocketAddrV4,
+    timeout: Duration,
+}
+
+impl Default for DnsLivenessProbe {
+    fn default() -> Self {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        Self {
+            resolver: SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53),
+            client: SocketAddrV4::new(Ipv4Addr::new(10, 74, 0, 2), 40000),
+            timeout: Duration::from_secs(5),
+        }
+    }
+}
+
+#[async_trait]
+impl LivenessProbe for DnsLivenessProbe {
+    async fn is_alive(&self, transport: &Arc<dyn Transport>, session: &Session) -> bool {
+        let pkt = crate::udpip::wrap(self.client, self.resolver, &dns_query("example.com"));
+        if transport.send(session, IpPacket::new(pkt)).await.is_err() {
+            return false;
+        }
+        // Any inbound packet within the window means the data path is live.
+        matches!(tokio::time::timeout(self.timeout, transport.recv(session)).await, Ok(Ok(_)))
+    }
+}
+
+/// Build a minimal DNS A-record query (recursion desired). The answer is irrelevant — we only
+/// need a packet that elicits *some* response.
+fn dns_query(name: &str) -> Vec<u8> {
+    let mut q = Vec::with_capacity(name.len() + 18);
+    q.extend_from_slice(&[0x13, 0x37]); // transaction id
+    q.extend_from_slice(&[0x01, 0x00]); // flags: recursion desired
+    q.extend_from_slice(&[0x00, 0x01]); // qdcount = 1
+    q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // an/ns/ar counts = 0
+    for label in name.split('.') {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0); // root label
+    q.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
+    q.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+    q
 }
 
 /// Shared body for the not-yet-implemented cascade rungs.
@@ -188,5 +295,82 @@ mod tests {
         assert_eq!(AmneziaWgTransport.fingerprint_profile(), Profile::Wireguardish);
         assert_eq!(WstunnelTransport.fingerprint_profile(), Profile::WebSocketTls);
         assert_eq!(RealityTransport.fingerprint_profile(), Profile::RealTlsBorrowed);
+    }
+
+    /// A transport whose `connect` hangs forever — simulates a DPI block that drops the
+    /// handshake instead of refusing it.
+    struct Hangs(TransportKind);
+    #[async_trait]
+    impl Transport for Hangs {
+        async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
+            std::future::pending::<()>().await; // never resolves
+            unreachable!()
+        }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Err(Error::Closed) }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Err(Error::Closed) }
+        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
+        fn kind(&self) -> TransportKind { self.0 }
+        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+    }
+
+    #[tokio::test]
+    async fn times_out_a_hanging_rung_and_steps_down() {
+        // MASQUE hangs (DPI drops the handshake) → after the timeout, step down to wstunnel.
+        let cascade = Cascade::new(vec![
+            Arc::new(Hangs(TransportKind::Masque)),
+            Arc::new(Working(TransportKind::Wstunnel)),
+        ])
+        .with_connect_timeout(Duration::from_millis(50));
+        let (t, _s) = cascade
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("times out the hanging rung and lands on the next");
+        assert_eq!(t.kind(), TransportKind::Wstunnel);
+    }
+
+    /// A probe that deems a rung alive only if its session kind matches.
+    struct AliveIf(TransportKind);
+    #[async_trait]
+    impl LivenessProbe for AliveIf {
+        async fn is_alive(&self, _t: &Arc<dyn Transport>, s: &Session) -> bool {
+            s.kind == self.0
+        }
+    }
+
+    #[tokio::test]
+    async fn steps_down_a_rung_that_connects_but_is_dead() {
+        // Both rungs "connect", but the probe says only wstunnel actually carries traffic, so the
+        // cascade must reject the handshake-only MASQUE rung and step down.
+        let cascade = Cascade::new(vec![
+            Arc::new(Working(TransportKind::Masque)),
+            Arc::new(Working(TransportKind::Wstunnel)),
+        ])
+        .with_liveness_probe(Arc::new(AliveIf(TransportKind::Wstunnel)));
+        let (t, _s) = cascade
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("steps down past the dead rung");
+        assert_eq!(t.kind(), TransportKind::Wstunnel, "rejected the connected-but-dead MASQUE rung");
+    }
+
+    #[tokio::test]
+    async fn errors_when_all_rungs_connect_but_are_dead() {
+        // Every rung handshakes but none carries traffic → no session, kill-switch holds.
+        let cascade = Cascade::new(vec![
+            Arc::new(Working(TransportKind::Masque)),
+            Arc::new(Working(TransportKind::Wstunnel)),
+        ])
+        .with_liveness_probe(Arc::new(AliveIf(TransportKind::Reality))); // never matches
+        assert!(cascade.connect(NodeEndpoint::loopback(), Grant::mock()).await.is_err());
+    }
+
+    #[test]
+    fn dns_query_is_well_formed() {
+        let q = dns_query("example.com");
+        assert_eq!(&q[0..2], &[0x13, 0x37], "transaction id");
+        assert_eq!(&q[4..6], &[0x00, 0x01], "one question");
+        // 12-byte header + 1+7 "example" + 1+3 "com" + 1 root + 2 qtype + 2 qclass = 29 bytes.
+        assert_eq!(q.len(), 29);
+        assert_eq!(&q[q.len() - 4..], &[0x00, 0x01, 0x00, 0x01], "QTYPE=A QCLASS=IN");
     }
 }
