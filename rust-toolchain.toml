@@ -1,6 +1,7 @@
-# Pin the toolchain so every contributor (and CI / reproducible node builds) uses the
-# same compiler. Phase 2 reproducible-build measurements depend on this being fixed.
+# Pin the toolchain so every contributor (and CI / reproducible node builds) uses the same
+# compiler. An EXACT version (not "stable") is the precondition for a reproducible nil-node
+# measurement: rustc codegen differs across versions, so "stable" cannot yield a stable hash.
 [toolchain]
-channel = "stable"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "default"

@@ -1,0 +1,31 @@
+# On a version tag: build nil-node reproducibly and publish its measurement + SBOM to the
+# Sigstore/Rekor transparency log (keyless via OIDC). The job FAILS if the double build is not
+# byte-identical, so a non-reproducible build can never be published. Clients then attest
+# nodes against the pinned measurement (architecture spec §5, runbook §4).
+name: release-attest
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  id-token: write   # keyless signing (Fulcio/Rekor OIDC identity)
+  contents: read
+
+jobs:
+  measure-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reproducible build (asserts byte-identical nil-node)
+        run: ./deploy/reproducible-build.sh
+
+      - name: Install SBOM + signing tooling
+        run: cargo install cargo-cyclonedx --locked
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: Publish measurement + SBOM to Rekor (keyless)
+        run: ./deploy/publish-measurement.sh --mode real
