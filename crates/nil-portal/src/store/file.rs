@@ -8,7 +8,7 @@
 //! timestamp. A full disk compromise yields no personal identity for an anonymous account.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -115,14 +115,29 @@ impl FileStore {
         Ok(Self { path, inner: RwLock::new(map) })
     }
 
-    /// Atomically write the whole map to disk (temp file + rename).
+    /// Atomically AND durably write the whole map to disk: write the temp file, `fsync` it,
+    /// rename over the target, then `fsync` the parent directory. The rename gives torn-read
+    /// protection; the fsyncs give crash durability — so `insert` returning `Ok` means the account
+    /// is on disk, matching the sibling `DurableSet`'s "accepted ⇒ fsync'd" guarantee.
     fn persist(&self, map: &HashMap<[u8; 32], AccountRecord>) -> io::Result<()> {
         let dtos: Vec<RecordDto> = map.values().map(RecordDto::from_record).collect();
         let json = serde_json::to_vec_pretty(&dtos)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &json)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&json)?;
+            f.flush()?;
+            f.sync_all()?; // fsync the temp data BEFORE the rename, or a crash can leave it unflushed
+        }
         std::fs::rename(&tmp, &self.path)?;
+        // fsync the parent directory so the rename itself survives a crash. Best-effort: some
+        // platforms (e.g. Windows) don't allow opening a directory for fsync.
+        if let Some(parent) = self.path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
 }
