@@ -3191,6 +3191,7 @@ dependencies = [
  "nil-attest",
  "nil-core",
  "nil-crypto",
+ "nil-datapath",
  "nil-proto",
  "nil-transport",
  "reqwest 0.12.28",

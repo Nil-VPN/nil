@@ -22,6 +22,10 @@ tauri-plugin-opener = "2"
 
 # Shared NIL crates — the client reuses the exact same code as the services, so the
 # client and node can never drift on the wire format (architecture spec §3).
+# Base (mobile-safe): just the Transport trait + loopback. The heavy MASQUE/QUIC transports
+# and the OS datapath are pulled in only on desktop (see the [target.…] section below), so the
+# iOS/Android cross-compile stays light — mobile uses a NEPacketTunnelProvider/VpnService
+# datapath built separately.
 nil-core = { workspace = true }
 nil-proto = { workspace = true }
 nil-transport = { workspace = true }
@@ -37,3 +41,10 @@ anyhow = { workspace = true }
 
 # HTTP to the Portal. rustls (not OpenSSL) to match the project's TLS standard.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Desktop only: the real MASQUE/PQ-WireGuard transports + the OS datapath (TUN, routing,
+# fail-closed kill-switch) and the shared `launch` builder the engine uses to bring up a real
+# tunnel. Target-gated so mobile builds never pull quiche/boringtun/tun-rs.
+[target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
+nil-transport = { workspace = true, features = ["masque", "pqwg"] }
+nil-datapath = { workspace = true, features = ["launch"] }
