@@ -31,16 +31,24 @@ impl CoordConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
-        // The token verifier loads the issuer's PUBLIC key (hex DER) — it can check tokens but
-        // never mint them (the private key stays in the Portal).
+        // The token verifier loads the issuer's PUBLIC key(s) — it can check tokens but never
+        // mint them (the private key stays in the Portal). NW_TOKEN_PUBKEY is a COMMA-SEPARATED
+        // list of hex DER keys: hold both the old and new key during an issuer-key rotation so
+        // tokens minted under either verify with zero downtime.
         let verifier = match std::env::var("NW_TOKEN_PUBKEY") {
-            Ok(hex) => match from_hex(hex.trim()) {
-                Some(der) => Some(
-                    Verifier::from_public_der(&der)
-                        .map_err(|e| anyhow::anyhow!("NW_TOKEN_PUBKEY: {e}"))?,
-                ),
-                None => anyhow::bail!("NW_TOKEN_PUBKEY is not valid hex"),
-            },
+            Ok(list) => {
+                let ders: Vec<Vec<u8>> = list
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|h| from_hex(h).ok_or_else(|| anyhow::anyhow!("NW_TOKEN_PUBKEY entry is not valid hex")))
+                    .collect::<anyhow::Result<_>>()?;
+                if ders.is_empty() {
+                    None
+                } else {
+                    Some(Verifier::from_public_ders(&ders).map_err(|e| anyhow::anyhow!("NW_TOKEN_PUBKEY: {e}"))?)
+                }
+            }
             Err(_) => None,
         };
         let nullifier_path = std::env::var("NW_NULLIFIER_PATH").ok().map(PathBuf::from);

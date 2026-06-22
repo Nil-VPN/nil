@@ -83,14 +83,34 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Load the issuer signing key. Order of preference:
+///   1. `NW_TOKEN_SECRET_FILE` — a raw DER key file (or a path a KMS/secrets-mount populates).
+///      Preferred: a file doesn't leak through `/proc/<pid>/environ` or process listings the way
+///      an env var does (runbook §9 — the issuer key is the most sensitive secret).
+///   2. `NW_TOKEN_SECRET` — hex DER (convenient for the Docker harness).
+///   3. Generate an ephemeral key (dev) + a warning.
+///
+/// For an HSM/KMS deployment the signing key never leaves the device: implement
+/// [`crate::tokens::TokenSigner`] against the HSM and construct `TokenState` with it instead of
+/// an in-memory `Issuer`.
+///
+/// Rotation (zero downtime): generate a new key, add its public DER to the Coordinator's
+/// `NW_TOKEN_PUBKEY` list (it accepts a comma-separated set), switch the Portal to the new key,
+/// then drop the old public key once outstanding old-key tokens have expired.
 fn load_or_generate_issuer() -> Result<Issuer> {
-    match std::env::var("NW_TOKEN_SECRET") {
-        Ok(hex_der) => {
-            let der = decode_hex(hex_der.trim()).ok_or_else(|| anyhow::anyhow!("NW_TOKEN_SECRET not hex"))?;
-            Ok(Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET: {e}"))?)
-        }
-        Err(_) => Ok(Issuer::generate().map_err(|e| anyhow::anyhow!("issuer keygen: {e}"))?),
+    if let Ok(path) = std::env::var("NW_TOKEN_SECRET_FILE") {
+        let der = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read NW_TOKEN_SECRET_FILE {path}: {e}"))?;
+        return Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET_FILE: {e}"));
     }
+    if let Ok(hex_der) = std::env::var("NW_TOKEN_SECRET") {
+        let der = decode_hex(hex_der.trim()).ok_or_else(|| anyhow::anyhow!("NW_TOKEN_SECRET not hex"))?;
+        return Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET: {e}"));
+    }
+    tracing::warn!(
+        "no issuer key configured (NW_TOKEN_SECRET_FILE / NW_TOKEN_SECRET) — generating an \
+         EPHEMERAL key; tokens won't survive a restart and the Coordinator must pin the logged pubkey"
+    );
+    Issuer::generate().map_err(|e| anyhow::anyhow!("issuer keygen: {e}"))
 }
 
 fn hex(b: &[u8]) -> String {

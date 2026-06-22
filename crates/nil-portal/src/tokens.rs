@@ -16,11 +16,31 @@ use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
 
 use crate::monero::PaymentWatcher;
 
+/// The issuer's signing capability, abstracted so the RSA private key can live in an HSM/KMS in
+/// production rather than process memory (runbook §9 names it the single most sensitive secret).
+/// The in-memory [`Issuer`] is the default; an HSM/KMS backend implements this trait and calls
+/// the device — `TokenState` never assumes the key is in-process.
+pub trait TokenSigner: Send + Sync {
+    /// Blind-sign a client's blinded token request.
+    fn blind_sign(&self, blind_msg: &[u8]) -> anyhow::Result<Vec<u8>>;
+    /// The issuer's public key (DER) — handed to clients and pinned by the verifier.
+    fn public_der(&self) -> anyhow::Result<Vec<u8>>;
+}
+
+impl TokenSigner for Issuer {
+    fn blind_sign(&self, blind_msg: &[u8]) -> anyhow::Result<Vec<u8>> {
+        Issuer::blind_sign(self, blind_msg).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+    fn public_der(&self) -> anyhow::Result<Vec<u8>> {
+        Issuer::public_der(self).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
 /// Issuer-side state. Separate from the account `AppState` (different trust concern); merged
 /// into the Portal router via `Router::merge`.
 #[derive(Clone)]
 pub struct TokenState {
-    pub issuer: Arc<Issuer>,
+    pub issuer: Arc<dyn TokenSigner>,
     pub watcher: Arc<dyn PaymentWatcher>,
     /// Payment ids already used to issue a token — one token per payment. Durable across
     /// restarts (file-backed in production), or a restart would re-permit a double-issue for an
@@ -31,12 +51,16 @@ pub struct TokenState {
 
 impl TokenState {
     /// Dev/test state with a volatile (in-memory) one-token-per-payment set.
-    pub fn new(issuer: Arc<Issuer>, watcher: Arc<dyn PaymentWatcher>) -> Self {
+    pub fn new(issuer: Arc<dyn TokenSigner>, watcher: Arc<dyn PaymentWatcher>) -> Self {
         Self { issuer, watcher, issued: Arc::new(DurableSet::in_memory()) }
     }
 
     /// Production state with a caller-provided (durable) one-token-per-payment set.
-    pub fn with_issued(issuer: Arc<Issuer>, watcher: Arc<dyn PaymentWatcher>, issued: Arc<DurableSet>) -> Self {
+    pub fn with_issued(
+        issuer: Arc<dyn TokenSigner>,
+        watcher: Arc<dyn PaymentWatcher>,
+        issued: Arc<DurableSet>,
+    ) -> Self {
         Self { issuer, watcher, issued }
     }
 }

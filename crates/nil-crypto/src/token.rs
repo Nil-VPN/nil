@@ -66,19 +66,42 @@ impl Issuer {
     }
 }
 
-/// Verifier side (Coordinator trust domain): holds only the public key.
+/// Verifier side (Coordinator trust domain): holds only public key(s).
+///
+/// It can hold MORE THAN ONE public key so issuer keys rotate without downtime: during a
+/// rotation both the old and new key are accepted, so a token minted under either verifies
+/// (architecture spec §7 / runbook §9). The private key never reaches this trust domain.
 pub struct Verifier {
-    pk: PublicKey,
+    keys: Vec<PublicKey>,
 }
 
 impl Verifier {
+    /// A single-key verifier.
     pub fn from_public_der(der: &[u8]) -> Result<Self, TokenError> {
-        Ok(Self { pk: PublicKey::from_der(der).map_err(map_rsa)? })
+        Ok(Self { keys: vec![PublicKey::from_der(der).map_err(map_rsa)?] })
     }
 
-    /// Verify a redeemed token: is `token_sig` the issuer's signature over `msg`?
+    /// A multi-key verifier (rotation window): a token verifies if ANY held key accepts it.
+    pub fn from_public_ders(ders: &[Vec<u8>]) -> Result<Self, TokenError> {
+        if ders.is_empty() {
+            return Err(TokenError::Rsa("verifier needs at least one public key".into()));
+        }
+        let keys = ders
+            .iter()
+            .map(|d| PublicKey::from_der(d).map_err(map_rsa))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { keys })
+    }
+
+    /// Verify a redeemed token: is `token_sig` a signature over `msg` under any held key?
     pub fn verify(&self, token_sig: &[u8], msg: &[u8]) -> bool {
-        self.pk.verify(&Signature(token_sig.to_vec()), None, msg).is_ok()
+        let sig = Signature(token_sig.to_vec());
+        self.keys.iter().any(|pk| pk.verify(&sig, None, msg).is_ok())
+    }
+
+    /// Number of public keys held (> 1 during a rotation window).
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
     }
 }
 
@@ -161,5 +184,28 @@ mod tests {
     #[test]
     fn verifier_cannot_be_built_from_a_bad_key() {
         assert!(Verifier::from_public_der(b"not a der key").is_err());
+    }
+
+    #[test]
+    fn multi_key_verifier_accepts_either_key_during_rotation() {
+        // Old + new issuer keys (a rotation window).
+        let old = Issuer::generate().unwrap();
+        let new = Issuer::generate().unwrap();
+        let old_pk = old.public_der().unwrap();
+        let new_pk = new.public_der().unwrap();
+
+        // A token minted under the OLD key.
+        let msg = token_msg();
+        let req = blind(&old_pk, &msg).unwrap();
+        let token = finalize(&old_pk, &req, &old.blind_sign(&req.blind_msg).unwrap()).unwrap();
+
+        // The verifier holding BOTH keys still accepts it (zero-downtime rotation).
+        let rotating = Verifier::from_public_ders(&[old_pk.clone(), new_pk.clone()]).unwrap();
+        assert_eq!(rotating.key_count(), 2);
+        assert!(rotating.verify(&token, &msg), "old-key token must verify during the rotation window");
+
+        // Once the old key is retired (verifier holds only the new key), the old token is refused.
+        let new_only = Verifier::from_public_ders(&[new_pk]).unwrap();
+        assert!(!new_only.verify(&token, &msg), "after rotation completes, old-key tokens are refused");
     }
 }
