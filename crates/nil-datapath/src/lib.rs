@@ -37,6 +37,10 @@ pub struct TunnelConfig {
     pub mtu: u16,
     pub dns: Vec<IpAddr>,
     pub kill_switch: bool,
+    /// Extra hosts whose direct traffic must bypass the tunnel (host-route exception + kill-switch
+    /// allow), beyond `node`. Used for obfuscation-cascade fallback nodes (e.g. the AmneziaWG
+    /// node): if a fallback rung's own UDP to its node went through the TUN it would loop.
+    pub also_except: Vec<String>,
 }
 
 /// Inputs the OS layer needs to arm routing/kill-switch/DNS.
@@ -45,6 +49,9 @@ pub struct ArmParams {
     pub tun_name: String,
     pub dns: Vec<IpAddr>,
     pub kill_switch: bool,
+    /// Additional node IPs to host-route-except + allow through the kill-switch (cascade
+    /// fallback nodes). Empty for a single-node tunnel.
+    pub also_except: Vec<IpAddr>,
 }
 
 /// OS-specific routing, kill-switch, and DNS control. `teardown` must be idempotent and
@@ -100,6 +107,13 @@ impl Tunnel {
         // multi-hop path. Its IP is the kill-switch host-route exception so the tunnel's own
         // QUIC doesn't loop; inner hops are reached through the tunnel and need no exception.
         let node_ip = resolve_ip(&cfg.node).await?;
+        // Extra hosts to except (cascade fallback nodes); skip any that don't resolve.
+        let mut also_except = Vec::new();
+        for host in &cfg.also_except {
+            if let Ok(ip) = resolve_host(host).await {
+                also_except.push(ip);
+            }
+        }
         // No node host/IP in logs — even on the client device, a session timeline must not be
         // reconstructable from tracing output (SOUL §3 / PD-2).
         tracing::info!("connecting MASQUE tunnel");
@@ -137,6 +151,7 @@ impl Tunnel {
             tun_name: tun_name.clone(),
             dns: cfg.dns.clone(),
             kill_switch: cfg.kill_switch,
+            also_except,
         }) {
             // Bringing up the network failed — tear down what we armed and close the session.
             net.teardown();
@@ -233,12 +248,18 @@ fn spawn_pumps(
 }
 
 async fn resolve_ip(node: &NodeEndpoint) -> anyhow::Result<IpAddr> {
-    let hp = format!("{}:{}", node.host, node.port);
+    resolve_host(&node.host).await
+}
+
+/// Resolve a bare host (or IP literal) to an `IpAddr` (port-agnostic — used for host-route
+/// exceptions).
+async fn resolve_host(host: &str) -> anyhow::Result<IpAddr> {
+    let hp = format!("{host}:0");
     let mut addrs = tokio::net::lookup_host(hp.clone())
         .await
         .map_err(|e| anyhow::anyhow!("resolve {hp}: {e}"))?;
     addrs
         .next()
         .map(|s| s.ip())
-        .ok_or_else(|| anyhow::anyhow!("no address for {hp}"))
+        .ok_or_else(|| anyhow::anyhow!("no address for {host}"))
 }

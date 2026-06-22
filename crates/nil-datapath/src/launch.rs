@@ -156,6 +156,14 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
             }
         };
 
+    // When the cascade is on, the AmneziaWG fallback node's traffic must also bypass the tunnel
+    // (else the fallback rung's own UDP to its node would loop through the TUN).
+    let also_except: Vec<String> = if std::env::var("NW_CASCADE").is_ok() {
+        std::env::var("NW_NODE_AMNEZIA_HOST").ok().into_iter().collect()
+    } else {
+        Vec::new()
+    };
+
     let cfg = TunnelConfig {
         node: routing_node,
         tun_name,
@@ -165,6 +173,7 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
         mtu,
         dns,
         kill_switch,
+        also_except,
     };
     Ok((transport, cfg))
 }

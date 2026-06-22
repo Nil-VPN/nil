@@ -18,6 +18,8 @@ pub struct LinuxNet {
     orig_default: Option<String>,
     /// Original `/etc/resolv.conf` contents.
     resolv_backup: Option<String>,
+    /// Extra node IPs host-route-excepted (cascade fallback nodes), to clean up on teardown.
+    also_except: Vec<IpAddr>,
 }
 
 impl NetControl for LinuxNet {
@@ -34,14 +36,20 @@ impl NetControl for LinuxNet {
         // 1. Capture the original default route so we can restore it.
         self.orig_default = capture_default_route();
 
-        // 2. Pin a host route to the node via the original path, so the tunnel's own QUIC
-        //    packets to the node bypass the TUN (avoids a routing loop / deadlock).
+        // 2. Pin a host route to the node (and any cascade fallback nodes) via the original path,
+        //    so the tunnel's own QUIC/UDP to them bypasses the TUN (avoids a routing loop).
         pin_node_route(p.node_ip)?;
+        for ip in &p.also_except {
+            if let Err(e) = pin_node_route(*ip) {
+                tracing::warn!("pin fallback node route (continuing): {e}");
+            }
+        }
+        self.also_except = p.also_except.clone();
 
         // 3. Arm the fail-closed kill-switch BEFORE flipping the default route — no window
         //    in which the default points at the TUN but traffic can still escape directly.
         if p.kill_switch {
-            arm_kill_switch(p.node_ip, &p.tun_name)?;
+            arm_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?;
             self.kill_switch = true;
         }
 
@@ -74,6 +82,9 @@ impl NetControl for LinuxNet {
             let _ = sh("ip", &["route", "del", "default", "dev", tun]);
         }
         if let Some(ip) = self.node_ip {
+            let _ = sh("ip", &["route", "del", &format!("{ip}/32")]);
+        }
+        for ip in &self.also_except {
             let _ = sh("ip", &["route", "del", &format!("{ip}/32")]);
         }
         // Disarm the kill-switch LAST, so connectivity only returns once routes/DNS are sane.
@@ -120,12 +131,18 @@ fn pin_node_route(node_ip: IpAddr) -> anyhow::Result<()> {
 /// Anything that tries to leave directly (bypassing the TUN) is dropped — INCLUDING IPv6.
 /// The tunnel is IPv4-only, so IPv6 is dropped wholesale (except loopback / the TUN); otherwise
 /// v6 traffic would sail around the v4 kill-switch — the classic VPN IPv6 leak.
-fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<()> {
-    let node = node_ip.to_string();
+fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<()> {
     sh("iptables", &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
     sh("iptables", &["-A", "OUTPUT", "-o", tun, "-j", "ACCEPT"])?;
+    // Allow the tunnel's own packets to the node — and to any cascade fallback node, on any port
+    // (a fallback rung may use a different UDP port than 443).
+    let node = node_ip.to_string();
     sh("iptables", &["-A", "OUTPUT", "-p", "udp", "-d", &node, "--dport", "443", "-j", "ACCEPT"])?;
     sh("iptables", &["-A", "OUTPUT", "-p", "tcp", "-d", &node, "--dport", "443", "-j", "ACCEPT"])?;
+    for ip in also_except {
+        let d = ip.to_string();
+        sh("iptables", &["-A", "OUTPUT", "-d", &d, "-j", "ACCEPT"])?;
+    }
     sh("iptables", &["-P", "OUTPUT", "DROP"])?;
 
     // Block all IPv6 egress (best-effort: if ip6tables is unavailable we warn loudly rather than

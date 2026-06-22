@@ -1,0 +1,61 @@
+# Host-safe obfuscation-cascade failover verification: a MASQUE node + an AmneziaWG node + a
+# client, all on a private bridge. deploy/verify-cascade.sh blocks the MASQUE node so the client
+# fails over to the AmneziaWG rung (architecture spec §4.3). Nothing touches the host network.
+
+x-node-base: &node-base
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  command: ["nil-node"]
+  cap_add: ["NET_ADMIN"]
+  devices: ["/dev/net/tun"]
+  sysctls:
+    - net.ipv4.ip_forward=1
+
+services:
+  # Primary rung: the default MASQUE/QUIC node (attested). The harness blocks UDP 443 to it so
+  # the client must step down to the fallback.
+  masque-node:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.10
+
+  # Fallback rung: the AmneziaWG responder (obfuscated WireGuard on UDP). Logs its WG pubkey.
+  awg-node:
+    <<: *node-base
+    environment:
+      - NW_NODE_AMNEZIA=1
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.11
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["sleep", "infinity"]
+    environment:
+      - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    depends_on: [masque-node, awg-node]
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.30
+
+networks:
+  nilnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.80.0.0/24

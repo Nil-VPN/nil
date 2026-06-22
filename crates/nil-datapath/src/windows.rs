@@ -49,6 +49,8 @@ pub struct WinNet {
     /// Saved per-profile `DefaultOutboundAction` (e.g. `Domain=Allow;Private=Allow;Public=Allow`)
     /// to restore on teardown.
     ks_saved: Option<String>,
+    /// Extra node IPs host-route-excepted (cascade fallback nodes), to clean up on teardown.
+    also_except: Vec<IpAddr>,
 }
 
 impl NetControl for WinNet {
@@ -59,9 +61,10 @@ impl NetControl for WinNet {
         // Fail-closed: arm the kill-switch BEFORE flipping the default route (no leak window).
         // Any cmdlet error aborts the whole bring-up rather than running unprotected.
         if p.kill_switch {
-            self.ks_saved = Some(arm_kill_switch(p.node_ip, &p.tun_name)?);
+            self.ks_saved = Some(arm_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?);
             self.kill_switch = true;
         }
+        self.also_except = p.also_except.clone();
 
         // Resolve interface indices we need for routing.
         let tun_idx = if_index_for_name(&p.tun_name)
@@ -78,6 +81,13 @@ impl NetControl for WinNet {
             let nh = format!("nexthop={gw}");
             if let Err(e) = sh("netsh", &["interface", "ipv4", "add", "route", &pfx, &ifc, &nh, "metric=1", "store=active"]) {
                 tracing::warn!("pin node route (continuing; may be on-link): {e}");
+            }
+            // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
+            for ip in &p.also_except {
+                let pfx = format!("prefix={ip}/32");
+                if let Err(e) = sh("netsh", &["interface", "ipv4", "add", "route", &pfx, &ifc, &nh, "metric=1", "store=active"]) {
+                    tracing::warn!("pin fallback node route (continuing): {e}");
+                }
             }
         } else {
             tracing::warn!("no default route found; skipping node host-route pin");
@@ -111,11 +121,15 @@ impl NetControl for WinNet {
             let _ = sh("netsh", &["interface", "ipv4", "delete", "route", "prefix=0.0.0.0/1", &ifc]);
             let _ = sh("netsh", &["interface", "ipv4", "delete", "route", "prefix=128.0.0.0/1", &ifc]);
         }
-        // Remove the pinned node route.
-        if let (Some(ip), Some(orig)) = (self.node_ip, self.orig_idx) {
-            let pfx = format!("prefix={ip}/32");
+        // Remove the pinned node route(s).
+        if let Some(orig) = self.orig_idx {
             let ifc = format!("interface={orig}");
-            let _ = sh("netsh", &["interface", "ipv4", "delete", "route", &pfx, &ifc]);
+            if let Some(ip) = self.node_ip {
+                let _ = sh("netsh", &["interface", "ipv4", "delete", "route", &format!("prefix={ip}/32"), &ifc]);
+            }
+            for ip in &self.also_except {
+                let _ = sh("netsh", &["interface", "ipv4", "delete", "route", &format!("prefix={ip}/32"), &ifc]);
+            }
         }
         // The wintun adapter (and its per-interface DNS) disappears when tun-rs drops the
         // device, so there is no host DNS state to restore.
@@ -201,7 +215,7 @@ const KS_GROUP: &str = "NIL-VPN-killswitch";
 /// (`FwpmEngineOpen0` dynamic session; PERMIT on `FWPM_CONDITION_IP_LOCAL_INTERFACE` == the TUN
 /// LUID + the node endpoint; default-block sublayer) — union-heavy unsafe FFI better written
 /// with a Windows compiler in the loop.
-fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<String> {
+fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<String> {
     let node = node_ip.to_string();
     // 1. Capture the current default outbound action per profile (e.g. "Domain=Allow;...").
     let saved = ps(
@@ -223,6 +237,13 @@ fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<String> {
         "New-NetFirewallRule -DisplayName 'NIL allow node TCP' -Group '{KS_GROUP}' -Direction Outbound \
          -Action Allow -RemoteAddress {node} -Protocol TCP -RemotePort 443 -Profile Any | Out-Null"
     ))?;
+    // Allow the tunnel's own traffic to any cascade fallback node (any port/protocol).
+    for ip in also_except {
+        ps(&format!(
+            "New-NetFirewallRule -DisplayName 'NIL allow fallback {ip}' -Group '{KS_GROUP}' \
+             -Direction Outbound -Action Allow -RemoteAddress {ip} -Profile Any | Out-Null"
+        ))?;
+    }
     // 3. Default-deny the rest (Allow rules override the default; we add no Block rules, so there
     //    is no block-wins conflict that could break tunneled traffic).
     ps("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block")?;

@@ -24,6 +24,8 @@ pub struct MacNet {
     pf_was_enabled: bool,
     dns_service: Option<String>,
     dns_backup: Option<Vec<String>>,
+    /// Extra node IPs host-route-excepted (cascade fallback nodes), to clean up on teardown.
+    also_except: Vec<IpAddr>,
 }
 
 impl NetControl for MacNet {
@@ -39,10 +41,17 @@ impl NetControl for MacNet {
         if let Err(e) = sh("route", &["-n", "add", "-host", &p.node_ip.to_string(), &gw]) {
             tracing::warn!("pin node route (continuing; may be on-link): {e}");
         }
+        // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
+        for ip in &p.also_except {
+            if let Err(e) = sh("route", &["-n", "add", "-host", &ip.to_string(), &gw]) {
+                tracing::warn!("pin fallback node route (continuing): {e}");
+            }
+        }
+        self.also_except = p.also_except.clone();
 
         // 3. Arm the kill-switch BEFORE flipping the default route.
         if p.kill_switch {
-            self.arm_pf(p.node_ip, &p.tun_name)?;
+            self.arm_pf(p.node_ip, &p.also_except, &p.tun_name)?;
             self.kill_switch = true;
         }
 
@@ -82,8 +91,11 @@ impl NetControl for MacNet {
         // Remove our default routes.
         let _ = sh("route", &["-n", "delete", "-net", "0.0.0.0/1"]);
         let _ = sh("route", &["-n", "delete", "-net", "128.0.0.0/1"]);
-        // Remove the pinned node route.
+        // Remove the pinned node route(s).
         if let Some(ip) = self.node_ip {
+            let _ = sh("route", &["-n", "delete", "-host", &ip.to_string()]);
+        }
+        for ip in &self.also_except {
             let _ = sh("route", &["-n", "delete", "-host", &ip.to_string()]);
         }
         // Disarm the kill-switch LAST (connectivity only returns once routes/DNS are sane).
@@ -101,7 +113,7 @@ impl NetControl for MacNet {
 }
 
 impl MacNet {
-    fn arm_pf(&mut self, node_ip: IpAddr, tun: &str) -> anyhow::Result<()> {
+    fn arm_pf(&mut self, node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<()> {
         // Snapshot the current ruleset + enabled state.
         let backup = std::env::temp_dir().join(format!("nil-pf-backup-{}.conf", std::process::id()));
         let cur = Command::new("pfctl").args(["-sr"]).output()?;
@@ -111,7 +123,7 @@ impl MacNet {
         self.pf_was_enabled = String::from_utf8_lossy(&info.stdout).contains("Status: Enabled");
 
         let node = node_ip.to_string();
-        let rules = format!(
+        let mut rules = format!(
             "set block-policy drop\n\
              set skip on lo0\n\
              block drop all\n\
@@ -121,6 +133,10 @@ impl MacNet {
              pass out quick proto tcp from any to {node} port 443\n\
              pass in  quick proto tcp from {node} port 443 to any\n"
         );
+        // Allow the tunnel's own traffic to any cascade fallback node (any port).
+        for ip in also_except {
+            rules.push_str(&format!("pass quick from any to {ip}\n"));
+        }
         let mut child = Command::new("pfctl")
             .args(["-f", "-"])
             .stdin(Stdio::piped())
