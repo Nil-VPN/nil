@@ -15,14 +15,16 @@ serde_json = { workspace = true }               # TDX DCAP collateral is JSON
 sha2 = { workspace = true }                     # report_data binding (SHA-256/512)
 subtle = { workspace = true }                   # constant-time measurement/nonce comparison
 thiserror = { workspace = true }
-# Synthetic attestation signer/verifier (Ed25519) — only compiled with the `synthetic` feature.
+# Synthetic attestation signer/verifier (Ed25519 + a cert builder) — only compiled with the
+# `synthetic` feature; the node enables it for the Docker harness, never a release client.
 ed25519-dalek = { version = "2", optional = true }
+rcgen = { workspace = true, optional = true }
 
 [features]
 # Test-only synthetic attestation: a report signed by an Ed25519 CA we control, so the Docker
 # accept/reject harness needs no real TEE hardware. NEVER enabled in a release client — the
 # synthetic trust anchor is unreachable without this feature.
-synthetic = ["dep:ed25519-dalek"]
+synthetic = ["dep:ed25519-dalek", "dep:rcgen"]
 
 [dev-dependencies]
 hex = "0.4"
