@@ -196,7 +196,8 @@ fn handle_packet(
     getrandom::getrandom(&mut scid).map_err(|_| anyhow::anyhow!("scid entropy"))?;
     let scid_cid = quiche::ConnectionId::from_ref(&scid);
     let conn = quiche::accept(&scid_cid, None, local, from, config)?;
-    tracing::info!(%from, "new QUIC connection accepted");
+    // No source address logged: nil-node is the data plane (SOUL §3 / PD-3 — no source-IP retention).
+    tracing::info!("new QUIC connection accepted");
 
     let mut client = Client {
         conn,

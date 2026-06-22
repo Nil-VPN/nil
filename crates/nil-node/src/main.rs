@@ -28,9 +28,11 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::NodeConfig::from_env()?;
+    // `bind`/`egress` are the node operator's own infra addresses (operational, not
+    // user-linkable); the tunnel-internal addressing (node/client IPs) is deliberately
+    // NOT logged — it reads as user data and the datapath must stay logless (SOUL §3 / PD-3).
     tracing::info!(
-        bind = %cfg.bind, egress = %cfg.egress, tun = %cfg.tun_name,
-        node_ip = %cfg.node_tun_ip, client_ip = %cfg.client_ip, role = ?cfg.role,
+        bind = %cfg.bind, egress = %cfg.egress, tun = %cfg.tun_name, role = ?cfg.role,
         "nil-node starting (MASQUE/CONNECT-IP; no disk logs)"
     );
 

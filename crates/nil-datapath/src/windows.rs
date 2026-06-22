@@ -9,19 +9,27 @@
 //! disarm the kill-switch *last*. We add two `/1` routes through the TUN (leaving the real
 //! default in the table) so teardown is just "delete what we added".
 //!
-//! ## Kill-switch is deliberately deferred to the Windows VM pass — and why
-//! A correct Windows kill-switch requires **WFP** (Windows Filtering Platform), not
-//! `netsh advfirewall`: the firewall CLI can only scope allow-rules by `interfacetype`
-//! (lan/wireless/ras), never by a specific interface. A coarse "block all egress except to
-//! the node" firewall rule would therefore block real application traffic *before* it enters
-//! the tunnel (its destination is an arbitrary internet IP, not the node) — breaking tunneling
-//! rather than being fail-closed. WireGuard-for-Windows solves this with a WFP filter that
-//! *permits traffic whose local interface is the tunnel LUID* plus permits to the node
-//! endpoint and blocks everything else. That WFP filter set is union-heavy unsafe FFI that
-//! cannot be written with confidence without a real Windows compiler+host in the loop, so it
-//! is implemented and verified in the VM session (see the TODO in [`arm_kill_switch`] for the
-//! exact filter set to install). Until then we stay **honestly fail-closed**: we refuse to
-//! bring the tunnel up with the kill-switch requested rather than silently run without one.
+//! ## Kill-switch via the Windows Firewall (NetSecurity cmdlets) — PENDING VM VERIFICATION
+//! `netsh advfirewall` can only scope allow-rules by `interfacetype` (lan/wireless/ras), never
+//! by a specific adapter — so a coarse "block all except the node" rule would block real app
+//! traffic before it enters the tunnel (its destination is an arbitrary internet IP, not the
+//! node). The newer **NetSecurity** cmdlets do not have that limitation: `New-NetFirewallRule
+//! -InterfaceAlias <tun>` matches traffic by its *outgoing interface*, which is exactly the
+//! tunneled-app case `netsh` couldn't express, and these rules are WFP-backed under the hood.
+//!
+//! So the kill-switch is: set the per-profile default **outbound action to Block** (the default
+//! action is overridden by Allow rules, and we add no Block rules, so there is no block-wins
+//! conflict), then Allow outbound on the TUN interface and the encapsulated QUIC/TCP to the
+//! node. Loopback is exempt from the firewall by default. Teardown removes our rule group and
+//! restores the captured default action.
+//!
+//! **This is implemented but NOT yet verified** — it cannot be compiled or run on the build
+//! host (no Windows target/linker), only on the Windows-on-ARM VM. It is built as plain
+//! `std::process` cmdlet shell-outs (no unsafe FFI), and arming is fail-closed: any cmdlet
+//! error aborts the bring-up (the tunnel refuses to come up) rather than running unprotected.
+//! A future hardening pass may replace it with a dynamic WFP filter set (WireGuard-for-Windows
+//! style: a `FwpmEngineOpen0` session whose filters auto-remove if the process dies), which
+//! avoids mutating the user's firewall profile at all — see the recipe in `arm_kill_switch`.
 
 use std::net::IpAddr;
 use std::process::Command;
@@ -38,6 +46,9 @@ pub struct WinNet {
     /// Interface index of the original default-route adapter (for the node /32 pin).
     orig_idx: Option<u32>,
     kill_switch: bool,
+    /// Saved per-profile `DefaultOutboundAction` (e.g. `Domain=Allow;Private=Allow;Public=Allow`)
+    /// to restore on teardown.
+    ks_saved: Option<String>,
 }
 
 impl NetControl for WinNet {
@@ -45,10 +56,10 @@ impl NetControl for WinNet {
         self.node_ip = Some(p.node_ip);
         self.tun_name = Some(p.tun_name.clone());
 
-        // Honest fail-closed: a real Windows kill-switch needs WFP (see module docs). Until
-        // that lands+verifies in the VM, refuse rather than run without the requested guard.
+        // Fail-closed: arm the kill-switch BEFORE flipping the default route (no leak window).
+        // Any cmdlet error aborts the whole bring-up rather than running unprotected.
         if p.kill_switch {
-            arm_kill_switch(p.node_ip, &p.tun_name)?;
+            self.ks_saved = Some(arm_kill_switch(p.node_ip, &p.tun_name)?);
             self.kill_switch = true;
         }
 
@@ -86,7 +97,7 @@ impl NetControl for WinNet {
         }
 
         self.armed = true;
-        tracing::info!(node = %p.node_ip, tun = %p.tun_name, tun_idx, kill_switch = p.kill_switch, "Windows datapath armed");
+        tracing::info!(tun = %p.tun_name, tun_idx, kill_switch = p.kill_switch, "Windows datapath armed");
         Ok(())
     }
 
@@ -111,7 +122,7 @@ impl NetControl for WinNet {
         //
         // Disarm the kill-switch LAST so connectivity only returns once routes are sane.
         if self.kill_switch {
-            disarm_kill_switch();
+            disarm_kill_switch(self.ks_saved.as_deref());
         }
         self.armed = false;
         tracing::info!("Windows datapath torn down; networking restored");
@@ -170,32 +181,83 @@ fn set_dns(tun: &str, dns: &[IpAddr]) {
     }
 }
 
-/// Arm the fail-closed kill-switch.
+/// Firewall rule group, so teardown removes exactly our rules.
+const KS_GROUP: &str = "NIL-VPN-killswitch";
+
+/// Arm the fail-closed kill-switch via the Windows Firewall (NetSecurity cmdlets). Returns the
+/// captured per-profile `DefaultOutboundAction` to restore on teardown.
 ///
-/// TODO(windows-vm): implement via WFP (`fwpuclnt.dll`), modeled on WireGuard-for-Windows
-/// `firewall`. The `windows` crate (0.61, already in the dep tree via tun-rs) has ergonomic
-/// WFP bindings — use it rather than raw `windows-sys`. The filter set, in one transaction:
-/// open a *dynamic* engine session (`FwpmEngineOpen0` — filters auto-remove if the process
-/// dies, itself a fail-closed property); add a dedicated sublayer at max weight; install BLOCK
-/// filters at low weight on the `ALE_AUTH_CONNECT_V4/V6` and `ALE_AUTH_RECV_ACCEPT_V4/V6`
-/// layers (the default-deny); then PERMIT filters at higher weight for
-/// `FWPM_CONDITION_IP_LOCAL_INTERFACE` == the TUN LUID (the tunneled app traffic — the piece
-/// `netsh advfirewall` cannot express), the node endpoint (UDP/TCP to `node_ip`:443, i.e. the
-/// encapsulated QUIC), loopback, and DHCP/DNS as needed; commit. Resolve the TUN LUID via
-/// `ConvertInterfaceAliasToLuid(tun_name)`. Teardown is `FwpmSubLayerDeleteByKey0` +
-/// `FwpmEngineClose0` (a dynamic session also cleans up on close). Verified in the VM (host
-/// untouched) before this returns `Ok`.
-fn arm_kill_switch(_node_ip: IpAddr, _tun: &str) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "Windows kill-switch (WFP) is implemented and verified in the Windows-VM pass; it is \
-         not active yet. Re-run with NW_KILLSWITCH=0 for functional (no-kill-switch) bring-up \
-         testing, or wait for the WFP kill-switch to land. Refusing to run fail-open."
-    )
+/// PENDING WINDOWS-VM VERIFICATION (cannot be compiled or run on the build host). The mechanism:
+///   1. capture each profile's current default outbound action,
+///   2. add Allow rules (our group) for the TUN interface and the encapsulated QUIC/TCP to the
+///      node — loopback is firewall-exempt by default,
+///   3. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
+///      anything trying to bypass the tunnel) is dropped.
+/// Allows precede the Block flip, so the only transient state is "more blocked", never a leak.
+/// Any cmdlet error returns `Err`, aborting the bring-up (fail-closed) rather than running open.
+///
+/// A future hardening pass may swap this for a dynamic WFP filter set (WireGuard-for-Windows
+/// style) that avoids mutating the user's firewall profile and auto-removes if the process dies
+/// (`FwpmEngineOpen0` dynamic session; PERMIT on `FWPM_CONDITION_IP_LOCAL_INTERFACE` == the TUN
+/// LUID + the node endpoint; default-block sublayer) — union-heavy unsafe FFI better written
+/// with a Windows compiler in the loop.
+fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<String> {
+    let node = node_ip.to_string();
+    // 1. Capture the current default outbound action per profile (e.g. "Domain=Allow;...").
+    let saved = ps(
+        "(Get-NetFirewallProfile -Profile Domain,Private,Public | \
+         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'",
+    )?;
+    // Clear any stale rules from a previous run (idempotent).
+    let _ = ps(&format!("Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"));
+    // 2. Allow the tunnel interface and the encapsulated QUIC/TCP to the node.
+    ps(&format!(
+        "New-NetFirewallRule -DisplayName 'NIL allow TUN' -Group '{KS_GROUP}' -Direction Outbound \
+         -Action Allow -InterfaceAlias '{tun}' -Profile Any | Out-Null"
+    ))?;
+    ps(&format!(
+        "New-NetFirewallRule -DisplayName 'NIL allow node UDP' -Group '{KS_GROUP}' -Direction Outbound \
+         -Action Allow -RemoteAddress {node} -Protocol UDP -RemotePort 443 -Profile Any | Out-Null"
+    ))?;
+    ps(&format!(
+        "New-NetFirewallRule -DisplayName 'NIL allow node TCP' -Group '{KS_GROUP}' -Direction Outbound \
+         -Action Allow -RemoteAddress {node} -Protocol TCP -RemotePort 443 -Profile Any | Out-Null"
+    ))?;
+    // 3. Default-deny the rest (Allow rules override the default; we add no Block rules, so there
+    //    is no block-wins conflict that could break tunneled traffic).
+    ps("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block")?;
+    Ok(saved)
 }
 
-/// Tear down the WFP kill-switch. No-op until [`arm_kill_switch`] is implemented (a dynamic
-/// WFP session also auto-removes its filters when its engine handle closes / the process exits).
-fn disarm_kill_switch() {}
+/// Tear down the kill-switch: restore each profile's saved default action, then remove our rules.
+fn disarm_kill_switch(saved: Option<&str>) {
+    if let Some(saved) = saved {
+        for entry in saved.split(';') {
+            if let Some((name, action)) = entry.split_once('=') {
+                let (name, action) = (name.trim(), action.trim());
+                if !name.is_empty() && !action.is_empty() {
+                    let _ = ps(&format!(
+                        "Set-NetFirewallProfile -Profile {name} -DefaultOutboundAction {action}"
+                    ));
+                }
+            }
+        }
+    }
+    let _ = ps(&format!("Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"));
+}
+
+/// Run a PowerShell command, returning trimmed stdout. Errors on a non-zero exit.
+fn ps(script: &str) -> anyhow::Result<String> {
+    tracing::debug!("$ powershell -Command {script}");
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn powershell: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!("powershell `{script}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
 
 fn sh(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
     tracing::debug!("$ {cmd} {}", args.join(" "));

@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
         .init();
 
     let (transport, cfg) = launch::from_env()?;
-    tracing::info!(node = %cfg.node.host, port = cfg.node.port, "nil-cli connecting…");
+    tracing::info!("nil-cli connecting…");
     let tunnel = Tunnel::up(transport, cfg).await?;
     tracing::info!("nil-cli connected — tunnel up. Ctrl-C to disconnect.");
 

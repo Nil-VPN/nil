@@ -565,7 +565,7 @@ async fn driver_run(
                                             if let Some(tx) = ready_tx.take() {
                                                 let mdp = conn.dgram_max_writable_len().unwrap_or(1200);
                                                 let _ = tx.send(Ok(ReadyInfo { max_dgram_payload: mdp }));
-                                                tracing::info!(%peer, flow_id, "MASQUE CONNECT-IP established");
+                                                tracing::info!(flow_id, "MASQUE CONNECT-IP established");
                                             }
                                         }
                                         Err(e) => {
@@ -658,7 +658,7 @@ async fn driver_run(
 
         if conn.is_closed() {
             fail!(Error::Closed);
-            tracing::info!(%peer, "MASQUE connection closed");
+            tracing::info!("MASQUE connection closed");
             return;
         }
     }

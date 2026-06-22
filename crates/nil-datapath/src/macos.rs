@@ -66,7 +66,7 @@ impl NetControl for MacNet {
         }
 
         self.armed = true;
-        tracing::info!(node = %p.node_ip, tun = %p.tun_name, kill_switch = p.kill_switch, "macOS datapath armed");
+        tracing::info!(tun = %p.tun_name, kill_switch = p.kill_switch, "macOS datapath armed");
         Ok(())
     }
 

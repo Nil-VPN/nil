@@ -100,7 +100,9 @@ impl Tunnel {
         // multi-hop path. Its IP is the kill-switch host-route exception so the tunnel's own
         // QUIC doesn't loop; inner hops are reached through the tunnel and need no exception.
         let node_ip = resolve_ip(&cfg.node).await?;
-        tracing::info!(node = %cfg.node.host, %node_ip, "connecting MASQUE tunnel");
+        // No node host/IP in logs — even on the client device, a session timeline must not be
+        // reconstructable from tracing output (SOUL §3 / PD-2).
+        tracing::info!("connecting MASQUE tunnel");
 
         // Fresh per-connection nonce: the transport sends it to the node, which must bind it
         // into its attestation report's report_data, and the appraisal checks the binding.
@@ -144,7 +146,7 @@ impl Tunnel {
 
         let cancel = CancellationToken::new();
         let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
-        tracing::info!(tun = %tun_name, client_ip = %cfg.client_ip, "tunnel up");
+        tracing::info!(tun = %tun_name, "tunnel up");
 
         Ok(Tunnel { transport, session: Some(session), net, cancel, pumps, _tun: tun })
     }

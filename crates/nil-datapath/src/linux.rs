@@ -54,7 +54,7 @@ impl NetControl for LinuxNet {
         }
 
         self.armed = true;
-        tracing::info!(node = %p.node_ip, tun = %p.tun_name, kill_switch = p.kill_switch, "datapath armed");
+        tracing::info!(tun = %p.tun_name, kill_switch = p.kill_switch, "datapath armed");
         Ok(())
     }
 

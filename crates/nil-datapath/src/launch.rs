@@ -103,7 +103,7 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
                 tracing::warn!("NW_PATH set — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
             }
             let entry = hops[0].clone();
-            tracing::info!(hops = hops.len(), entry = %entry.host, "multi-hop trust-split path");
+            tracing::info!(hops = hops.len(), "multi-hop trust-split path");
             // The inner hops' QUIC is stamped with the client tunnel address so the relaying
             // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
             let inner = MasqueTransport::with_config(MasqueConfig {

@@ -103,6 +103,10 @@ fn load_or_generate_issuer() -> Result<Issuer> {
         return Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET_FILE: {e}"));
     }
     if let Ok(hex_der) = std::env::var("NW_TOKEN_SECRET") {
+        tracing::warn!(
+            "NW_TOKEN_SECRET (env) in use — the issuer key leaks via /proc/<pid>/environ and process \
+             listings; prefer NW_TOKEN_SECRET_FILE (or an HSM/KMS TokenSigner) in production"
+        );
         let der = decode_hex(hex_der.trim()).ok_or_else(|| anyhow::anyhow!("NW_TOKEN_SECRET not hex"))?;
         return Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET: {e}"));
     }

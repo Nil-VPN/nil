@@ -146,7 +146,8 @@ impl AppEngine {
     async fn bring_up_real() -> Result<nil_datapath::Tunnel, EngineError> {
         let (transport, cfg) =
             nil_datapath::launch::from_env().map_err(|e| EngineError::Transport(e.to_string()))?;
-        eprintln!("[nil-client] bringing up real datapath via {}:{}", cfg.node.host, cfg.node.port);
+        // No node address in logs (SOUL §3 / PD-2); structured tracing, not raw stderr.
+        tracing::debug!("bringing up real datapath");
         nil_datapath::Tunnel::up(transport, cfg)
             .await
             .map_err(|e| EngineError::Transport(e.to_string()))
