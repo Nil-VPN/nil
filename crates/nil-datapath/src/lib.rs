@@ -92,7 +92,10 @@ pub struct Tunnel {
 
 impl Tunnel {
     /// Connect the transport, bring up the TUN + routes + kill-switch, and start pumping.
-    pub async fn up(transport: Arc<dyn Transport>, cfg: TunnelConfig) -> anyhow::Result<Tunnel> {
+    pub async fn up(transport: Arc<dyn Transport>, mut cfg: TunnelConfig) -> anyhow::Result<Tunnel> {
+        // `cfg.node` is the directly-reachable hop: a single node, or the *entry* of a
+        // multi-hop path. Its IP is the kill-switch host-route exception so the tunnel's own
+        // QUIC doesn't loop; inner hops are reached through the tunnel and need no exception.
         let node_ip = resolve_ip(&cfg.node).await?;
         tracing::info!(node = %cfg.node.host, %node_ip, "connecting MASQUE tunnel");
 
@@ -107,6 +110,17 @@ impl Tunnel {
             .await
             .map_err(|e| anyhow::anyhow!("transport connect: {e}"))?;
         tracing::info!("tunnel session established; bringing up TUN + routes");
+
+        // Size the TUN to the tunnel's negotiated usable MTU. Each nested hop shrinks it (the
+        // inner QUIC rides the outer tunnel), so a multi-hop onion ends up smaller than a single
+        // tunnel; clamp to the configured ceiling so we never grow it past what the OS expects.
+        if let Some(m) = transport.tunnel_mtu(&session) {
+            let m = m.min(u16::MAX as usize) as u16;
+            if m < cfg.mtu {
+                tracing::info!(negotiated = m, configured = cfg.mtu, "sizing TUN to negotiated tunnel MTU");
+                cfg.mtu = m;
+            }
+        }
 
         let tun = Arc::new(open_tun(&cfg).map_err(|e| anyhow::anyhow!("open tun: {e}"))?);
         // Resolve the actual interface name (macOS auto-assigns utunN; Linux honors our name).

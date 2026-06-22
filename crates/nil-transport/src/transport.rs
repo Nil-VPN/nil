@@ -2,7 +2,9 @@
 //!
 //! The bare `Result` in the spec binds to [`nil_core::Result`]; the referenced types
 //! (`NodeEndpoint`, `Grant`, `Session`, `IpPacket`, `TransportKind`, `Profile`) all
-//! live in `nil-core`. The trait body is otherwise reproduced verbatim.
+//! live in `nil-core`. The spec methods are reproduced verbatim; [`Transport::tunnel_mtu`] is
+//! an additive, defaulted accessor the datapath uses to size the TUN (it changes no behavior
+//! for existing transports).
 
 use async_trait::async_trait;
 use nil_core::{Grant, IpPacket, NodeEndpoint, Profile, Result, Session, TransportKind};
@@ -20,4 +22,11 @@ pub trait Transport: Send + Sync {
 
     fn kind(&self) -> TransportKind; // Masque | AmneziaWg | Wstunnel | Reality
     fn fingerprint_profile(&self) -> Profile; // how it should look on the wire
+
+    /// Usable inner MTU for a live session (the largest IP packet the tunnel can carry in one
+    /// frame), if known. The datapath sizes the TUN device from this; nested transports use it
+    /// to shrink each hop's payload. `None` ⇒ unknown (the default; e.g. loopback).
+    fn tunnel_mtu(&self, _session: &Session) -> Option<usize> {
+        None
+    }
 }

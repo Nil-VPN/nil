@@ -292,6 +292,11 @@ impl Transport for PqWgTransport {
     fn fingerprint_profile(&self) -> Profile {
         Profile::HttpsQuic
     }
+
+    fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
+        // Inherent method (priority over this trait method): MASQUE MTU minus WG's 32 bytes.
+        PqWgTransport::tunnel_mtu(self, session)
+    }
 }
 
 /// The data pump: app IP packets → WG encapsulate → inner MASQUE; inner MASQUE → WG

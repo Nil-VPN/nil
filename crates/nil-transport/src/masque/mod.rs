@@ -19,7 +19,7 @@
 //! (spec §5). No expectation pinned ⇒ the connection is unattested and the driver warns.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,13 +39,39 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_QUEUE: usize = 1024;
 const INBOUND_QUEUE: usize = 1024;
 const CONTROL_QUEUE: usize = 16;
-const MAX_UDP_PAYLOAD: usize = 1350;
+/// Max QUIC UDP payload for the **outermost** (real-socket) hop. 1420 keeps the wire packet
+/// (+28 B IPv4/UDP) at 1448 — under 1500 on every common path — while leaving headroom for the
+/// trust-split onion: each nested hop costs ~72 B (udpip + inner QUIC/datagram framing), so a
+/// 3-hop path's innermost QUIC payload (~1258 B) still clears QUIC's mandatory 1200 B floor.
+/// Nested hops derive a smaller value from the outer tunnel's negotiated MTU (see
+/// [`MasqueTransport::connect_nested`]).
+const MAX_UDP_PAYLOAD: usize = 1420;
+/// IPv4 (20) + UDP (8) header bytes [`crate::udpip`] adds when wrapping an inner QUIC packet to
+/// ride an outer tunnel. A nested hop's QUIC packets must fit in `outer_tunnel_mtu - this`.
+const UDPIP_OVERHEAD: usize = 28;
+/// QUIC's mandatory floor for `max_udp_payload_size` (RFC 9000 §18.2 / quiche). A nested hop
+/// whose computed inner payload drops below this is rejected — the path is too deep to carry
+/// QUIC within the available MTU.
+const MIN_QUIC_UDP_PAYLOAD: usize = 1200;
+/// Source address stamped on a nested hop's inner QUIC packets (the udpip wrap). It must lie
+/// inside every relaying node's tunnel CIDR so the node's NAT (`MASQUERADE -s <cidr>`) rewrites
+/// it on egress and the un-NAT'd reply routes back through the node's TUN. The harness uses
+/// `10.74.0.0/24`, so this defaults to the client tunnel address; deployments with a different
+/// inner CIDR override it via [`MasqueConfig::nested_client_ip`].
+const DEFAULT_NESTED_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 74, 0, 2);
+/// Source port for a nested hop's inner QUIC packets (arbitrary; each hop is a distinct node so
+/// there is no conntrack collision).
+const NESTED_CLIENT_PORT: u16 = 51820;
 
 /// Client-side MASQUE configuration.
 #[derive(Clone, Debug, Default)]
 pub struct MasqueConfig {
     /// TLS SNI / `:authority`. Defaults to the target host at connect time.
     pub server_name: Option<String>,
+    /// Source address for nested hops' inner QUIC packets (see [`DEFAULT_NESTED_CLIENT_IP`]).
+    /// Must lie inside the relaying nodes' tunnel CIDR. `None` ⇒ the default. Only relevant when
+    /// this transport is used as the inner of a [`crate::path::PathTransport`].
+    pub nested_client_ip: Option<Ipv4Addr>,
 }
 
 /// Heavy per-session state, owned by the transport and keyed by [`SessionId`].
@@ -108,24 +134,61 @@ impl MasqueTransport {
         let mut rx = s.ctrl_from.lock().await;
         rx.recv().await.ok_or(Error::Closed)
     }
-}
 
-#[async_trait]
-impl Transport for MasqueTransport {
-    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
+    /// Connect a hop **over an existing outer tunnel** — the building block of the trust-split
+    /// onion (architecture spec §6). The inner QUIC rides the outer CONNECT-IP tunnel (as
+    /// IPv4/UDP packets to `target`); the outer node forwards them by NAT, so the next hop sees
+    /// a QUIC connection from the previous node, never the original client.
+    pub async fn connect_nested(
+        &self,
+        target: NodeEndpoint,
+        creds: Grant,
+        outer: Arc<dyn Transport>,
+        outer_session: Session,
+    ) -> Result<Session> {
         let peer = resolve(&target).await?;
-        let bind: SocketAddr = if peer.is_ipv6() {
-            "[::]:0".parse().expect("valid v6 bind")
-        } else {
-            "0.0.0.0:0".parse().expect("valid v4 bind")
+        let peer_v4 = match peer {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => {
+                return Err(Error::Transport("nested MASQUE requires an IPv4 next hop".into()))
+            }
         };
-        let socket = UdpSocket::bind(bind)
-            .await
-            .map_err(|e| Error::Transport(format!("udp bind: {e}")))?;
-        let local = socket
-            .local_addr()
-            .map_err(|e| Error::Transport(format!("local_addr: {e}")))?;
+        // The inner QUIC packets ride the outer tunnel as IPv4/UDP, so they must fit in the
+        // outer's usable MTU after udpip wrapping. Shrink this hop's QUIC payload accordingly;
+        // reject if it would fall below QUIC's mandatory floor (the path is too deep).
+        let outer_mtu = outer
+            .tunnel_mtu(&outer_session)
+            .ok_or_else(|| Error::Transport("nested MASQUE: outer tunnel has no negotiated MTU".into()))?;
+        let max_udp_payload = outer_mtu
+            .checked_sub(UDPIP_OVERHEAD)
+            .filter(|&m| m >= MIN_QUIC_UDP_PAYLOAD)
+            .ok_or_else(|| {
+                Error::Transport(format!(
+                    "nested MASQUE: path too deep — outer MTU {outer_mtu}B leaves < {MIN_QUIC_UDP_PAYLOAD}B \
+                     for the inner QUIC payload"
+                ))
+            })?;
+        // A fixed inner client address (inside the nodes' tunnel CIDR); the outer node NATs it
+        // away before the next hop, and the reply routes back through the node's TUN.
+        let inner_ip = self.config.nested_client_ip.unwrap_or(DEFAULT_NESTED_CLIENT_IP);
+        let local = SocketAddrV4::new(inner_ip, NESTED_CLIENT_PORT);
+        let authority = self.config.server_name.clone().unwrap_or_else(|| target.host.clone());
+        let policy = policy_for(&target);
+        let chan = PacketChannel::Tunnel(TunnelChannel { outer, outer_session, local, peer: peer_v4 });
+        self.finish_connect(chan, peer, authority, creds.nonce, policy, max_udp_payload).await
+    }
 
+    /// Spawn the driver over `chan` and register the session once the CONNECT-IP handshake
+    /// (and attestation) completes. Shared by [`Self::connect`] and [`Self::connect_nested`].
+    async fn finish_connect(
+        &self,
+        chan: PacketChannel,
+        peer: SocketAddr,
+        authority: String,
+        nonce: [u8; 32],
+        policy: Option<AppraisalPolicy>,
+        max_udp_payload: usize,
+    ) -> Result<Session> {
         let (to_tx, to_rx) = mpsc::channel(OUTBOUND_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(INBOUND_QUEUE);
         let (ctrl_to_tx, ctrl_to_rx) = mpsc::channel(CONTROL_QUEUE);
@@ -133,30 +196,9 @@ impl Transport for MasqueTransport {
         let (ready_tx, ready_rx) = oneshot::channel();
         let shutdown = CancellationToken::new();
 
-        let authority = self
-            .config
-            .server_name
-            .clone()
-            .unwrap_or_else(|| target.host.clone());
-        // The node must attest to the measurement the Coordinator pinned in the endpoint. No
-        // expectation (loopback/dev) → the connection is unattested and the driver warns.
-        let policy = target
-            .expected
-            .as_ref()
-            .map(|e| AppraisalPolicy::new(e.tee, e.measurement.clone()));
         let driver = tokio::spawn(driver_run(
-            socket,
-            peer,
-            local,
-            authority,
-            creds.nonce,
-            policy,
-            to_rx,
-            from_tx,
-            ctrl_to_rx,
-            ctrl_from_tx,
-            ready_tx,
-            shutdown.clone(),
+            chan, peer, authority, nonce, policy, max_udp_payload, to_rx, from_tx, ctrl_to_rx,
+            ctrl_from_tx, ready_tx, shutdown.clone(),
         ));
 
         let ready = match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
@@ -191,6 +233,35 @@ impl Transport for MasqueTransport {
             .insert(id, state);
         Ok(Session { id, kind: TransportKind::Masque })
     }
+}
+
+#[async_trait]
+impl Transport for MasqueTransport {
+    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
+        let peer = resolve(&target).await?;
+        let bind: SocketAddr = if peer.is_ipv6() {
+            "[::]:0".parse().expect("valid v6 bind")
+        } else {
+            "0.0.0.0:0".parse().expect("valid v4 bind")
+        };
+        let socket = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| Error::Transport(format!("udp bind: {e}")))?;
+        let local = socket
+            .local_addr()
+            .map_err(|e| Error::Transport(format!("local_addr: {e}")))?;
+        let authority = self.config.server_name.clone().unwrap_or_else(|| target.host.clone());
+        let policy = policy_for(&target);
+        self.finish_connect(
+            PacketChannel::Udp { socket, local },
+            peer,
+            authority,
+            creds.nonce,
+            policy,
+            MAX_UDP_PAYLOAD,
+        )
+        .await
+    }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
         let s = self.state(session)?;
@@ -223,6 +294,11 @@ impl Transport for MasqueTransport {
     fn fingerprint_profile(&self) -> Profile {
         Profile::HttpsQuic
     }
+
+    fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
+        // Inherent method (priority over this trait method) does the real work.
+        MasqueTransport::tunnel_mtu(self, session)
+    }
 }
 
 /// Resolve a [`NodeEndpoint`] to a socket address.
@@ -236,18 +312,110 @@ async fn resolve(target: &NodeEndpoint) -> Result<SocketAddr> {
         .ok_or_else(|| Error::Transport(format!("no address for {host_port}")))
 }
 
+/// Build the appraisal policy from a node endpoint's pinned attestation expectation, if any.
+/// `None` ⇒ unattested (loopback/dev). The node must attest to the measurement the Coordinator
+/// pinned in the endpoint.
+fn policy_for(target: &NodeEndpoint) -> Option<AppraisalPolicy> {
+    target
+        .expected
+        .as_ref()
+        .map(|e| AppraisalPolicy::new(e.tee, e.measurement.clone()))
+}
+
+/// How a driver moves QUIC packets to and from its peer. The outermost hop uses a real UDP
+/// socket; a nested hop in the trust-split onion (architecture spec §6) tunnels its QUIC inside
+/// an outer CONNECT-IP tunnel via [`TunnelChannel`]. The driver loop is identical either way —
+/// this is the only seam.
+enum PacketChannel {
+    Udp { socket: UdpSocket, local: SocketAddr },
+    Tunnel(TunnelChannel),
+}
+
+impl PacketChannel {
+    /// The local address quiche binds the connection to.
+    fn local(&self) -> SocketAddr {
+        match self {
+            PacketChannel::Udp { local, .. } => *local,
+            PacketChannel::Tunnel(t) => SocketAddr::V4(t.local),
+        }
+    }
+
+    /// Receive one QUIC packet from the peer into `buf`, returning `(len, source)`.
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            PacketChannel::Udp { socket, .. } => socket.recv_from(buf).await,
+            PacketChannel::Tunnel(t) => t.recv(buf).await,
+        }
+    }
+
+    /// Send one QUIC packet to `dst`.
+    async fn send_to(&self, pkt: &[u8], dst: SocketAddr) -> std::io::Result<()> {
+        match self {
+            PacketChannel::Udp { socket, .. } => socket.send_to(pkt, dst).await.map(|_| ()),
+            PacketChannel::Tunnel(t) => t.send_to(pkt, dst).await,
+        }
+    }
+}
+
+/// A QUIC packet channel that rides an outer CONNECT-IP tunnel. Each inner QUIC packet is
+/// wrapped in a userspace IPv4/UDP datagram ([`crate::udpip`]) addressed to the next hop and
+/// handed to the outer transport as an IP packet; the outer node NATs it onward, so the next
+/// hop sees a QUIC connection from the previous node — never the original client.
+struct TunnelChannel {
+    outer: Arc<dyn Transport>,
+    outer_session: Session,
+    /// Our fixed inner client address (the outer node NATs it away).
+    local: SocketAddrV4,
+    /// The next hop, as seen inside the outer tunnel.
+    peer: SocketAddrV4,
+}
+
+impl TunnelChannel {
+    async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        loop {
+            let ip = self
+                .outer
+                .recv(&self.outer_session)
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            let Some((src, _dst, payload)) = crate::udpip::unwrap(ip.as_bytes()) else {
+                continue; // not a well-formed IPv4/UDP packet
+            };
+            if src != self.peer {
+                continue; // not from our next hop
+            }
+            let n = payload.len().min(buf.len());
+            buf[..n].copy_from_slice(&payload[..n]);
+            return Ok((n, SocketAddr::V4(src)));
+        }
+    }
+
+    async fn send_to(&self, pkt: &[u8], dst: SocketAddr) -> std::io::Result<()> {
+        // quiche always sends to the single configured peer; fall back to it for any v6 `to`.
+        let dst = match dst {
+            SocketAddr::V4(v4) => v4,
+            SocketAddr::V6(_) => self.peer,
+        };
+        let wrapped = crate::udpip::wrap(self.local, dst, pkt);
+        self.outer
+            .send(&self.outer_session, IpPacket::new(wrapped))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }
+}
+
 struct ReadyInfo {
     max_dgram_payload: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn driver_run(
-    socket: UdpSocket,
+    chan: PacketChannel,
     peer: SocketAddr,
-    local: SocketAddr,
     authority: String,
     nonce: [u8; 32],
     policy: Option<AppraisalPolicy>,
+    max_udp_payload: usize,
     mut to_rx: mpsc::Receiver<IpPacket>,
     from_tx: mpsc::Sender<IpPacket>,
     mut ctrl_to_rx: mpsc::Receiver<Vec<u8>>,
@@ -255,6 +423,7 @@ async fn driver_run(
     ready_tx: oneshot::Sender<Result<ReadyInfo>>,
     shutdown: CancellationToken,
 ) {
+    let local = chan.local();
     let mut ready_tx = Some(ready_tx);
     // Reliable control-channel buffers carried on the CONNECT-IP request stream.
     let mut ctrl_out: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
@@ -267,7 +436,7 @@ async fn driver_run(
         }};
     }
 
-    let mut config = match build_client_config() {
+    let mut config = match build_client_config(max_udp_payload) {
         Ok(c) => c,
         Err(e) => {
             fail!(e);
@@ -304,7 +473,7 @@ async fn driver_run(
     let mut out = vec![0u8; MAX_UDP_PAYLOAD];
     let mut buf = vec![0u8; 65535];
 
-    flush(&mut conn, &socket, &mut out).await;
+    flush(&mut conn, &chan, &mut out).await;
 
     loop {
         let timeout = conn.timeout().unwrap_or(Duration::from_secs(3600));
@@ -312,10 +481,10 @@ async fn driver_run(
             biased;
             _ = shutdown.cancelled() => {
                 let _ = conn.close(true, 0x100, b"bye");
-                flush(&mut conn, &socket, &mut out).await;
+                flush(&mut conn, &chan, &mut out).await;
                 return;
             }
-            res = socket.recv_from(&mut buf) => {
+            res = chan.recv(&mut buf) => {
                 match res {
                     Ok((len, from)) => {
                         let info = quiche::RecvInfo { from, to: local };
@@ -323,7 +492,7 @@ async fn driver_run(
                             tracing::debug!("masque conn.recv: {e}");
                         }
                     }
-                    Err(e) => tracing::warn!("masque udp recv: {e}"),
+                    Err(e) => tracing::warn!("masque packet-channel recv: {e}"),
                 }
             }
             _ = tokio::time::sleep(timeout) => {
@@ -340,7 +509,7 @@ async fn driver_run(
                     None => {
                         // All app senders dropped → close cleanly.
                         let _ = conn.close(true, 0x100, b"done");
-                        flush(&mut conn, &socket, &mut out).await;
+                        flush(&mut conn, &chan, &mut out).await;
                         return;
                     }
                 }
@@ -368,7 +537,7 @@ async fn driver_run(
                         Err(e) => {
                             fail!(Error::Transport(format!("send CONNECT-IP: {e}")));
                             let _ = conn.close(true, 0x101, b"req");
-                            flush(&mut conn, &socket, &mut out).await;
+                            flush(&mut conn, &chan, &mut out).await;
                             return;
                         }
                     }
@@ -402,7 +571,7 @@ async fn driver_run(
                                         Err(e) => {
                                             fail!(e);
                                             let _ = conn.close(true, 0x104, b"attestation");
-                                            flush(&mut conn, &socket, &mut out).await;
+                                            flush(&mut conn, &chan, &mut out).await;
                                             return;
                                         }
                                     }
@@ -412,7 +581,7 @@ async fn driver_run(
                                         "CONNECT-IP refused: status {other:?}"
                                     )));
                                     let _ = conn.close(true, 0x102, b"status");
-                                    flush(&mut conn, &socket, &mut out).await;
+                                    flush(&mut conn, &chan, &mut out).await;
                                     return;
                                 }
                             }
@@ -423,7 +592,7 @@ async fn driver_run(
                         if Some(sid) == ci_stream {
                             fail!(Error::Closed);
                             let _ = conn.close(true, 0x103, b"tunnel-closed");
-                            flush(&mut conn, &socket, &mut out).await;
+                            flush(&mut conn, &chan, &mut out).await;
                             return;
                         }
                     }
@@ -485,7 +654,7 @@ async fn driver_run(
             }
         }
 
-        flush(&mut conn, &socket, &mut out).await;
+        flush(&mut conn, &chan, &mut out).await;
 
         if conn.is_closed() {
             fail!(Error::Closed);
@@ -495,13 +664,14 @@ async fn driver_run(
     }
 }
 
-/// Send all pending QUIC packets out the UDP socket.
-async fn flush(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]) {
+/// Send all pending QUIC packets out the packet channel (UDP socket, or wrapped through an
+/// outer tunnel for a nested hop).
+async fn flush(conn: &mut quiche::Connection, chan: &PacketChannel, out: &mut [u8]) {
     loop {
         match conn.send(out) {
             Ok((len, info)) => {
-                if let Err(e) = socket.send_to(&out[..len], info.to).await {
-                    tracing::warn!("masque udp send: {e}");
+                if let Err(e) = chan.send_to(&out[..len], info.to).await {
+                    tracing::warn!("masque packet-channel send: {e}");
                     return;
                 }
             }
@@ -515,15 +685,19 @@ async fn flush(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]
     }
 }
 
-fn build_client_config() -> Result<quiche::Config> {
+/// Build the client QUIC config. `max_udp_payload` caps both the size of UDP payloads we will
+/// receive (advertised to the peer, so it caps *its* sends too) and the size of packets we
+/// send. The outermost hop uses [`MAX_UDP_PAYLOAD`]; a nested hop uses a smaller value so its
+/// QUIC packets fit inside the outer tunnel after [`crate::udpip`] wrapping.
+fn build_client_config(max_udp_payload: usize) -> Result<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
     config
         .set_application_protos(&[b"h3"])
         .map_err(|e| Error::Transport(format!("set_application_protos: {e}")))?;
     config.set_max_idle_timeout(30_000);
-    config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
-    config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
+    config.set_max_recv_udp_payload_size(max_udp_payload);
+    config.set_max_send_udp_payload_size(max_udp_payload);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);

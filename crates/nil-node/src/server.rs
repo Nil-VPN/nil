@@ -19,7 +19,11 @@ use crate::cert::DevCert;
 use crate::config::NodeConfig;
 use crate::pqwg::ClientPqWg;
 
-const MAX_UDP_PAYLOAD: usize = 1350;
+// Must match the client's `nil_transport::masque` value: the negotiated datagram size is the
+// min of both peers' advertised `max_udp_payload_size`, so a lower value here would re-cap every
+// hop and starve the trust-split onion's innermost QUIC of its 1200 B floor. 1420 keeps the wire
+// packet (+28 B IPv4/UDP) under 1500.
+const MAX_UDP_PAYLOAD: usize = 1420;
 
 struct Client {
     conn: quiche::Connection,

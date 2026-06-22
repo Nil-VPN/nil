@@ -63,7 +63,13 @@ impl NodeConfig {
             prefix: 24,
             tunnel_cidr: "10.74.0.0/24".to_string(),
             egress,
-            mtu: 1280,
+            // The TUN carries decapsulated client IP packets out to the next hop / internet. For
+            // a trust-split path those packets are the next hop's QUIC wrapped in udpip (spec
+            // §6), up to the outer tunnel's MTU (~1411 B at the 1420 B payload ceiling), in BOTH
+            // directions. A 1280 TUN silently drops the larger nested handshake/response packets,
+            // so it must clear the wrapped size; 1420 matches the QUIC payload ceiling. (Single
+            // hop is unaffected: real packets stay ≤ the client's ~1280 TUN.)
+            mtu: 1420,
             attest: crate::attest::NodeAttest::from_env(),
             role: NodeRole::from_env_str(
                 &std::env::var("NW_NODE_ROLE").unwrap_or_else(|_| "exit".to_string()),

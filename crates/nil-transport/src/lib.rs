@@ -14,13 +14,18 @@ mod transport;
 pub mod cascade;
 pub mod connectip;
 pub mod loopback;
+pub mod udpip;
 #[cfg(feature = "masque")]
 pub mod masque;
+#[cfg(feature = "masque")]
+pub mod path;
 #[cfg(feature = "pqwg")]
 pub mod pqwg;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]
 pub use masque::{MasqueConfig, MasqueTransport};
+#[cfg(feature = "masque")]
+pub use path::PathTransport;
 #[cfg(feature = "pqwg")]
 pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};

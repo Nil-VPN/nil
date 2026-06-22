@@ -1,0 +1,100 @@
+# Host-safe trust-split (multi-hop) verification: entry → middle → exit MASQUE nodes plus an
+# origin and a headless client, all in throwaway containers on a private bridge. Nothing
+# touches the host's networking.
+#   cd deploy && ./verify-trustsplit.sh
+#
+# Topology (architecture spec §6): the client nests three attested MASQUE/CONNECT-IP tunnels —
+# entry sees the client IP and the middle, exit sees the middle and the destination, middle
+# sees neither endpoint. A fourth "middle-rogue" node attests the WRONG measurement so the
+# harness can prove each hop is appraised independently (the onion fails at that hop). The
+# destination is a fixed public IP (1.1.1.1) so the harness needs no extra image to pull.
+#
+# All nodes are the same image (built with `synthetic-attest`) and share the default tunnel
+# addressing (node 10.74.0.1, client 10.74.0.2, CIDR 10.74.0.0/24); they differ only by role,
+# bridge IP, and the measurement they attest to.
+
+x-node-base: &node-base
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  command: ["nil-node"]
+  cap_add: ["NET_ADMIN"]
+  devices: ["/dev/net/tun"]
+  sysctls:
+    - net.ipv4.ip_forward=1
+
+services:
+  entry:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=entry
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.11
+
+  middle:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=middle
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.12
+
+  exit:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=exit
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.13
+
+  # A rogue middle: attests a DIFFERENT measurement. Used only by the negative path to prove the
+  # middle hop is independently appraised (the client pins the real measurement → this hop fails).
+  middle-rogue:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=middle
+      - NW_NODE_MEASUREMENT=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.14
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["sleep", "infinity"] # the tunnel + curl + assertions are driven by the script
+    environment:
+      - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    depends_on: [entry, middle, exit, middle-rogue]
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.30
+
+networks:
+  nilnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.80.0.0/24

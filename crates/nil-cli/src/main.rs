@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_datapath::{Tunnel, TunnelConfig};
 use nil_transport::connectip;
-use nil_transport::{MasqueTransport, PqWgTransport, Transport};
+use nil_transport::{MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport};
 use tracing_subscriber::EnvFilter;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -33,6 +33,33 @@ fn expected_from_env() -> Result<Option<AttestExpectation>> {
         other => anyhow::bail!("NW_EXPECTED_TEE must be sev-snp or tdx, got {other}"),
     };
     Ok(Some(AttestExpectation { tee, measurement: Measurement(bytes) }))
+}
+
+/// A multi-hop trust-split path from `NW_PATH`: a comma-separated list of `host:port` hops,
+/// outermost (entry) first, innermost (exit) last — e.g. `entry:443,middle:443,exit:443`. Set
+/// ⇒ build a nested-MASQUE onion (architecture spec §6); unset ⇒ single hop. Every hop is
+/// pinned to the same `expected` measurement here (the Docker harness builds all nodes from one
+/// binary); in production the Coordinator supplies a distinct, operator-diverse pin per hop.
+fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<NodeEndpoint>>> {
+    let Ok(spec) = std::env::var("NW_PATH") else { return Ok(None) };
+    let mut hops = Vec::new();
+    for (i, item) in spec.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+        let (host, port) = item
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("NW_PATH hop {i} must be host:port, got {item:?}"))?;
+        let port: u16 = port.parse().with_context(|| format!("NW_PATH hop {i} port {port:?}"))?;
+        hops.push(NodeEndpoint {
+            host: host.to_string(),
+            port,
+            kind: TransportKind::Masque,
+            wg_pub: None,
+            expected: expected.clone(),
+        });
+    }
+    if hops.is_empty() {
+        anyhow::bail!("NW_PATH is set but lists no hops");
+    }
+    Ok(Some(hops))
 }
 
 /// The node's WireGuard static public key (hex) from `NW_NODE_WG_PUB`. Present ⇒ run the inner
@@ -67,22 +94,47 @@ async fn main() -> Result<()> {
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
+    let path = path_from_env(&expected)?;
 
-    // With a node WireGuard key, run the inner PQ-WireGuard layer over MASQUE (the TUN MTU
-    // drops by WireGuard's 32-byte overhead); otherwise plain MASQUE.
-    let (transport, mtu): (Arc<dyn Transport>, u16) = if wg_pub.is_some() {
-        (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), 1232)
-    } else {
-        (Arc::new(MasqueTransport::new()), 1280)
-    };
+    // Pick the transport. The datapath sizes the TUN from the tunnel's *negotiated* MTU, so the
+    // value here is just a ceiling (nested hops shrink it further).
+    //   - NW_PATH set        → multi-hop trust-split onion (plain nested MASQUE).
+    //   - NW_NODE_WG_PUB set → inner PQ-WireGuard over a single MASQUE hop.
+    //   - otherwise          → a single plain MASQUE hop.
+    // `routing_node` is the directly-reachable hop the datapath excepts from the kill-switch.
+    let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) =
+        if let Some(hops) = path {
+            if wg_pub.is_some() {
+                tracing::warn!(
+                    "NW_PATH set — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE"
+                );
+            }
+            let entry = hops[0].clone();
+            tracing::info!(hops = hops.len(), entry = %entry.host, "multi-hop trust-split path");
+            // The inner hops' QUIC is stamped with the client tunnel address so the relaying
+            // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
+            let inner = MasqueTransport::with_config(MasqueConfig {
+                nested_client_ip: Some(client_ip),
+                ..Default::default()
+            });
+            let t = PathTransport::new(Arc::new(inner), hops);
+            (Arc::new(t), entry, 1280)
+        } else {
+            let node = NodeEndpoint {
+                host: host.clone(),
+                port,
+                kind: TransportKind::Masque,
+                wg_pub,
+                expected,
+            };
+            if wg_pub.is_some() {
+                (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), node, 1232)
+            } else {
+                (Arc::new(MasqueTransport::new()), node, 1280)
+            }
+        };
     let cfg = TunnelConfig {
-        node: NodeEndpoint {
-            host: host.clone(),
-            port,
-            kind: TransportKind::Masque,
-            wg_pub,
-            expected,
-        },
+        node: routing_node,
         tun_name,
         client_ip,
         peer_ip,
@@ -92,7 +144,7 @@ async fn main() -> Result<()> {
         kill_switch,
     };
 
-    tracing::info!(%host, port, "nil-cli connecting to node…");
+    tracing::info!(node = %cfg.node.host, port = cfg.node.port, "nil-cli connecting…");
     let tunnel = Tunnel::up(transport, cfg).await?;
     tracing::info!("nil-cli connected — tunnel up. Ctrl-C to disconnect.");
 
