@@ -67,7 +67,7 @@ ml-kem = "0.3"                         # ML-KEM-1024 (FIPS 203), forward secrecy
 classic-mceliece-rust = { version = "3", features = ["mceliece460896", "alloc"] }  # Classic McEliece 460896, authentication half
 
 # --- Declared for forward intent; activated in their phase step.
-# boringtun = "0.7"                    # Phase 2   (inner WireGuard Noise core over MASQUE)
+boringtun = "0.7"                      # inner WireGuard Noise core (PQ PSK over MASQUE)
 # quinn = "0.11"                       # prototyping alt QUIC
 
 # Internal crates (path deps — versioned together; explicit version silences

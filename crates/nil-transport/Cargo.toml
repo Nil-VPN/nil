@@ -14,6 +14,9 @@ masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest"]
 # Test/dev only: accept synthetic attestation reports (for the Docker accept/reject harness).
 # Never enable in a release client — the synthetic trust anchor is unreachable without it.
 synthetic-attest = ["masque", "nil-attest/synthetic"]
+# Inner PQ-WireGuard-over-MASQUE: a boringtun Noise core fed by the nil-crypto hybrid PSK,
+# wrapping any inner Transport. (Spec §4.2; shares the PQ core with the Phase 4 cascade.)
+pqwg = ["dep:boringtun", "dep:nil-crypto", "dep:getrandom"]
 
 [dependencies]
 nil-core = { workspace = true }
@@ -24,3 +27,5 @@ tracing = { workspace = true }
 quiche = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
+boringtun = { workspace = true, optional = true }       # WireGuard Noise core (pqwg)
+nil-crypto = { workspace = true, optional = true }       # PQ hybrid PSK (pqwg)

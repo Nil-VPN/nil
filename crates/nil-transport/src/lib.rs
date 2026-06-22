@@ -15,7 +15,11 @@ pub mod connectip;
 pub mod loopback;
 #[cfg(feature = "masque")]
 pub mod masque;
+#[cfg(feature = "pqwg")]
+pub mod pqwg;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]
 pub use masque::{MasqueConfig, MasqueTransport};
+#[cfg(feature = "pqwg")]
+pub use pqwg::{PqWgCore, WgKeypair, WgStep};
