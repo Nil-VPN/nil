@@ -15,12 +15,36 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
-use nil_transport::{connectip, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport};
+use nil_transport::cascade::{Cascade, CascadeTransport, DnsLivenessProbe};
+use nil_transport::{
+    connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport,
+};
 
 use crate::TunnelConfig;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// The AmneziaWG cascade fallback rung, if `NW_CASCADE` is set. Reads the fallback node's WG
+/// pubkey (`NW_NODE_AMNEZIA_WG_PUB`, hex) and endpoint (`NW_NODE_AMNEZIA_HOST` /
+/// `NW_NODE_AMNEZIA_PORT`, defaulting to the primary host / 443).
+fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
+    if std::env::var("NW_CASCADE").is_err() {
+        return Ok(None);
+    }
+    let Ok(h) = std::env::var("NW_NODE_AMNEZIA_WG_PUB") else {
+        anyhow::bail!("NW_CASCADE set but NW_NODE_AMNEZIA_WG_PUB (the fallback node's WG key) is missing");
+    };
+    let bytes = connectip::from_hex(h.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_NODE_AMNEZIA_WG_PUB is not valid hex"))?;
+    let wg_pub: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NW_NODE_AMNEZIA_WG_PUB must be 32 bytes"))?;
+    let host = std::env::var("NW_NODE_AMNEZIA_HOST").ok();
+    let port = std::env::var("NW_NODE_AMNEZIA_PORT").ok().and_then(|p| p.parse().ok());
+    Ok(Some(AmneziaWgTransport::new(wg_pub, host, port)))
 }
 
 /// Whether the environment configures a real node/path (vs. nothing → the GUI uses loopback).
@@ -113,10 +137,22 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
             (Arc::new(PathTransport::new(Arc::new(inner), hops)), entry, 1280)
         } else {
             let node = NodeEndpoint { host: host.clone(), port, kind: TransportKind::Masque, wg_pub, expected };
-            if wg_pub.is_some() {
-                (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), node, 1232)
+            // Primary rung: PQ-WireGuard-over-MASQUE if a node WG key is pinned, else plain MASQUE.
+            let (primary, base_mtu): (Arc<dyn Transport>, u16) = if wg_pub.is_some() {
+                (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), 1232)
             } else {
-                (Arc::new(MasqueTransport::new()), node, 1280)
+                (Arc::new(MasqueTransport::new()), 1280)
+            };
+            // With NW_CASCADE, wrap [primary, AmneziaWG] in a cascade that steps down (timeout /
+            // dead-tunnel) and verifies each rung with a DNS liveness probe before committing.
+            match amneziawg_fallback_from_env()? {
+                Some(awg) => {
+                    tracing::info!("obfuscation cascade enabled (MASQUE primary → AmneziaWG fallback)");
+                    let cascade = Cascade::new(vec![primary, Arc::new(awg)])
+                        .with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
+                    (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
+                }
+                None => (primary, node, base_mtu),
             }
         };
 

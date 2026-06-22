@@ -31,8 +31,6 @@ pub struct NodeConfig {
     pub tun_name: String,
     /// Address assigned to the node end of the tunnel.
     pub node_tun_ip: Ipv4Addr,
-    /// The client's (statically assigned) tunnel address — Phase 1 has one client.
-    pub client_ip: Ipv4Addr,
     /// Tunnel subnet prefix length.
     pub prefix: u8,
     /// `network/prefix` CIDR for the NAT source match (e.g. `10.74.0.0/24`).
@@ -59,7 +57,6 @@ impl NodeConfig {
             bind,
             tun_name: std::env::var("NW_NODE_TUN").unwrap_or_else(|_| "nil0".to_string()),
             node_tun_ip: "10.74.0.1".parse().expect("valid ip"),
-            client_ip: "10.74.0.2".parse().expect("valid ip"),
             prefix: 24,
             tunnel_cidr: "10.74.0.0/24".to_string(),
             egress,

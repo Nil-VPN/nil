@@ -29,11 +29,13 @@
 //! reusing the PQ-WireGuard crypto ([`crate::pqwg`]); only its live UDP datapath remains. wstunnel
 //! is WebSocket-over-TLS; REALITY borrows a real TLS handshake.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, TransportKind};
+use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
 
 use crate::Transport;
 
@@ -177,6 +179,82 @@ fn dns_query(name: &str) -> Vec<u8> {
     q.extend_from_slice(&[0x00, 0x01]); // QTYPE = A
     q.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
     q
+}
+
+/// The transport that won a cascade, plus its session.
+type Winner = (Arc<dyn Transport>, Session);
+
+/// Adapts a [`Cascade`] to the [`Transport`] seam so the datapath drives it like any single
+/// transport: `connect` runs the cascade and remembers the rung that won; `send`/`recv`/`close`/
+/// `tunnel_mtu` delegate to that winning rung's session.
+pub struct CascadeTransport {
+    cascade: Cascade,
+    winners: Mutex<HashMap<SessionId, Winner>>,
+    next_id: AtomicU64,
+}
+
+impl CascadeTransport {
+    pub fn new(cascade: Cascade) -> Self {
+        Self { cascade, winners: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+    }
+
+    fn winner(&self, session: &Session) -> Result<Winner> {
+        self.winners
+            .lock()
+            .map_err(|_| Error::Transport("cascade map poisoned".into()))?
+            .get(&session.id)
+            .cloned()
+            .ok_or(Error::SessionNotFound(session.id))
+    }
+}
+
+#[async_trait]
+impl Transport for CascadeTransport {
+    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
+        let (transport, inner) = self.cascade.connect(target, creds).await?;
+        let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let kind = transport.kind();
+        self.winners
+            .lock()
+            .map_err(|_| Error::Transport("cascade map poisoned".into()))?
+            .insert(id, (transport, inner));
+        Ok(Session { id, kind })
+    }
+
+    async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
+        let (t, inner) = self.winner(session)?;
+        t.send(&inner, packet).await
+    }
+
+    async fn recv(&self, session: &Session) -> Result<IpPacket> {
+        let (t, inner) = self.winner(session)?;
+        t.recv(&inner).await
+    }
+
+    async fn close(&self, session: Session) -> Result<()> {
+        let (t, inner) = {
+            let mut map = self
+                .winners
+                .lock()
+                .map_err(|_| Error::Transport("cascade map poisoned".into()))?;
+            map.remove(&session.id).ok_or(Error::SessionNotFound(session.id))?
+        };
+        t.close(inner).await
+    }
+
+    fn kind(&self) -> TransportKind {
+        // Nominal before a rung wins; the established session carries the winner's kind.
+        TransportKind::Masque
+    }
+
+    fn fingerprint_profile(&self) -> Profile {
+        Profile::HttpsQuic
+    }
+
+    fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
+        let (t, inner) = self.winner(session).ok()?;
+        t.tunnel_mtu(&inner)
+    }
 }
 
 /// Shared body for the not-yet-implemented cascade rungs.

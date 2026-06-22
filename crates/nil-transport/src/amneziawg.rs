@@ -34,6 +34,10 @@ const WG_LEN: [usize; 4] = [
 pub struct ObfsParams {
     /// `H[t-1]` = the 4-byte magic that replaces the WG type word for message type `t`.
     pub headers: [[u8; 4]; 4],
+    /// Magic header for the **preface** packet (the client's 32-byte WG static pubkey). WireGuard
+    /// responders need the initiator's static key in advance, and the raw-UDP rung has no control
+    /// channel, so the client sends it in one obfuscated packet before the handshake.
+    pub preface_header: [u8; 4],
     pub junk_count: usize,
     pub junk_min: usize,
     pub junk_max: usize,
@@ -51,6 +55,7 @@ impl Default for ObfsParams {
                 [0x6f, 0x0c, 0xa3, 0xe2],
                 [0xd4, 0x77, 0x19, 0x5b],
             ],
+            preface_header: [0x5c, 0xa8, 0x3f, 0xd1],
             junk_count: 4,
             junk_min: 32,
             junk_max: 192,
@@ -132,6 +137,26 @@ impl ObfsParams {
     pub fn junk_packets(&self) -> Vec<Vec<u8>> {
         (0..self.junk_count).map(|_| rand_bytes(rand_len(self.junk_min, self.junk_max))).collect()
     }
+
+    /// Obfuscate the preface (the client's 32-byte WG static pubkey) the responder needs before
+    /// the handshake. `preface_header ‖ pubkey ‖ junk-tail`.
+    pub fn obfuscate_preface(&self, pubkey: &[u8; 32]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + 32 + self.tail_max);
+        out.extend_from_slice(&self.preface_header);
+        out.extend_from_slice(pubkey);
+        out.extend_from_slice(&rand_bytes(rand_len(self.tail_min, self.tail_max)));
+        out
+    }
+
+    /// Recover the client's WG static pubkey from a preface packet, or `None` if `wire` isn't one.
+    pub fn try_preface(&self, wire: &[u8]) -> Option<[u8; 32]> {
+        if wire.len() < 4 + 32 || wire[0..4] != self.preface_header {
+            return None;
+        }
+        let mut pk = [0u8; 32];
+        pk.copy_from_slice(&wire[4..36]);
+        Some(pk)
+    }
 }
 
 // ---- The AmneziaWG transport: obfuscated WireGuard directly on UDP (cascade rung 2) ---------
@@ -160,7 +185,10 @@ const AWG_TICK: Duration = Duration::from_millis(250);
 pub struct AmneziaWgConfig {
     /// The node's WireGuard static public key.
     pub node_wg_pub: [u8; 32],
-    /// UDP port to reach the node's AmneziaWG responder on. `None` ⇒ use the endpoint's port.
+    /// Host of the node's AmneziaWG responder. `None` ⇒ use the connect target's host (the
+    /// fallback rung often runs on a separate node from the MASQUE one).
+    pub host: Option<String>,
+    /// UDP port to reach the node's AmneziaWG responder on. `None` ⇒ use the target's port.
     pub port: Option<u16>,
     /// Obfuscation parameters (must match the node's).
     pub obfs: ObfsParams,
@@ -182,8 +210,8 @@ pub struct AmneziaWgTransport {
 }
 
 impl AmneziaWgTransport {
-    pub fn new(node_wg_pub: [u8; 32], port: Option<u16>) -> Self {
-        Self::with_config(AmneziaWgConfig { node_wg_pub, port, obfs: ObfsParams::default() })
+    pub fn new(node_wg_pub: [u8; 32], host: Option<String>, port: Option<u16>) -> Self {
+        Self::with_config(AmneziaWgConfig { node_wg_pub, host, port, obfs: ObfsParams::default() })
     }
 
     pub fn with_config(cfg: AmneziaWgConfig) -> Self {
@@ -211,8 +239,9 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
 #[async_trait]
 impl Transport for AmneziaWgTransport {
     async fn connect(&self, target: NodeEndpoint, _creds: Grant) -> Result<Session> {
+        let host = self.cfg.host.as_deref().unwrap_or(&target.host);
         let port = self.cfg.port.unwrap_or(target.port);
-        let peer = resolve(&target.host, port).await?;
+        let peer = resolve(host, port).await?;
         let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
         let socket = UdpSocket::bind(bind)
             .await
@@ -225,8 +254,14 @@ impl Transport for AmneziaWgTransport {
             let _ = socket.send(&junk).await;
         }
         let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let client_pub = *client_kp.public.as_bytes();
         let mut core = PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
         let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        // Preface (our WG pubkey, so the responder can build its Tunn) then the handshake init.
+        socket
+            .send(&obfs.obfuscate_preface(&client_pub))
+            .await
+            .map_err(|e| Error::Transport(format!("send preface: {e}")))?;
         socket
             .send(&obfs.obfuscate(&init))
             .await

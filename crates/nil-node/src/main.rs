@@ -8,6 +8,7 @@
 //!
 //! Phase 1 presents a self-signed dev TLS cert (NOT attestation — RA-TLS is Phase 2, §5).
 
+mod amneziawg;
 mod attest;
 mod cert;
 mod config;
@@ -36,10 +37,17 @@ async fn main() -> Result<()> {
         "nil-node starting (MASQUE/CONNECT-IP; no disk logs)"
     );
 
-    let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;
     let exit = exit::Exit::setup(&cfg)?;
 
-    // Runs until Ctrl-C; `exit` drops here and tears down the NAT rules.
-    server::run(&cfg, &cert, exit.tun()).await?;
+    // NW_NODE_AMNEZIA selects the obfuscated-WireGuard fallback responder (a separate node from
+    // the MASQUE one); otherwise the default MASQUE/CONNECT-IP server. Both own the exit TUN and
+    // run until Ctrl-C; `exit` drops afterward and tears down the NAT rules.
+    if std::env::var("NW_NODE_AMNEZIA").is_ok() {
+        tracing::info!("node mode: AmneziaWG responder (obfuscated WireGuard cascade fallback)");
+        amneziawg::run(&cfg, exit.tun()).await?;
+    } else {
+        let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;
+        server::run(&cfg, &cert, exit.tun()).await?;
+    }
     Ok(())
 }
