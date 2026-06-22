@@ -53,6 +53,7 @@ quiche     = "0.22"                    # default MASQUE/QUIC transport (Cloudfla
 tun-rs     = { version = "2", features = ["async_tokio"] }  # TUN device (Linux/macOS)
 rcgen      = "0.13"                    # self-signed dev TLS cert for nil-node (Phase 1)
 tokio-util = { version = "0.7", features = ["rt"] }          # CancellationToken for pumps
+getrandom  = "0.2"                     # QUIC source connection IDs
 
 # --- Declared for forward intent; not referenced yet. Uncomment when each phase lands.
 # rustls = "0.23"                      # Phase 2+ (RA-TLS integration)

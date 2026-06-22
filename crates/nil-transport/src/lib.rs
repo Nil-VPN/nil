@@ -13,5 +13,9 @@
 mod transport;
 pub mod connectip;
 pub mod loopback;
+#[cfg(feature = "masque")]
+pub mod masque;
 
 pub use transport::Transport;
+#[cfg(feature = "masque")]
+pub use masque::{MasqueConfig, MasqueTransport};

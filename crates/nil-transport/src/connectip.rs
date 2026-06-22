@@ -26,6 +26,11 @@ pub const IP_FULL_TUNNEL_TEMPLATE: &str = "/.well-known/masque/ip/*/*/";
 /// Largest QUIC varint, `2^62 - 1` (RFC 9000 §16).
 pub const MAX_VARINT: u64 = (1u64 << 62) - 1;
 
+/// Worst-case bytes [`encode_datagram`] prepends to an IP packet: an 8-byte flow-id varint
+/// plus the 1-byte context-id. The datapath subtracts this from the negotiated datagram
+/// payload to pick a safe TUN MTU.
+pub const MAX_FRAMING_OVERHEAD: usize = 8 + 1;
+
 /// Encode an IP packet into a CONNECT-IP HTTP Datagram payload: `[ varint(0) | ip ]`.
 /// Context 0 encodes to a single `0x00` byte, so the result is `1 + ip.len()` bytes.
 pub fn encode(ip: &[u8]) -> Vec<u8> {
