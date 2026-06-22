@@ -17,9 +17,11 @@ use nil_proto::path::{Hop, PathResponse, Tee as WireTee};
 use nil_proto::token::RedeemRequest;
 use nil_transport::connectip;
 
-/// A redeemed trust-split path must be multi-hop — a single hop defeats Pillar 3 (entry would see
-/// both the client and the destination). Reject a degraded path the Coordinator hands back.
-const MIN_HOPS: usize = 2;
+/// Minimum hops in a redeemed path. A trust-split path is multi-hop (≥2) — a single hop means the
+/// one node sees BOTH the client IP and the destination (no split). The closed alpha ships
+/// SINGLE-HOP deliberately (trust-split is the next milestone), so 1 is allowed but a single-hop
+/// path is WARNED about as not-yet-trust-split (see [`path_from_response`]). 0 hops is always rejected.
+const MIN_HOPS: usize = 1;
 /// Sanity cap on a Coordinator-returned path (the Coordinator is a distinct, not-fully-trusted
 /// domain). A real path is a handful of hops; anything larger is rejected.
 const MAX_HOPS: usize = 8;
@@ -52,10 +54,17 @@ fn read_token() -> Result<RedeemRequest> {
     Ok(RedeemRequest { msg, token })
 }
 
-/// Redeem the token at the Coordinator (`coord_url`) and return the attested trust-split path.
-/// Fails closed if the token is missing, the URL is plaintext-to-non-loopback, the Coordinator
-/// rejects/stalls, or the response is empty/short/oversized/malformed.
+/// Redeem the token in `NW_TOKEN_MSG` + `NW_TOKEN[_FILE]` at the Coordinator. Used by `nil-cli`
+/// (headless); the desktop engine holds the token in-process and calls [`redeem_path`] directly.
 pub async fn redeem_path_from_env(coord_url: &str) -> Result<Vec<NodeEndpoint>> {
+    let req = read_token()?;
+    redeem_path(coord_url, &req.msg, &req.token).await
+}
+
+/// Redeem an explicitly-supplied token (`msg` + `token`, both hex) at the Coordinator (`coord_url`)
+/// and return the attested path. Fails closed if the URL is plaintext-to-non-loopback, the
+/// Coordinator rejects/stalls, or the response is empty/oversized/malformed.
+pub async fn redeem_path(coord_url: &str, msg: &str, token: &str) -> Result<Vec<NodeEndpoint>> {
     // The token is a bearer credential — never POST it in cleartext to a non-loopback host. A
     // plaintext link also lets a MITM rewrite the per-hop measurements. Require TLS unless the
     // host is loopback, or the operator explicitly opted into an insecure control plane (a
@@ -65,7 +74,7 @@ pub async fn redeem_path_from_env(coord_url: &str) -> Result<Vec<NodeEndpoint>> 
             .map_err(|e| anyhow::anyhow!("NW_COORDINATOR_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local network)"))?;
     }
 
-    let req = read_token()?;
+    let req = RedeemRequest { msg: msg.to_owned(), token: token.to_owned() };
     let url = format!("{}/v1/redeem", coord_url.trim_end_matches('/'));
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -93,13 +102,17 @@ pub async fn redeem_path_from_env(coord_url: &str) -> Result<Vec<NodeEndpoint>> 
 fn path_from_response(body: &[u8]) -> Result<Vec<NodeEndpoint>> {
     let resp: PathResponse = serde_json::from_slice(body).context("parse PathResponse")?;
     if resp.hops.len() < MIN_HOPS {
-        anyhow::bail!(
-            "coordinator returned a {}-hop path; a trust-split path needs at least {MIN_HOPS} hops",
-            resp.hops.len()
-        );
+        anyhow::bail!("coordinator returned an empty path");
     }
     if resp.hops.len() > MAX_HOPS {
         anyhow::bail!("coordinator returned {} hops (> {MAX_HOPS})", resp.hops.len());
+    }
+    if resp.hops.len() == 1 {
+        // Honest about the limit (SOUL §6): one hop is not trust-split.
+        tracing::warn!(
+            "single-hop path: the exit node sees BOTH your IP and your destination — NOT trust-split \
+             (acceptable only for the single-hop alpha; trust-split is the next milestone)"
+        );
     }
     resp.hops.into_iter().enumerate().map(|(i, h)| hop_to_endpoint(i, h)).collect()
 }
@@ -166,11 +179,14 @@ mod tests {
     }
 
     #[test]
-    fn single_hop_path_is_rejected() {
-        // A 1-hop "trust-split" path defeats Pillar 3 — the client must refuse it (fail closed).
+    fn single_hop_path_is_accepted_for_the_alpha() {
+        // The closed alpha ships single-hop (trust-split is the next milestone); a 1-hop path is
+        // accepted (with a not-trust-split warning) and still pins its measurement. 0 hops is rejected.
         let m = "ab".repeat(48);
         let body = format!(r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#);
-        assert!(path_from_response(body.as_bytes()).is_err(), "a single-hop path must be rejected");
+        let hops = path_from_response(body.as_bytes()).expect("single-hop accepted for the alpha");
+        assert_eq!(hops.len(), 1);
+        assert!(hops[0].expected.is_some(), "the single hop still pins a measurement (attested)");
     }
 
     #[test]

@@ -7,11 +7,15 @@ mod engine;
 mod killswitch;
 mod leakguard;
 mod splittunnel;
+mod tokens;
+mod tokenstore;
 
 use tauri::State;
 
 use account::{AnonymousAccount, Location, PortalClient, RecoverResult};
 use engine::{AppEngine, ConnState};
+use tokens::TokenClient;
+use tokenstore::TokenStore;
 
 // ---- Account commands (talk to the live Portal; errors surface in the UI) ----
 
@@ -43,10 +47,36 @@ async fn recover_account(
 // ---- Engine commands (drive the loopback state machine) ----
 
 #[tauri::command]
-async fn connect(engine: State<'_, AppEngine>) -> Result<ConnState, String> {
-    // Arm leak protection before the tunnel comes up (Phase 0 stub).
+async fn connect(
+    engine: State<'_, AppEngine>,
+    store: State<'_, TokenStore>,
+) -> Result<ConnState, String> {
+    // Arm leak protection before the tunnel comes up.
     leakguard::arm().map_err(|e| e.to_string())?;
-    engine.connect().await.map_err(|e| e.to_string())
+    // Consume one token (removed from disk before use, so a crash never replays a spent token).
+    // None is fine for the loopback/dev path; the engine returns NoTokens if a Coordinator is
+    // configured but the store is empty (fail closed — never connect unattested/unpaid).
+    let token = store.take_one().map_err(|e| e.to_string())?;
+    engine.connect(token).await.map_err(|e| e.to_string())
+}
+
+// ---- Token commands (buy = blind→issue→finalize against the Portal; balance = local count) ----
+
+#[tauri::command]
+async fn token_balance(store: State<'_, TokenStore>) -> Result<usize, String> {
+    store.count().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn buy_tokens(
+    payment_id: String,
+    tokens: State<'_, TokenClient>,
+    store: State<'_, TokenStore>,
+) -> Result<usize, String> {
+    // One token per confirmed payment (the Portal enforces it). Top up with a new payment id.
+    let token = tokens.acquire(&payment_id).await.map_err(|e| e.to_string())?;
+    store.add(&[token]).map_err(|e| e.to_string())?;
+    store.count().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -91,6 +121,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(AppEngine::new())
         .manage(PortalClient::from_env())
+        .manage(TokenClient::from_env())
+        .setup(|app| {
+            // The token store lives in the app's local-data dir — only the device holds tokens
+            // (they're unlinkable to the account/payment, so this is privacy-safe).
+            use tauri::Manager;
+            let dir = app.path().app_local_data_dir()?;
+            app.manage(TokenStore::open(dir.join("tokens.json")));
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_anonymous_account,
             create_email_account,
@@ -102,6 +141,8 @@ pub fn run() {
             set_transport_mode,
             set_split_tunnel,
             toggle_kill_switch,
+            buy_tokens,
+            token_balance,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

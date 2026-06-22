@@ -141,9 +141,23 @@ fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<Node
     Ok(Some(hops))
 }
 
-/// Build the transport and a [`TunnelConfig`] from the environment. The returned `node` is the
-/// directly-reachable hop (a single node, or a path's entry) the kill-switch excepts.
-pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+/// Env-derived tunnel parameters shared by both launch entrypoints. The ONLY difference between
+/// [`from_env`] and [`from_env_with_token`] is how the path is resolved (env token vs an
+/// explicitly-supplied, in-process one); everything else comes from here.
+struct TunnelParams {
+    host: String,
+    port: u16,
+    tun_name: String,
+    client_ip: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    dns: Vec<IpAddr>,
+    kill_switch: bool,
+    allow_unattested: bool,
+    expected: Option<AttestExpectation>,
+    wg_pub: Option<[u8; 32]>,
+}
+
+fn params_from_env() -> Result<TunnelParams> {
     let host = env_or("NW_NODE_HOST", "node");
     let port: u16 = env_or("NW_NODE_PORT", "443").parse().context("NW_NODE_PORT")?;
     let tun_name = env_or("NW_TUN", "nil0");
@@ -162,37 +176,43 @@ pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let allow_unattested = nil_core::net::env_flag("NW_ALLOW_UNATTESTED");
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
-    // Path priority: (1) redeem a Privacy Pass token at the Coordinator for a real, per-hop-attested
-    // trust-split path (production); (2) a static NW_PATH onion (dev); (3) a single node.
-    let path = if let Ok(url) = std::env::var("NW_COORDINATOR_URL") {
-        Some(crate::redeem::redeem_path_from_env(&url).await?)
-    } else {
-        path_from_env(&expected)?
-    };
+    Ok(TunnelParams { host, port, tun_name, client_ip, peer_ip, dns, kill_switch, allow_unattested, expected, wg_pub })
+}
 
+/// Build the transport + a [`TunnelConfig`] from resolved params + a resolved path. `path` is
+/// `Some` for a trust-split / Coordinator-redeemed path (its first hop is the kill-switch
+/// exception), `None` for a single configured node (which may be wrapped in the obfuscation
+/// cascade). The transport assembly is identical regardless of how the path was obtained.
+fn assemble(p: TunnelParams, path: Option<Vec<NodeEndpoint>>) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) =
         if let Some(hops) = path {
-            if wg_pub.is_some() {
-                tracing::warn!("NW_PATH set — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
+            if p.wg_pub.is_some() {
+                tracing::warn!("a path is configured — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
             }
             let entry = hops[0].clone();
-            tracing::info!(hops = hops.len(), "multi-hop trust-split path");
+            tracing::info!(hops = hops.len(), "trust-split path");
             // The inner hops' QUIC is stamped with the client tunnel address so the relaying
             // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
             let inner = MasqueTransport::with_config(MasqueConfig {
-                nested_client_ip: Some(client_ip),
-                allow_unattested,
+                nested_client_ip: Some(p.client_ip),
+                allow_unattested: p.allow_unattested,
                 ..Default::default()
             });
             (Arc::new(PathTransport::new(Arc::new(inner), hops)), entry, 1280)
         } else {
-            let node = NodeEndpoint { host: host.clone(), port, kind: TransportKind::Masque, wg_pub, expected };
+            let node = NodeEndpoint {
+                host: p.host.clone(),
+                port: p.port,
+                kind: TransportKind::Masque,
+                wg_pub: p.wg_pub,
+                expected: p.expected.clone(),
+            };
             // Primary rung: PQ-WireGuard-over-MASQUE if a node WG key is pinned, else plain MASQUE.
-            let (primary, base_mtu): (Arc<dyn Transport>, u16) = if wg_pub.is_some() {
-                let inner = MasqueTransport::with_config(MasqueConfig { allow_unattested, ..Default::default() });
+            let (primary, base_mtu): (Arc<dyn Transport>, u16) = if p.wg_pub.is_some() {
+                let inner = MasqueTransport::with_config(MasqueConfig { allow_unattested: p.allow_unattested, ..Default::default() });
                 (Arc::new(PqWgTransport::new(Arc::new(inner))), 1232)
             } else {
-                (Arc::new(MasqueTransport::with_config(MasqueConfig { allow_unattested, ..Default::default() })), 1280)
+                (Arc::new(MasqueTransport::with_config(MasqueConfig { allow_unattested: p.allow_unattested, ..Default::default() })), 1280)
             };
             // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
             // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
@@ -226,18 +246,13 @@ pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
 
     // When the cascade is on, each fallback node's traffic must also bypass the tunnel (else the
     // fallback rung's own packets to its node would loop through the TUN, and — since the
-    // kill-switch only opens the PRIMARY node on :443 — its custom port would be dropped). Default
-    // each fallback host to the primary host (a rung reuses it when its *_HOST is unset), so the
-    // except/allow covers all ports of that node regardless of port config. Dedup so we don't pin
-    // the same host twice.
-    // Only except hosts that an ACTUALLY-ASSEMBLED fallback rung reaches — gated on the same key
-    // vars that gate the rungs above (lines 185/188). Otherwise NW_CASCADE alone would punch an
-    // all-ports kill-switch hole for a fallback host even in a wstunnel-only (or AmneziaWG-only)
-    // deployment, widening the fail-closed surface beyond any live rung.
+    // kill-switch only opens the PRIMARY node on :443 — its custom port would be dropped). Only
+    // except hosts that an ACTUALLY-ASSEMBLED fallback rung reaches (gated on the same key vars
+    // that gate the rungs above), so NW_CASCADE alone never punches an all-ports kill-switch hole.
     let mut also_except: Vec<String> = Vec::new();
     if std::env::var("NW_CASCADE").is_ok() {
         let mut except_host = |env_key: &str| {
-            let h = std::env::var(env_key).unwrap_or_else(|_| host.clone());
+            let h = std::env::var(env_key).unwrap_or_else(|_| p.host.clone());
             if !also_except.contains(&h) {
                 also_except.push(h);
             }
@@ -252,14 +267,41 @@ pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
 
     let cfg = TunnelConfig {
         node: routing_node,
-        tun_name,
-        client_ip,
-        peer_ip,
+        tun_name: p.tun_name,
+        client_ip: p.client_ip,
+        peer_ip: p.peer_ip,
         prefix: 24,
         mtu,
-        dns,
-        kill_switch,
+        dns: p.dns,
+        kill_switch: p.kill_switch,
         also_except,
     };
     Ok((transport, cfg))
+}
+
+/// Build the transport and a [`TunnelConfig`] from the environment. Path priority: (1) redeem a
+/// Privacy Pass token at the Coordinator (`NW_COORDINATOR_URL` + `NW_TOKEN_MSG`/`NW_TOKEN[_FILE]`);
+/// (2) a static `NW_PATH` onion (dev); (3) a single `NW_NODE_HOST`. Used by `nil-cli` (headless).
+pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    let p = params_from_env()?;
+    let path = if let Ok(url) = std::env::var("NW_COORDINATOR_URL") {
+        Some(crate::redeem::redeem_path_from_env(&url).await?)
+    } else {
+        path_from_env(&p.expected)?
+    };
+    assemble(p, path)
+}
+
+/// Like [`from_env`], but the path is redeemed with a CALLER-SUPPLIED token (`msg` + `token`, both
+/// hex) instead of `NW_TOKEN_MSG`/`NW_TOKEN`. The desktop engine holds the unblinded token
+/// in-process (from its local token store) and passes it here — avoiding a bearer credential in
+/// the process-global environment. All other tunnel params still come from the environment.
+pub async fn from_env_with_token(
+    coord_url: &str,
+    msg: &str,
+    token: &str,
+) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    let p = params_from_env()?;
+    let path = Some(crate::redeem::redeem_path(coord_url, msg, token).await?);
+    assemble(p, path)
 }

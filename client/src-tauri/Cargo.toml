@@ -42,6 +42,7 @@ tracing = { workspace = true }   # structured logs (no node address — privacy)
 
 # HTTP to the Portal. rustls (not OpenSSL) to match the project's TLS standard.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom = { workspace = true }   # fresh random token-message nonce (client-side blinding)
 
 # Desktop only: the real MASQUE/PQ-WireGuard transports + the OS datapath (TUN, routing,
 # fail-closed kill-switch) and the shared `launch` builder the engine uses to bring up a real
