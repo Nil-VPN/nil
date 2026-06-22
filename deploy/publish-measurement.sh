@@ -19,6 +19,7 @@ MODE="offline"
 [ "${1:-}" = "--mode" ] && MODE="${2:-offline}"
 
 OUT="$(mktemp -d)/measurement"; mkdir -p "$OUT"
+SDE=$(git log -1 --pretty=%ct 2>/dev/null || echo 0)   # commit time, for the deterministic re-extract
 
 echo "==> computing the nil-node measurement (reproducible build)"
 MEASUREMENT=$(./deploy/reproducible-build.sh | awk -F= '/^MEASUREMENT=/{print $2}')
@@ -57,8 +58,8 @@ echo "  attestation → $STMT"
 case "$MODE" in
   offline)
     echo; echo "==> OFFLINE (dry run) — would publish to Rekor with:"
-    echo "    cosign attest --yes --type slsaprovenance --predicate $STMT <image-or-artifact-ref>"
-    echo "    (or: rekor-cli upload --artifact nil-node --signature ... --public-key ...)"
+    echo "    cosign attest-blob --yes --type slsaprovenance --predicate $STMT \\"
+    echo "      --bundle nil-node.attestation.bundle <nil-node binary>"
     echo "  Pin the resulting Rekor log index in the Coordinator (NW_PINNED_MEASUREMENT=$MEASUREMENT)."
     ;;
   real)
@@ -66,9 +67,24 @@ case "$MODE" in
       echo "real mode needs a CI OIDC identity (keyless signing); run this from the release workflow."; exit 1
     fi
     command -v cosign >/dev/null 2>&1 || { echo "cosign not installed"; exit 1; }
-    : "${ARTIFACT_REF:?set ARTIFACT_REF to the image/artifact to attest}"
-    cosign attest --yes --type slsaprovenance --predicate "$STMT" "$ARTIFACT_REF"
-    echo "  published to Rekor; pin NW_PINNED_MEASUREMENT=$MEASUREMENT in the Coordinator."
+    # Attest the actual production nil-node BINARY (a blob) — the measurement IS the binary's
+    # hash, so `attest-blob` is the right primitive and needs no pushed OCI image / ARTIFACT_REF.
+    # Re-extract the reproducibly-built binary and confirm its hash matches the published value
+    # before signing (never attest a binary that doesn't match the measurement we publish).
+    echo "==> extracting the production nil-node binary for attestation"
+    docker build --no-cache --build-arg SOURCE_DATE_EPOCH="$SDE" \
+      -f deploy/Dockerfile.repro --target builder -t nil-node-repro:publish . >/dev/null
+    docker run --rm --entrypoint cat nil-node-repro:publish /nil-node > "$OUT/nil-node"
+    GOT=$(sha256sum "$OUT/nil-node" | awk '{print $1}')
+    if [ "$GOT" != "$MEASUREMENT" ]; then
+      echo "extracted binary hash $GOT != published measurement $MEASUREMENT — aborting"; exit 1
+    fi
+    # Keyless: Fulcio issues a short-lived cert from the CI OIDC identity and the entry lands in
+    # the public Rekor log; the bundle carries the inclusion proof + Rekor log index.
+    cosign attest-blob --yes --type slsaprovenance --predicate "$STMT" \
+      --bundle "$OUT/nil-node.attestation.bundle" "$OUT/nil-node"
+    echo "  published to Rekor (keyless); bundle → $OUT/nil-node.attestation.bundle"
+    echo "  pin NW_PINNED_MEASUREMENT=$MEASUREMENT in the Coordinator (and the Rekor index from the bundle)."
     ;;
   *) echo "unknown mode: $MODE (use offline|real)"; exit 1 ;;
 esac

@@ -1,0 +1,49 @@
+# PRODUCTION nil-node image — runs inside a confidential VM (AMD SEV-SNP / Intel TDX).
+#
+# Built with `--features hw-attest` and WITHOUT `synthetic-attest`: the node fetches a REAL
+# hardware attestation report from the kernel configfs-TSM interface (crates/nil-node/src/hw.rs).
+# Without a TEE guest the report fetch fails and the node serves no report → a pinning client
+# fails closed (never an unattested tunnel). This image is NOT the Docker test harness
+# (deploy/Dockerfile, which uses synthetic-attest); it is the thing that runs in the cloud CVM.
+#
+# Operator runbook: deploy/PRODUCTION-NODE.md (configfs-TSM mount, VCEK/collateral provisioning,
+# capturing + pinning the real guest-launch measurement, required env + caps).
+#
+# The builder stage is DELIBERATELY identical to deploy/Dockerfile.repro (same toolchain,
+# deterministic flags, --locked, --features hw-attest) so the binary this image ships is the
+# byte-identical, reproducibly-built artifact whose measurement is published to Rekor. KEEP THE
+# TWO BUILDER STAGES IN SYNC — if they diverge, the shipped node is no longer the audited binary.
+# TODO(prod): pin both bases by @sha256 (FROM rust:1.96.0-bookworm@sha256:… / debian:…@sha256:…)
+# so a floating-tag re-tag can't change the artifact (resolve via `docker buildx imagetools inspect`).
+
+FROM rust:1.96.0-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CARGO_INCREMENTAL=0 \
+    LC_ALL=C \
+    TZ=UTC \
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+WORKDIR /build
+COPY . .
+# No cache mounts — hermetic, so this binary hashes identically to the published measurement.
+RUN cargo build --release --locked -p nil-node --features hw-attest && cp target/release/nil-node /nil-node
+
+FROM debian:bookworm-slim
+# Datapath tooling: the exit node NATs decapsulated packets to the internet and owns a TUN.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 iptables procps ethtool ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /nil-node /usr/local/bin/nil-node
+
+# Runtime contract (enforced by the guest provisioning, see deploy/PRODUCTION-NODE.md):
+#   /sys/kernel/config/tsm   configfs-TSM mounted in the guest (real SEV-SNP/TDX reports)
+#   NW_NODE_BIND             listen addr, e.g. 0.0.0.0:443
+#   NW_NODE_EGRESS           egress interface, e.g. eth0
+#   NW_NODE_TEE              sev-snp | tdx
+#   NW_NODE_MEASUREMENT      48-byte hex guest-launch measurement (captured on first real boot,
+#                            then pinned in the Coordinator registry)
+#   NW_VCEK_PATH             AMD VCEK DER (SEV-SNP) — fetched once from AMD KDS at provisioning
+#   NW_TDX_COLLATERAL        Intel DCAP collateral JSON (TDX) — from Intel PCS
+# Needs CAP_NET_ADMIN + /dev/net/tun. Keeps NO disk logs (stdout only) — do not mount a log volume.
+ENTRYPOINT ["nil-node"]
