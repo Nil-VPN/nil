@@ -33,9 +33,9 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Format
-        run: cargo fmt --all -- --check
-
+      # No `cargo fmt --check` gate: the codebase uses a deliberate wide hand-formatted style
+      # (no rustfmt.toml) that default rustfmt would rewrite repo-wide. Clippy (-D warnings) is the
+      # enforced style/quality gate; new code should read like the surrounding code.
       - name: Build
         run: cargo build --workspace --locked
 
