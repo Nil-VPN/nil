@@ -3,9 +3,11 @@
 //! for the node so the tunnel's own QUIC packets don't loop), arms a fail-closed
 //! kill-switch, and runs the bidirectional packet pump.
 //!
-//! The OS-specific routing/kill-switch/DNS lives behind [`NetControl`]; Phase 1 implements
-//! Linux (verified in Docker). macOS is a Phase-1b stub. The [`Transport`] trait stays the
-//! only seam to the tunnel — this crate never knows which transport is active.
+//! The OS-specific routing/kill-switch/DNS lives behind [`NetControl`]: Linux (verified in
+//! Docker) and macOS (verified in a tart VM) are complete; Windows implements routing/DNS and
+//! is verified in a Windows-on-ARM VM (its WFP kill-switch lands in that same pass — see
+//! `windows.rs`). The [`Transport`] trait stays the only seam to the tunnel — this crate never
+//! knows which transport is active.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -19,6 +21,8 @@ use tokio_util::sync::CancellationToken;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
 
 /// How to bring up the tunnel.
 pub struct TunnelConfig {
@@ -47,14 +51,14 @@ pub trait NetControl: Send {
     fn teardown(&mut self);
 }
 
-/// Fallback for non-Linux targets (macOS datapath is Phase 1b). Compiles everywhere so the
-/// workspace builds on macOS; refuses to arm at runtime.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Fallback for targets without a native datapath impl. Compiles everywhere so the workspace
+/// builds on any host; refuses to arm at runtime.
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 struct StubNet;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 impl NetControl for StubNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
-        anyhow::bail!("system datapath is implemented for Linux and macOS only")
+        anyhow::bail!("system datapath is implemented for Linux, macOS, and Windows only")
     }
     fn teardown(&mut self) {}
 }
@@ -67,7 +71,11 @@ fn new_net_control() -> Box<dyn NetControl> {
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(macos::MacNet::default())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn new_net_control() -> Box<dyn NetControl> {
+    Box::new(windows::WinNet::default())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(StubNet)
 }
@@ -139,8 +147,9 @@ fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
     let mut builder = tun_rs::DeviceBuilder::new()
         .ipv4(cfg.client_ip, cfg.prefix, Some(cfg.peer_ip))
         .mtu(cfg.mtu);
-    // macOS requires a `utun*` name (auto-assigned); Linux honors our chosen name.
-    #[cfg(target_os = "linux")]
+    // macOS requires a `utun*` name (auto-assigned); Linux and Windows (the wintun adapter
+    // name) honor our chosen name.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         builder = builder.name(cfg.tun_name.clone());
     }
