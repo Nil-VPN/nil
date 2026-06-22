@@ -1,0 +1,16 @@
+[package]
+name = "nil-provision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN client provisioning helper: acquire an unlinkable Privacy Pass token from the Portal."
+
+[dependencies]
+nil-crypto = { workspace = true }   # Privacy Pass blind/finalize (client side)
+nil-proto = { workspace = true }    # token DTOs (shared with the Portal)
+tokio = { workspace = true }
+anyhow = { workspace = true }
+getrandom = { workspace = true }    # fresh random token message
+# Talk to the Business plane (Portal). rustls (not OpenSSL) to match the project's TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

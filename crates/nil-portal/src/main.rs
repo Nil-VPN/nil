@@ -99,7 +99,19 @@ async fn main() -> Result<()> {
             tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
             w
         }
-        Err(_) => Arc::new(MockWatcher::with_paid(std::iter::empty())),
+        // Dev only: seed the mock watcher with already-"paid" payment ids from NW_MOCK_PAID
+        // (comma-separated). Lets the integration harness mint a token without a live monerod;
+        // never use in production (NW_MONERO_RPC takes precedence above).
+        Err(_) => {
+            let paid: Vec<String> = std::env::var("NW_MOCK_PAID")
+                .ok()
+                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default();
+            if !paid.is_empty() {
+                tracing::warn!(count = paid.len(), "NW_MOCK_PAID set — mock payment watcher (dev/integration only)");
+            }
+            Arc::new(MockWatcher::with_paid(paid))
+        }
     };
 
     // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning
