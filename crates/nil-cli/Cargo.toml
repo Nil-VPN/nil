@@ -6,12 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "NIL VPN headless client: brings up a MASQUE tunnel through a node (Linux/Docker test client + CLI)."
 
-[features]
-# `dev-insecure` skips TLS verification (needed only to reach a self-signed Phase-1 node).
-# OFF by default — the default `nil-cli` build verifies TLS. The Docker verify harness opts
-# in explicitly (see deploy/Dockerfile). Replaced entirely by RA-TLS in Phase 2.
-dev-insecure = ["nil-transport/dev-insecure"]
-
 [dependencies]
 nil-core = { workspace = true }
 nil-transport = { workspace = true, features = ["masque"] }

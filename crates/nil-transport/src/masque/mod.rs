@@ -11,10 +11,12 @@
 //! loop. [`MasqueTransport::send`]/[`recv`](MasqueTransport::recv) cross bounded channels
 //! to/from that task — the [`Transport`] seam stays identical to loopback.
 //!
-//! ## Phase 1 caveat (honest)
-//! TLS peer verification is currently a dev placeholder (`verify_peer(false)` when
-//! [`MasqueConfig::insecure_dev`]); this is **NOT attestation**. `nil-attest` RA-TLS
-//! (SEV-SNP/TDX appraisal) replaces it in Phase 2 (spec §5).
+//! ## Trust (Phase 2)
+//! The node presents a self-signed RA-TLS certificate with its SEV-SNP/TDX report embedded in
+//! an X.509 extension, so BoringSSL chain verification is off (`verify_peer(false)`). All node
+//! trust comes from `nil-attest` appraising that report — against the Coordinator-pinned
+//! measurement and a per-connection nonce — at the single ready gate before any packet flows
+//! (spec §5). No expectation pinned ⇒ the connection is unattested and the driver warns.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,6 +30,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
 
+use nil_attest::{appraise, AppraisalPolicy};
+
 use crate::connectip;
 use crate::Transport;
 
@@ -37,19 +41,10 @@ const INBOUND_QUEUE: usize = 1024;
 const MAX_UDP_PAYLOAD: usize = 1350;
 
 /// Client-side MASQUE configuration.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct MasqueConfig {
     /// TLS SNI / `:authority`. Defaults to the target host at connect time.
     pub server_name: Option<String>,
-    /// Phase 1 dev: skip TLS peer verification (self-signed node cert). NOT attestation.
-    pub insecure_dev: bool,
-}
-
-impl Default for MasqueConfig {
-    fn default() -> Self {
-        // Phase 1 default trusts the dev node cert without verification (RA-TLS is Phase 2).
-        Self { server_name: None, insecure_dev: true }
-    }
 }
 
 /// Heavy per-session state, owned by the transport and keyed by [`SessionId`].
@@ -97,7 +92,7 @@ impl MasqueTransport {
 
 #[async_trait]
 impl Transport for MasqueTransport {
-    async fn connect(&self, target: NodeEndpoint, _creds: Grant) -> Result<Session> {
+    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
         let peer = resolve(&target).await?;
         let bind: SocketAddr = if peer.is_ipv6() {
             "[::]:0".parse().expect("valid v6 bind")
@@ -121,12 +116,19 @@ impl Transport for MasqueTransport {
             .server_name
             .clone()
             .unwrap_or_else(|| target.host.clone());
+        // The node must attest to the measurement the Coordinator pinned in the endpoint. No
+        // expectation (loopback/dev) → the connection is unattested and the driver warns.
+        let policy = target
+            .expected
+            .as_ref()
+            .map(|e| AppraisalPolicy::new(e.tee, e.measurement.clone()));
         let driver = tokio::spawn(driver_run(
             socket,
             peer,
             local,
             authority,
-            self.config.insecure_dev,
+            creds.nonce,
+            policy,
             to_rx,
             from_tx,
             ready_tx,
@@ -218,7 +220,8 @@ async fn driver_run(
     peer: SocketAddr,
     local: SocketAddr,
     authority: String,
-    insecure_dev: bool,
+    nonce: [u8; 32],
+    policy: Option<AppraisalPolicy>,
     mut to_rx: mpsc::Receiver<IpPacket>,
     from_tx: mpsc::Sender<IpPacket>,
     ready_tx: oneshot::Sender<Result<ReadyInfo>>,
@@ -233,7 +236,7 @@ async fn driver_run(
         }};
     }
 
-    let mut config = match build_client_config(insecure_dev) {
+    let mut config = match build_client_config() {
         Ok(c) => c,
         Err(e) => {
             fail!(e);
@@ -317,7 +320,7 @@ async fn driver_run(
         if h3.is_none() && conn.is_established() {
             match quiche::h3::Connection::with_transport(&mut conn, &h3_config) {
                 Ok(mut h3c) => {
-                    let headers = connect_ip_headers(&authority);
+                    let headers = connect_ip_headers(&authority, &nonce);
                     match h3c.send_request(&mut conn, &headers, false) {
                         Ok(sid) => {
                             ci_stream = Some(sid);
@@ -347,10 +350,23 @@ async fn driver_run(
                         if Some(sid) == ci_stream {
                             match status_of(&list) {
                                 Some(code) if (200..300).contains(&code) => {
-                                    if let Some(tx) = ready_tx.take() {
-                                        let mdp = conn.dgram_max_writable_len().unwrap_or(1200);
-                                        let _ = tx.send(Ok(ReadyInfo { max_dgram_payload: mdp }));
-                                        tracing::info!(%peer, flow_id, "MASQUE CONNECT-IP established");
+                                    // THE attestation gate: appraise the node's RA-TLS cert
+                                    // before signaling ready. This is the only ready-Ok site,
+                                    // so a failed/absent appraisal can never yield a tunnel.
+                                    match attest_peer(&conn, &list, policy.as_ref(), &nonce) {
+                                        Ok(()) => {
+                                            if let Some(tx) = ready_tx.take() {
+                                                let mdp = conn.dgram_max_writable_len().unwrap_or(1200);
+                                                let _ = tx.send(Ok(ReadyInfo { max_dgram_payload: mdp }));
+                                                tracing::info!(%peer, flow_id, "MASQUE CONNECT-IP established");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            fail!(e);
+                                            let _ = conn.close(true, 0x104, b"attestation");
+                                            flush(&mut conn, &socket, &mut out).await;
+                                            return;
+                                        }
                                     }
                                 }
                                 other => {
@@ -432,7 +448,7 @@ async fn flush(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]
     }
 }
 
-fn build_client_config(insecure_dev: bool) -> Result<quiche::Config> {
+fn build_client_config() -> Result<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
         .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
     config
@@ -448,29 +464,70 @@ fn build_client_config(insecure_dev: bool) -> Result<quiche::Config> {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.enable_dgram(true, 65536, 65536);
-    if insecure_dev {
-        // The insecure path only exists when the `dev-insecure` feature is compiled in, so a
-        // build without it can NEVER silently skip TLS verification (defense against the
-        // feature leaking into a shipped binary).
-        #[cfg(feature = "dev-insecure")]
-        {
-            // Phase 1 dev only — NOT attestation. Replaced by nil-attest RA-TLS in Phase 2.
-            config.verify_peer(false);
-            tracing::warn!(
-                "DEV INSECURE: TLS peer verification DISABLED — connection is NOT attested (Phase 1 dev only)"
-            );
-        }
-        #[cfg(not(feature = "dev-insecure"))]
-        {
-            tracing::error!(
-                "insecure_dev requested but the `dev-insecure` feature is not built in — keeping TLS verification ON"
-            );
-        }
-    }
+    // The node presents a self-signed RA-TLS cert (the attestation report is embedded in an
+    // X.509 extension, not chained to a public CA), so BoringSSL-level chain verification is
+    // intentionally off. ALL node trust comes from `attest_peer` appraising the embedded
+    // report after the handshake — see the single ready gate in `driver_run`.
+    config.verify_peer(false);
     Ok(config)
 }
 
-fn connect_ip_headers(authority: &str) -> Vec<quiche::h3::Header> {
+/// The single attestation gate. With a pinned policy, appraise the node's attestation
+/// evidence (from the CONNECT-IP response header) against it — bound to the node's TLS key
+/// (`peer_cert()` SPKI) and the client nonce. Without a policy the connection is unattested
+/// and we warn loudly (dev/loopback only — a real endpoint always carries a policy).
+fn attest_peer(
+    conn: &quiche::Connection,
+    headers: &[quiche::h3::Header],
+    policy: Option<&AppraisalPolicy>,
+    nonce: &[u8; 32],
+) -> Result<()> {
+    let Some(policy) = policy else {
+        tracing::warn!("MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only");
+        return Ok(());
+    };
+    let cert = conn
+        .peer_cert()
+        .ok_or_else(|| Error::Transport("attestation failed: node presented no certificate".into()))?;
+    let spki = nil_attest::ratls::spki_of(cert)
+        .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
+    let report_hex = header_value(headers, connectip::ATTEST_REPORT_HEADER.as_bytes())
+        .ok_or_else(|| Error::Transport("attestation failed: node returned no report".into()))?;
+    let evidence = hex_decode(report_hex)
+        .ok_or_else(|| Error::Transport("attestation failed: malformed report header".into()))?;
+    let verdict = appraise(&evidence, &spki, policy, nonce)
+        .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
+    tracing::info!(tee = ?verdict.tee, "node attestation verified");
+    Ok(())
+}
+
+/// Find an H3 header value by (lowercase) name.
+fn header_value<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a [u8]> {
+    use quiche::h3::NameValue;
+    headers.iter().find(|h| h.name() == name).map(|h| h.value())
+}
+
+/// Decode lowercase/uppercase hex bytes to a byte vector (reverse of [`hex32`]).
+fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
+fn connect_ip_headers(authority: &str, nonce: &[u8; 32]) -> Vec<quiche::h3::Header> {
     use quiche::h3::Header;
     vec![
         Header::new(b":method", b"CONNECT"),
@@ -479,7 +536,21 @@ fn connect_ip_headers(authority: &str) -> Vec<quiche::h3::Header> {
         Header::new(b":authority", authority.as_bytes()),
         Header::new(b":path", connectip::IP_FULL_TUNNEL_TEMPLATE.as_bytes()),
         Header::new(b"capsule-protocol", b"?1"),
+        // RA-TLS freshness challenge: the node must bind this nonce into its report's
+        // report_data, proving the report was minted for this connection.
+        Header::new(connectip::ATTEST_NONCE_HEADER.as_bytes(), hex32(nonce).as_bytes()),
     ]
+}
+
+/// Lowercase hex of a 32-byte value (header-safe; avoids a hex dependency).
+fn hex32(b: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for &x in b {
+        s.push(HEX[(x >> 4) as usize] as char);
+        s.push(HEX[(x & 0xf) as usize] as char);
+    }
+    s
 }
 
 fn status_of(list: &[quiche::h3::Header]) -> Option<u16> {

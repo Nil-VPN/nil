@@ -23,6 +23,15 @@ pub const CONTEXT_ID_IP_PACKET: u64 = 0;
 /// Both client and node reference this one constant so the handshake can't drift.
 pub const IP_FULL_TUNNEL_TEMPLATE: &str = "/.well-known/masque/ip/*/*/";
 
+/// HTTP/3 request header carrying the client's RA-TLS freshness nonce (lowercase hex). The
+/// node binds it into its attestation report's `report_data` (architecture spec §5).
+pub const ATTEST_NONCE_HEADER: &str = "nil-attest-nonce";
+
+/// HTTP/3 response header carrying the node's attestation evidence (lowercase hex of the
+/// `[tag][parts]` blob), bound to the node's TLS key + the client nonce and appraised by
+/// `nil-attest` before the tunnel is accepted.
+pub const ATTEST_REPORT_HEADER: &str = "nil-attest-report";
+
 /// Largest QUIC varint, `2^62 - 1` (RFC 9000 §16).
 pub const MAX_VARINT: u64 = (1u64 << 62) - 1;
 

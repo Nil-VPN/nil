@@ -72,31 +72,11 @@ pub fn verify(payload: &[u8]) -> Result<Evidence, AttestError> {
     Ok(Evidence { tee, measurement: signed[1..49].to_vec(), report_data, tcb_status: TcbStatus::UpToDate })
 }
 
-/// Build a synthetic RA-TLS leaf cert (DER) embedding a report for `measurement`, bound to a
-/// freshly-generated TLS key and `nonce`. Two-pass: learn the SPKI, bind, then embed.
-#[cfg(feature = "synthetic")]
-pub fn synthetic_cert(tee: Tee, measurement: &[u8; 48], nonce: &[u8; 32]) -> Result<Vec<u8>, AttestError> {
-    let key = rcgen::KeyPair::generate().map_err(|e| AttestError::Cert(format!("keypair: {e}")))?;
-
-    // Pass 1: a cert with no extension, just to read the SPKI this key produces.
-    let bare = rcgen::CertificateParams::new(vec!["nil-node.synthetic".into()])
-        .map_err(|e| AttestError::Cert(format!("params: {e}")))?
-        .self_signed(&key)
-        .map_err(|e| AttestError::Cert(format!("self-sign: {e}")))?;
-    let spki = ratls::spki_of(bare.der())?;
-
-    // Bind the report to this exact key + nonce, sign it, embed it.
-    let report_data = ratls::bind_report_data(&spki, nonce);
-    let evidence = sign(tee, measurement, &report_data);
-    let ext_value = ratls::encode(ratls::TAG_SYNTHETIC, &[&evidence]);
-
-    let mut params = rcgen::CertificateParams::new(vec!["nil-node.synthetic".into()])
-        .map_err(|e| AttestError::Cert(format!("params: {e}")))?;
-    params
-        .custom_extensions
-        .push(rcgen::CustomExtension::from_oid_content(ratls::OID_ARCS, ext_value));
-    let cert = params
-        .self_signed(&key)
-        .map_err(|e| AttestError::Cert(format!("self-sign: {e}")))?;
-    Ok(cert.der().to_vec())
+/// Build a synthetic evidence blob (the `[tag][parts]` bytes the node returns over the
+/// channel) for `measurement`, bound to the node's TLS key (`spki`) and the client `nonce`.
+/// This is what a synthetic node computes after reading the client's nonce header.
+pub fn synthetic_evidence(tee: Tee, measurement: &[u8; 48], spki: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
+    let report_data = ratls::bind_report_data(spki, nonce);
+    let report = sign(tee, measurement, &report_data);
+    ratls::encode(ratls::TAG_SYNTHETIC, &[&report])
 }

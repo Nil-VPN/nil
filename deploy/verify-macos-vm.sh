@@ -22,8 +22,10 @@ SSH="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownH
 SCP="scp -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 VMIP=$(tart ip "$VM")
 
-echo "==> build macOS nil-cli (dev-insecure) + copy into VM"
-( cd "$(dirname "$0")/.." && cargo build --release -p nil-cli --features dev-insecure )
+echo "==> build macOS nil-cli + copy into VM"
+# No pinned measurement here, so the tunnel connects unattested (the client warns); this
+# harness exercises the macOS routing/kill-switch datapath, not attestation.
+( cd "$(dirname "$0")/.." && cargo build --release -p nil-cli )
 $SCP "$(dirname "$0")/../target/release/nil-cli" "admin@$VMIP:/Users/admin/nil-cli"
 $SCP "$(dirname "$0")/vm_verify.sh" "admin@$VMIP:/tmp/vm_verify.sh"
 ${=SSH} 'chmod +x ~/nil-cli /tmp/vm_verify.sh'

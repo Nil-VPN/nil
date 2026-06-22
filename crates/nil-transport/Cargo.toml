@@ -10,12 +10,11 @@ description = "NIL VPN transport trait — the single seam between the engine an
 default = []
 # MASQUE/QUIC transport (quiche + BoringSSL → needs cmake to build). Off by default so
 # crates that only need the trait + loopback (and the pure `connectip` framing) build light.
-masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom"]
-# Dev-only TLS bypass for Phase 1 (no attestation yet). Never enable in release.
-dev-insecure = []
+masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest"]
 
 [dependencies]
 nil-core = { workspace = true }
+nil-attest = { workspace = true, optional = true }   # RA-TLS appraisal gate (with `masque`)
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

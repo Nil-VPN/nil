@@ -5,11 +5,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY . .
-# nil-cli is built with `dev-insecure` (self-signed Phase-1 node); nil-node has no such flag.
+# Phase 2: RA-TLS attestation replaces the dev TLS bypass; nil-node is built with the
+# `synthetic-attest` feature so the Docker harness can attest without real TEE hardware.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release -p nil-node && \
-    cargo build --release -p nil-cli --features dev-insecure && \
+    cargo build --release -p nil-node --features synthetic-attest && \
+    cargo build --release -p nil-cli && \
     mkdir -p /out && \
     cp target/release/nil-node target/release/nil-cli /out/
 
