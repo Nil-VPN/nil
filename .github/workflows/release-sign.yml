@@ -1,0 +1,360 @@
+# Build + SIGN the NIL VPN desktop client on a version tag.
+#
+# Trigger: a `v*` tag (same convention as release-attest.yml). The job builds the Tauri v2
+# desktop bundles and signs them per-platform with credentials that live ONLY in GitHub
+# repository secrets — nothing signing-related is ever committed:
+#   - macOS : Developer ID Application cert + Apple notarization (notarytool), stapled.
+#   - Windows: Authenticode signature over the .exe/.msi (signtool).
+#   - Linux : detached GPG signatures (.asc) over the .deb / .AppImage.
+#
+# Signed artifacts are uploaded per-platform. Promotion to a public GitHub Release is left to
+# the founder (the `release` job at the bottom is gated + commented) so unsigned/partial runs
+# never publish.
+#
+# This workflow signs the *installer bundles*. The Tauri auto-updater signature (a separate
+# minisign keypair) is a TODO below, gated on the founder generating an updater key — until
+# then the app ships without in-app auto-update, which is the correct closed-alpha posture.
+name: release-sign
+
+on:
+  push:
+    tags: ["v*"]
+  # Manual re-run for a tag that already exists (e.g. after adding a missing secret), without
+  # re-tagging. Provide the tag ref to check out.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build + sign (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-sign-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tauri reads the app version from tauri.conf.json; the workspace is pinned to the same
+  # version via rust-toolchain.toml (1.96.0), installed automatically on first cargo call.
+  TAURI_CLIENT_DIR: client
+
+jobs:
+  # ---------------------------------------------------------------------------------------
+  # Validate the workflow_dispatch tag once, into an output the build jobs consume. A tag-push
+  # run uses github.ref directly (no untrusted input), so this only constrains the manual path.
+  # ---------------------------------------------------------------------------------------
+  resolve-ref:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+    steps:
+      - name: Resolve + validate the ref to build
+        id: pick
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          PUSH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TAG:-}" ]; then
+            # Reject anything that is not a plain version tag — no path traversal into ref:.
+            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v[0-9A-Za-z._-]+$'; then
+              echo "Refusing tag '${INPUT_TAG}': must match ^v[0-9A-Za-z._-]+$" >&2
+              exit 1
+            fi
+            echo "ref=refs/tags/${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${PUSH_REF}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ---------------------------------------------------------------------------------------
+  # macOS — Developer ID signing + Apple notarization (Tauri does both via tauri-action when
+  # the APPLE_* env vars are present; notarytool staples the ticket into the .app/.dmg).
+  # ---------------------------------------------------------------------------------------
+  macos:
+    needs: resolve-ref
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Validated upstream (resolve-ref): a plain `vX` tag or the pushed tag ref.
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node (pnpm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
+
+      # Both Apple Silicon and Intel from the macos-14 (arm64) runner.
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend deps
+        working-directory: ${{ env.TAURI_CLIENT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      # Materialize the App Store Connect API key (.p8) from a secret into a temp file BEFORE the
+      # build; tauri-action reads its path via APPLE_API_KEY_PATH to drive notarytool.
+      #   APPLE_API_KEY_P8 secret = full contents of the AuthKey_XXXXXXXXXX.p8 file.
+      - name: Write App Store Connect API key from secret
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPLE_API_KEY_P8:-}" ]; then
+            echo "APPLE_API_KEY_P8 secret is not set — add the AuthKey_*.p8 contents as a repo secret." >&2
+            exit 1
+          fi
+          printf '%s' "$APPLE_API_KEY_P8" > "${RUNNER_TEMP}/asc_api_key.p8"
+
+      - name: Build, sign (Developer ID) and notarize
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # --- Apple code-signing identity (founder must add all of these as repo secrets) ---
+          # APPLE_CERTIFICATE: base64 of the "Developer ID Application" .p12 export
+          #   (`base64 -i DeveloperIDApplication.p12 | pbcopy`).
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          # APPLE_CERTIFICATE_PASSWORD: the password set when exporting that .p12.
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          # APPLE_SIGNING_IDENTITY: the identity string, e.g.
+          #   "Developer ID Application: Your Name (TEAMID1234)".
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # --- Apple notarization (App Store Connect API key — preferred over app-specific pw) ---
+          # APPLE_API_ISSUER: the Issuer ID (UUID) from App Store Connect > Users and Access > Keys.
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # APPLE_API_KEY: the Key ID (10 chars) of that App Store Connect API key.
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          # APPLE_API_KEY_PATH is written below from the secret file content; tauri-action reads it.
+          APPLE_API_KEY_PATH: ${{ runner.temp }}/asc_api_key.p8
+        with:
+          projectPath: ${{ env.TAURI_CLIENT_DIR }}
+          # Universal binary so one .dmg covers Apple Silicon + Intel.
+          args: --target universal-apple-darwin
+        # tauri-action invokes `pnpm build` (beforeBuildCommand) then bundles + signs.
+
+      - name: Upload signed macOS bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: nilvpn-macos-signed
+          path: |
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # Windows — Authenticode signing of the bundled .msi / .exe via signtool.
+  # tauri-action builds the bundle; we sign with the founder's code-signing cert afterward so
+  # signtool flags (timestamp URL, digest) are explicit and auditable.
+  # ---------------------------------------------------------------------------------------
+  windows:
+    needs: resolve-ref
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node (pnpm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend deps
+        working-directory: ${{ env.TAURI_CLIENT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      # Build the bundle UNSIGNED here; signtool runs in the next step so the cert never touches
+      # the build env and the signing command is explicit.
+      - name: Build Windows bundle
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ${{ env.TAURI_CLIENT_DIR }}
+
+      # Materialize the code-signing cert from a base64 secret into a temp .pfx, sign every
+      # produced .msi/.exe with an RFC-3161 timestamp, then delete the .pfx.
+      #   WINDOWS_CERTIFICATE          : base64 of the Authenticode code-signing .pfx
+      #                                  (`certutil -encode cert.pfx cert.b64`, strip headers, or
+      #                                   `[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`).
+      #   WINDOWS_CERTIFICATE_PASSWORD : the .pfx export password.
+      - name: Sign Windows bundle (Authenticode)
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE)) {
+            Write-Error "WINDOWS_CERTIFICATE secret is not set — add the base64 .pfx as a repo secret."
+            exit 1
+          }
+          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          # Locate signtool from the installed Windows SDK.
+          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+            Where-Object { $_.FullName -match "x64" } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { Write-Error "signtool.exe not found in Windows SDK"; exit 1 }
+          $bundleRoot = Join-Path $env:GITHUB_WORKSPACE "$env:TAURI_CLIENT_DIR\src-tauri\target\release\bundle"
+          $targets = Get-ChildItem -Path $bundleRoot -Recurse -Include *.msi,*.exe
+          if (-not $targets) { Write-Error "No .msi/.exe produced under $bundleRoot"; exit 1 }
+          foreach ($f in $targets) {
+            & $signtool sign /f $pfxPath /p $env:WINDOWS_CERTIFICATE_PASSWORD `
+              /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 /v $f.FullName
+            if ($LASTEXITCODE -ne 0) { Write-Error "signtool failed for $($f.FullName)"; exit 1 }
+            & $signtool verify /pa /v $f.FullName
+            if ($LASTEXITCODE -ne 0) { Write-Error "signature verify failed for $($f.FullName)"; exit 1 }
+          }
+          Remove-Item $pfxPath -Force
+
+      - name: Upload signed Windows bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: nilvpn-windows-signed
+          path: |
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/msi/*.msi
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------------------
+  # Linux — build the .deb / .AppImage, then attach detached GPG signatures (.asc) so users
+  # can verify provenance with the project's published public key.
+  # Same system build deps as .github/workflows/ci.yml (WebKitGTK/GTK/glib + cmake/clang).
+  # ---------------------------------------------------------------------------------------
+  linux:
+    needs: resolve-ref
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node (pnpm cache)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
+
+      # Mirrors the system libraries the workspace build needs on Linux (see ci.yml): the Tauri
+      # client pulls glib/gtk/webkit2gtk-sys (need the -dev packages + pkg-config), and
+      # quiche/BoringSSL needs cmake + clang. Without these the *-sys build scripts fail.
+      - name: Install Linux build deps (Tauri + BoringSSL/quiche)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libglib2.0-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
+            cmake clang pkg-config build-essential
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install frontend deps
+        working-directory: ${{ env.TAURI_CLIENT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Linux bundles
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ${{ env.TAURI_CLIENT_DIR }}
+
+      # Detached GPG signatures over each .deb / .AppImage.
+      #   GPG_PRIVATE_KEY : ASCII-armored private signing key
+      #                     (`gpg --armor --export-secret-keys KEYID`).
+      #   GPG_PASSPHRASE  : passphrase protecting that key.
+      - name: Sign Linux bundles (detached GPG)
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "GPG_PRIVATE_KEY secret is not set — add the armored private key as a repo secret." >&2
+            exit 1
+          fi
+          export GNUPGHOME="$(mktemp -d)"
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          bundle_root="${TAURI_CLIENT_DIR}/src-tauri/target/release/bundle"
+          mapfile -t artifacts < <(find "$bundle_root" -type f \( -name '*.deb' -o -name '*.AppImage' \))
+          if [ "${#artifacts[@]}" -eq 0 ]; then
+            echo "No .deb/.AppImage produced under $bundle_root" >&2
+            exit 1
+          fi
+          for f in "${artifacts[@]}"; do
+            gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
+              --armor --detach-sign --output "${f}.asc" "$f"
+            gpg --batch --verify "${f}.asc" "$f"
+          done
+          rm -rf "$GNUPGHOME"
+
+      - name: Upload signed Linux bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: nilvpn-linux-signed
+          path: |
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/deb/*.deb
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/deb/*.deb.asc
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/appimage/*.AppImage
+            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/appimage/*.AppImage.asc
+          if-no-files-found: error
+
+# ===========================================================================================
+# TODO (founder) — Tauri auto-updater signing. The in-app updater requires its OWN minisign
+# keypair (NOT the OS code-signing certs above):
+#   1. `pnpm --dir client tauri signer generate -w nilvpn-updater.key`   (keep the .key OFFLINE).
+#   2. Add the PUBLIC key to client/src-tauri/tauri.conf.json under `plugins.updater.pubkey`
+#      and configure an `endpoints` URL.
+#   3. Add repo secrets TAURI_SIGNING_PRIVATE_KEY (the .key contents) and
+#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD (its passphrase).
+#   4. Set both as `env:` on each tauri-apps/tauri-action step above — tauri-action then emits
+#      the signed `latest.json` + `*.sig` updater artifacts automatically.
+# Until the founder completes this, the app ships WITHOUT auto-update (correct for closed alpha).
+#
+# TODO (founder) — promote to a public GitHub Release. Intentionally NOT automated so a
+# partial/unsigned run never publishes. After verifying the three `nilvpn-*-signed` artifacts,
+# enable a `release` job that downloads them and runs softprops/action-gh-release (needs
+# `permissions: contents: write`).
+# ===========================================================================================
