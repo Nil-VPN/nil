@@ -20,6 +20,8 @@ pub mod masque;
 #[cfg(feature = "masque")]
 pub mod path;
 #[cfg(feature = "pqwg")]
+pub mod amneziawg;
+#[cfg(feature = "pqwg")]
 pub mod pqwg;
 
 pub use transport::Transport;

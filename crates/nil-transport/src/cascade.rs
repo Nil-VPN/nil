@@ -21,11 +21,13 @@
 //! therefore (1) bounds each rung's `connect` with a **timeout** and (2) optionally runs a
 //! post-connect **liveness probe** before committing to a rung.
 //!
-//! MASQUE is fully implemented (the `masque` feature). The lower rungs are **Phase-4
-//! scaffolds**: they carry the correct `kind()`/`fingerprint_profile()` and slot into the
-//! cascade, but their datapaths are not built yet — `connect` returns a clear error, so the
-//! cascade simply steps past them to MASQUE today. AmneziaWG will reuse the PQ-WireGuard core
-//! ([`crate::pqwg`]); wstunnel is WebSocket-over-TLS; REALITY borrows a real TLS handshake.
+//! MASQUE is fully implemented (the `masque` feature). The lower rungs are **scaffolds** at the
+//! `Transport` level: they carry the correct `kind()`/`fingerprint_profile()` and slot into the
+//! cascade, but their `connect` returns a clear error, so the cascade steps past them to MASQUE
+//! today. AmneziaWG's DPI-defeating obfuscation core (magic headers + junk that erase WG's
+//! 148/92-byte + message-type fingerprint) is implemented and tested in [`crate::amneziawg`],
+//! reusing the PQ-WireGuard crypto ([`crate::pqwg`]); only its live UDP datapath remains. wstunnel
+//! is WebSocket-over-TLS; REALITY borrows a real TLS handshake.
 
 use std::sync::Arc;
 use std::time::Duration;
