@@ -96,8 +96,14 @@ impl Tunnel {
         let node_ip = resolve_ip(&cfg.node).await?;
         tracing::info!(node = %cfg.node.host, %node_ip, "connecting MASQUE tunnel");
 
+        // Fresh per-connection nonce: the transport sends it to the node, which must bind it
+        // into its attestation report's report_data, and the appraisal checks the binding.
+        let mut nonce = [0u8; 32];
+        getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("nonce entropy: {e}"))?;
+        let grant = Grant { token: Vec::new(), nonce };
+
         let session = transport
-            .connect(cfg.node.clone(), Grant::mock())
+            .connect(cfg.node.clone(), grant)
             .await
             .map_err(|e| anyhow::anyhow!("transport connect: {e}"))?;
         tracing::info!("tunnel session established; bringing up TUN + routes");

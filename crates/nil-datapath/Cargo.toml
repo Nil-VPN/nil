@@ -12,5 +12,6 @@ nil-transport = { workspace = true }   # the Transport trait (no masque feature 
 tun-rs = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+getrandom = { workspace = true }       # per-connection attestation freshness nonce
 anyhow = { workspace = true }
 tracing = { workspace = true }

@@ -8,6 +8,7 @@
 //!
 //! Phase 1 presents a self-signed dev TLS cert (NOT attestation — RA-TLS is Phase 2, §5).
 
+mod attest;
 mod cert;
 mod config;
 mod exit;

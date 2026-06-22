@@ -9,12 +9,16 @@ use std::path::PathBuf;
 pub struct DevCert {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
+    /// The cert's TLS SubjectPublicKeyInfo (DER) — the key the attestation report binds to.
+    pub spki: Vec<u8>,
     dir: PathBuf,
 }
 
 impl DevCert {
     pub fn generate(subject_alt_names: Vec<String>) -> anyhow::Result<DevCert> {
         let ck = rcgen::generate_simple_self_signed(subject_alt_names)?;
+        let spki = nil_attest::ratls::spki_of(ck.cert.der())
+            .map_err(|e| anyhow::anyhow!("extract node SPKI: {e}"))?;
         let cert_pem = ck.cert.pem();
         let key_pem = ck.key_pair.serialize_pem();
 
@@ -27,7 +31,7 @@ impl DevCert {
         tracing::warn!(
             "DEV TLS: self-signed cert generated — NOT attested (Phase 1 dev only; RA-TLS is Phase 2)"
         );
-        Ok(DevCert { cert_path, key_path, dir })
+        Ok(DevCert { cert_path, key_path, spki, dir })
     }
 }
 

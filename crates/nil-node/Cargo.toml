@@ -6,9 +6,15 @@ license.workspace = true
 rust-version.workspace = true
 description = "NIL VPN Data plane node: MASQUE/CONNECT-IP server + exit. Runs in a TEE; keeps NO disk logs."
 
+[features]
+# Synthetic RA-TLS report (test/dev) so the Docker harness can attest without TEE hardware.
+# A real deployment fetches a hardware SEV-SNP/TDX report instead; never ship this.
+synthetic-attest = ["nil-attest/synthetic"]
+
 [dependencies]
 nil-core = { workspace = true }
 nil-transport = { workspace = true }   # for the shared connectip framing (no masque feature)
+nil-attest = { workspace = true }      # shared RA-TLS binding/codec (anti-drift with the client)
 quiche = { workspace = true }
 tun-rs = { workspace = true }
 rcgen = { workspace = true }

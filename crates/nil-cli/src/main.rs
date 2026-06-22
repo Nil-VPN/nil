@@ -9,13 +9,30 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nil_core::{NodeEndpoint, TransportKind};
+use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_datapath::{Tunnel, TunnelConfig};
+use nil_transport::connectip;
 use nil_transport::{MasqueTransport, Transport};
 use tracing_subscriber::EnvFilter;
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Build the pinned attestation expectation from the environment. In production the client
+/// gets this from the Coordinator's `RequestPath`; the Docker harness injects it directly.
+/// `NW_EXPECTED_MEASUREMENT` = hex measurement, `NW_EXPECTED_TEE` = `sev-snp`|`tdx`.
+/// Unset ⇒ `None` ⇒ the connection is unattested (a warning is logged).
+fn expected_from_env() -> Result<Option<AttestExpectation>> {
+    let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") else { return Ok(None) };
+    let bytes = connectip::from_hex(hex.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_EXPECTED_MEASUREMENT is not valid hex"))?;
+    let tee = match env_or("NW_EXPECTED_TEE", "sev-snp").as_str() {
+        "tdx" => Tee::Tdx,
+        "sev-snp" => Tee::SevSnp,
+        other => anyhow::bail!("NW_EXPECTED_TEE must be sev-snp or tdx, got {other}"),
+    };
+    Ok(Some(AttestExpectation { tee, measurement: Measurement(bytes) }))
 }
 
 #[tokio::main]
@@ -35,6 +52,7 @@ async fn main() -> Result<()> {
         .map(|s| s.trim().parse::<IpAddr>().map_err(|e| anyhow::anyhow!("NW_DNS {s}: {e}")))
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
+    let expected = expected_from_env()?;
 
     let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::new());
     let cfg = TunnelConfig {
@@ -42,8 +60,8 @@ async fn main() -> Result<()> {
             host: host.clone(),
             port,
             kind: TransportKind::Masque,
-            wg_pub: None,     // wired from NW_NODE_WG_PUB in the PqWgTransport step
-            expected: None,   // wired from the Coordinator's pinned measurement in the wiring step
+            wg_pub: None, // wired from NW_NODE_WG_PUB in the PqWgTransport step
+            expected,
         },
         tun_name,
         client_ip,

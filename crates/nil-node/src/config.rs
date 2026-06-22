@@ -20,6 +20,8 @@ pub struct NodeConfig {
     pub egress: String,
     /// TUN MTU (kept under the QUIC datagram limit; see nil-transport MTU notes).
     pub mtu: u16,
+    /// What this node attests to (from the environment). `None` ⇒ serve unattested (dev).
+    pub attest: Option<crate::attest::NodeAttest>,
 }
 
 impl NodeConfig {
@@ -39,6 +41,7 @@ impl NodeConfig {
             tunnel_cidr: "10.74.0.0/24".to_string(),
             egress,
             mtu: 1280,
+            attest: crate::attest::NodeAttest::from_env(),
         })
     }
 }

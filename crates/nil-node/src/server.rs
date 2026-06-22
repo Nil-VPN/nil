@@ -87,7 +87,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
         // Drive H3 + decapsulate inbound client packets to the TUN.
         let mut to_tun: Vec<Vec<u8>> = Vec::new();
         for client in clients.values_mut() {
-            drive_h3(client, &h3_config);
+            drive_h3(client, &h3_config, &cert.spki, cfg.attest.as_ref());
             if client.h3.is_some() {
                 loop {
                     match client.conn.dgram_recv(&mut buf) {
@@ -148,7 +148,12 @@ fn handle_packet(
     Ok(())
 }
 
-fn drive_h3(client: &mut Client, h3_config: &quiche::h3::Config) {
+fn drive_h3(
+    client: &mut Client,
+    h3_config: &quiche::h3::Config,
+    node_spki: &[u8],
+    attest: Option<&crate::attest::NodeAttest>,
+) {
     if client.h3.is_none() && client.conn.is_established() {
         match quiche::h3::Connection::with_transport(&mut client.conn, h3_config) {
             Ok(h3) => client.h3 = Some(h3),
@@ -168,10 +173,24 @@ fn drive_h3(client: &mut Client, h3_config: &quiche::h3::Config) {
                 if method.as_deref() == Some(&b"CONNECT"[..])
                     && protocol.as_deref() == Some(&b"connect-ip"[..])
                 {
-                    let resp = [
+                    let mut resp = vec![
                         quiche::h3::Header::new(b":status", b"200"),
                         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
                     ];
+                    // RA-TLS: bind a report to our TLS key + the client's nonce and return it
+                    // so the client can appraise us before sending traffic (spec §5).
+                    if let Some(nonce_hex) = header_value(&list, connectip::ATTEST_NONCE_HEADER.as_bytes()) {
+                        if let Some(nb) = connectip::from_hex(&nonce_hex) {
+                            if let Ok(nonce) = <[u8; 32]>::try_from(nb.as_slice()) {
+                                if let Some(report) = crate::attest::report_hex(node_spki, attest, &nonce) {
+                                    resp.push(quiche::h3::Header::new(
+                                        connectip::ATTEST_REPORT_HEADER.as_bytes(),
+                                        report.as_bytes(),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     if h3.send_response(&mut client.conn, stream_id, &resp, false).is_ok() {
                         client.ci_stream = Some(stream_id);
                         client.flow_id = stream_id / 4;
