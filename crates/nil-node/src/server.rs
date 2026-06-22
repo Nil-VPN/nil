@@ -89,10 +89,10 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             r = tun.recv(&mut tun_buf) => {
                 match r {
                     Ok(n) => {
-                        // Internet reply → finalize checksums (the kernel may hand us a
-                        // partial-checksum forwarded packet) → (PQ-WireGuard encapsulate, if
+                        // Internet reply → finalize checksums, IPv4 or IPv6 (the kernel may hand
+                        // us a partial-checksum forwarded packet) → (PQ-WireGuard encapsulate, if
                         // enabled) → encapsulate to the client as a CONNECT-IP datagram.
-                        nil_core::checksum::fix_ipv4_checksums(&mut tun_buf[..n]);
+                        nil_core::checksum::fix_l4_checksums(&mut tun_buf[..n]);
                         if let Some(client) = clients.values_mut().find(|c| c.tunnel_up) {
                             let payload = match client.pqwg.as_mut().and_then(|p| p.tunn.as_mut()) {
                                 Some(tunn) => tunn.encapsulate(&tun_buf[..n]).ok(),

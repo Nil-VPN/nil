@@ -80,6 +80,8 @@ impl NetControl for LinuxNet {
         if self.kill_switch {
             let _ = sh("iptables", &["-P", "OUTPUT", "ACCEPT"]);
             let _ = sh("iptables", &["-F", "OUTPUT"]);
+            let _ = sh("ip6tables", &["-P", "OUTPUT", "ACCEPT"]);
+            let _ = sh("ip6tables", &["-F", "OUTPUT"]);
         }
         self.armed = false;
         tracing::info!("datapath torn down; networking restored");
@@ -115,7 +117,9 @@ fn pin_node_route(node_ip: IpAddr) -> anyhow::Result<()> {
 }
 
 /// Fail-closed: drop all egress except loopback, the TUN, and QUIC/TCP to the node:443.
-/// Anything that tries to leave directly (bypassing the TUN) is dropped.
+/// Anything that tries to leave directly (bypassing the TUN) is dropped — INCLUDING IPv6.
+/// The tunnel is IPv4-only, so IPv6 is dropped wholesale (except loopback / the TUN); otherwise
+/// v6 traffic would sail around the v4 kill-switch — the classic VPN IPv6 leak.
 fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<()> {
     let node = node_ip.to_string();
     sh("iptables", &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
@@ -123,6 +127,17 @@ fn arm_kill_switch(node_ip: IpAddr, tun: &str) -> anyhow::Result<()> {
     sh("iptables", &["-A", "OUTPUT", "-p", "udp", "-d", &node, "--dport", "443", "-j", "ACCEPT"])?;
     sh("iptables", &["-A", "OUTPUT", "-p", "tcp", "-d", &node, "--dport", "443", "-j", "ACCEPT"])?;
     sh("iptables", &["-P", "OUTPUT", "DROP"])?;
+
+    // Block all IPv6 egress (best-effort: if ip6tables is unavailable we warn loudly rather than
+    // fail the whole tunnel, since the v4 protection is already up and a v6-less host can't leak).
+    let v6 = |args: &[&str]| {
+        if let Err(e) = sh("ip6tables", args) {
+            tracing::warn!("ip6tables {args:?} failed ({e}); IPv6 leak protection may be incomplete");
+        }
+    };
+    v6(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]);
+    v6(&["-A", "OUTPUT", "-o", tun, "-j", "ACCEPT"]);
+    v6(&["-P", "OUTPUT", "DROP"]);
     Ok(())
 }
 
