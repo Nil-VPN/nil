@@ -6,3 +6,4 @@
 //! I/O — which keeps this crate safe for the Tauri client to depend on directly.
 
 pub mod account;
+pub mod path;

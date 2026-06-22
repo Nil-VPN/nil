@@ -10,7 +10,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release -p nil-node --features synthetic-attest && \
-    cargo build --release -p nil-cli && \
+    cargo build --release -p nil-cli --features synthetic-attest && \
     mkdir -p /out && \
     cp target/release/nil-node target/release/nil-cli /out/
 

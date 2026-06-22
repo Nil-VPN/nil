@@ -11,6 +11,9 @@ default = []
 # MASQUE/QUIC transport (quiche + BoringSSL → needs cmake to build). Off by default so
 # crates that only need the trait + loopback (and the pure `connectip` framing) build light.
 masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest"]
+# Test/dev only: accept synthetic attestation reports (for the Docker accept/reject harness).
+# Never enable in a release client — the synthetic trust anchor is unreachable without it.
+synthetic-attest = ["masque", "nil-attest/synthetic"]
 
 [dependencies]
 nil-core = { workspace = true }

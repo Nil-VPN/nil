@@ -2992,6 +2992,10 @@ name = "nil-coordinator"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "nil-proto",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
