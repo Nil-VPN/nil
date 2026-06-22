@@ -12,6 +12,7 @@ mod attest;
 mod cert;
 mod config;
 mod exit;
+mod pqwg;
 mod server;
 
 use anyhow::Result;

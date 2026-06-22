@@ -3263,9 +3263,11 @@ name = "nil-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "boringtun",
  "getrandom 0.2.17",
  "nil-attest",
  "nil-core",
+ "nil-crypto",
  "nil-transport",
  "quiche",
  "rcgen",

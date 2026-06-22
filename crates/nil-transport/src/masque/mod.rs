@@ -38,6 +38,7 @@ use crate::Transport;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_QUEUE: usize = 1024;
 const INBOUND_QUEUE: usize = 1024;
+const CONTROL_QUEUE: usize = 16;
 const MAX_UDP_PAYLOAD: usize = 1350;
 
 /// Client-side MASQUE configuration.
@@ -51,6 +52,11 @@ pub struct MasqueConfig {
 struct MasqueSession {
     to_wire: mpsc::Sender<IpPacket>,
     from_wire: AsyncMutex<mpsc::Receiver<IpPacket>>,
+    /// Reliable control channel (length-prefixed messages over the CONNECT-IP request stream):
+    /// app → driver. Used by the inner PQ-WireGuard handshake to ship its (large) KEM offer.
+    ctrl_to: mpsc::Sender<Vec<u8>>,
+    /// Reliable control channel: driver → app.
+    ctrl_from: AsyncMutex<mpsc::Receiver<Vec<u8>>>,
     shutdown: CancellationToken,
     _driver: tokio::task::JoinHandle<()>,
     /// Max writable QUIC datagram payload negotiated at handshake.
@@ -88,6 +94,20 @@ impl MasqueTransport {
             .map_err(|_| Error::Transport("masque session map poisoned".into()))?;
         map.get(&session.id).cloned().ok_or(Error::SessionNotFound(session.id))
     }
+
+    /// Send a reliable, ordered control message over the CONNECT-IP request stream (not the
+    /// lossy datagram path). Used by [`crate::pqwg`] to ship the PQ-WireGuard KEM offer.
+    pub async fn control_send(&self, session: &Session, msg: Vec<u8>) -> Result<()> {
+        let s = self.state(session)?;
+        s.ctrl_to.send(msg).await.map_err(|_| Error::Closed)
+    }
+
+    /// Receive the next reliable control message from the CONNECT-IP request stream.
+    pub async fn control_recv(&self, session: &Session) -> Result<Vec<u8>> {
+        let s = self.state(session)?;
+        let mut rx = s.ctrl_from.lock().await;
+        rx.recv().await.ok_or(Error::Closed)
+    }
 }
 
 #[async_trait]
@@ -108,6 +128,8 @@ impl Transport for MasqueTransport {
 
         let (to_tx, to_rx) = mpsc::channel(OUTBOUND_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(INBOUND_QUEUE);
+        let (ctrl_to_tx, ctrl_to_rx) = mpsc::channel(CONTROL_QUEUE);
+        let (ctrl_from_tx, ctrl_from_rx) = mpsc::channel(CONTROL_QUEUE);
         let (ready_tx, ready_rx) = oneshot::channel();
         let shutdown = CancellationToken::new();
 
@@ -131,6 +153,8 @@ impl Transport for MasqueTransport {
             policy,
             to_rx,
             from_tx,
+            ctrl_to_rx,
+            ctrl_from_tx,
             ready_tx,
             shutdown.clone(),
         ));
@@ -155,6 +179,8 @@ impl Transport for MasqueTransport {
         let state = Arc::new(MasqueSession {
             to_wire: to_tx,
             from_wire: AsyncMutex::new(from_rx),
+            ctrl_to: ctrl_to_tx,
+            ctrl_from: AsyncMutex::new(ctrl_from_rx),
             shutdown,
             _driver: driver,
             max_dgram_payload: ready.max_dgram_payload,
@@ -224,10 +250,15 @@ async fn driver_run(
     policy: Option<AppraisalPolicy>,
     mut to_rx: mpsc::Receiver<IpPacket>,
     from_tx: mpsc::Sender<IpPacket>,
+    mut ctrl_to_rx: mpsc::Receiver<Vec<u8>>,
+    ctrl_from_tx: mpsc::Sender<Vec<u8>>,
     ready_tx: oneshot::Sender<Result<ReadyInfo>>,
     shutdown: CancellationToken,
 ) {
     let mut ready_tx = Some(ready_tx);
+    // Reliable control-channel buffers carried on the CONNECT-IP request stream.
+    let mut ctrl_out: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
+    let mut ctrl_in: Vec<u8> = Vec::new();
     macro_rules! fail {
         ($e:expr) => {{
             if let Some(tx) = ready_tx.take() {
@@ -314,6 +345,13 @@ async fn driver_run(
                     }
                 }
             }
+            maybe = ctrl_to_rx.recv(), if h3.is_some() => {
+                if let Some(msg) = maybe {
+                    // Frame as [u32 BE len][payload] and queue for the reliable request stream.
+                    ctrl_out.extend((msg.len() as u32).to_be_bytes());
+                    ctrl_out.extend(msg);
+                }
+            }
         }
 
         // Establish H3 + send the CONNECT-IP request once the QUIC handshake completes.
@@ -389,12 +427,41 @@ async fn driver_run(
                             return;
                         }
                     }
+                    Ok((sid, quiche::h3::Event::Data)) => {
+                        // Reliable control bytes on the CONNECT-IP request stream → reassemble
+                        // [u32 len][payload] frames and hand them to the app (the PQ handshake).
+                        if Some(sid) == ci_stream {
+                            while let Ok(n) = h3c.recv_body(&mut conn, sid, &mut buf) {
+                                ctrl_in.extend_from_slice(&buf[..n]);
+                            }
+                            while ctrl_in.len() >= 4 {
+                                let len = u32::from_be_bytes([ctrl_in[0], ctrl_in[1], ctrl_in[2], ctrl_in[3]]) as usize;
+                                if ctrl_in.len() < 4 + len {
+                                    break;
+                                }
+                                let payload = ctrl_in[4..4 + len].to_vec();
+                                ctrl_in.drain(..4 + len);
+                                let _ = ctrl_from_tx.try_send(payload);
+                            }
+                        }
+                    }
                     Ok(_) => {}
                     Err(quiche::h3::Error::Done) => break,
                     Err(e) => {
                         tracing::warn!("masque h3 poll: {e}");
                         break;
                     }
+                }
+            }
+        }
+
+        // Flush any queued control bytes onto the CONNECT-IP request stream (reliable, ordered;
+        // flow-control may accept only part — the rest retries on the next loop).
+        if let (Some(h3c), Some(sid)) = (h3.as_mut(), ci_stream) {
+            if !ctrl_out.is_empty() {
+                let chunk = ctrl_out.make_contiguous();
+                if let Ok(written) = h3c.send_body(&mut conn, sid, chunk, false) {
+                    ctrl_out.drain(..written);
                 }
             }
         }

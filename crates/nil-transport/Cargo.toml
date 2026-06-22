@@ -15,8 +15,8 @@ masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest"]
 # Never enable in a release client — the synthetic trust anchor is unreachable without it.
 synthetic-attest = ["masque", "nil-attest/synthetic"]
 # Inner PQ-WireGuard-over-MASQUE: a boringtun Noise core fed by the nil-crypto hybrid PSK,
-# wrapping any inner Transport. (Spec §4.2; shares the PQ core with the Phase 4 cascade.)
-pqwg = ["dep:boringtun", "dep:nil-crypto", "dep:getrandom"]
+# wrapping the MASQUE transport. (Spec §4.2; shares the PQ core with the Phase 4 cascade.)
+pqwg = ["masque", "dep:boringtun", "dep:nil-crypto", "dep:getrandom"]
 
 [dependencies]
 nil-core = { workspace = true }

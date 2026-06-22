@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_datapath::{Tunnel, TunnelConfig};
 use nil_transport::connectip;
-use nil_transport::{MasqueTransport, Transport};
+use nil_transport::{MasqueTransport, PqWgTransport, Transport};
 use tracing_subscriber::EnvFilter;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -35,6 +35,19 @@ fn expected_from_env() -> Result<Option<AttestExpectation>> {
     Ok(Some(AttestExpectation { tee, measurement: Measurement(bytes) }))
 }
 
+/// The node's WireGuard static public key (hex) from `NW_NODE_WG_PUB`. Present ⇒ run the inner
+/// PQ-WireGuard layer over MASQUE; absent ⇒ plain MASQUE.
+fn wg_pub_from_env() -> Result<Option<[u8; 32]>> {
+    let Ok(h) = std::env::var("NW_NODE_WG_PUB") else { return Ok(None) };
+    let bytes = connectip::from_hex(h.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_NODE_WG_PUB is not valid hex"))?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NW_NODE_WG_PUB must be 32 bytes"))?;
+    Ok(Some(arr))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -53,21 +66,28 @@ async fn main() -> Result<()> {
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
     let expected = expected_from_env()?;
+    let wg_pub = wg_pub_from_env()?;
 
-    let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::new());
+    // With a node WireGuard key, run the inner PQ-WireGuard layer over MASQUE (the TUN MTU
+    // drops by WireGuard's 32-byte overhead); otherwise plain MASQUE.
+    let (transport, mtu): (Arc<dyn Transport>, u16) = if wg_pub.is_some() {
+        (Arc::new(PqWgTransport::new(Arc::new(MasqueTransport::new()))), 1232)
+    } else {
+        (Arc::new(MasqueTransport::new()), 1280)
+    };
     let cfg = TunnelConfig {
         node: NodeEndpoint {
             host: host.clone(),
             port,
             kind: TransportKind::Masque,
-            wg_pub: None, // wired from NW_NODE_WG_PUB in the PqWgTransport step
+            wg_pub,
             expected,
         },
         tun_name,
         client_ip,
         peer_ip,
         prefix: 24,
-        mtu: 1280,
+        mtu,
         dns,
         kill_switch,
     };

@@ -1,0 +1,8 @@
+# Override that turns on the node's PQ-WireGuard responder (deploy/verify-nested.sh).
+# Used as: docker compose -f compose.yaml -f compose.pqwg.yaml ...
+# Kept separate so the plain-MASQUE harnesses (verify.sh, verify-attest.sh) are unaffected —
+# a PQ-WireGuard node and a plain-MASQUE client would not agree on the datagram contents.
+services:
+  node:
+    environment:
+      - NW_NODE_PQWG=1

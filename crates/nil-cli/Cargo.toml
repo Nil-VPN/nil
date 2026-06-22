@@ -13,7 +13,7 @@ synthetic-attest = ["nil-transport/synthetic-attest"]
 
 [dependencies]
 nil-core = { workspace = true }
-nil-transport = { workspace = true, features = ["masque"] }
+nil-transport = { workspace = true, features = ["masque", "pqwg"] }
 nil-datapath = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }

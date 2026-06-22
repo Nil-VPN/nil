@@ -23,4 +23,4 @@ pub use transport::Transport;
 #[cfg(feature = "masque")]
 pub use masque::{MasqueConfig, MasqueTransport};
 #[cfg(feature = "pqwg")]
-pub use pqwg::{PqWgCore, WgKeypair, WgStep};
+pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};

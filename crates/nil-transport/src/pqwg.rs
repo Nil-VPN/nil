@@ -9,10 +9,27 @@
 //! transport, so the crypto lives here once. The PQ PSK exchange itself is in
 //! [`nil_crypto::psk`]; here we just consume the derived [`Psk`].
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
 use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use nil_crypto::psk::Psk;
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
+use nil_crypto::psk::{PqCiphertexts, PqInitiator, Psk};
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+use crate::{MasqueTransport, Transport};
+
+/// PQ handshake timeout (KEM exchange + WireGuard Noise handshake over the inner tunnel).
+const PQWG_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A WireGuard static X25519 keypair.
 pub struct WgKeypair {
@@ -60,7 +77,7 @@ impl PqWgCore {
     }
 
     /// Initiator: produce the first handshake datagram to send to the peer.
-    pub fn handshake_init(&mut self) -> Result<Vec<u8>, WireGuardError> {
+    pub fn handshake_init(&mut self) -> std::result::Result<Vec<u8>, WireGuardError> {
         let mut dst = vec![0u8; 2048];
         match self.tunn.format_handshake_initiation(&mut dst, false) {
             TunnResult::WriteToNetwork(p) => Ok(p.to_vec()),
@@ -81,7 +98,7 @@ impl PqWgCore {
     }
 
     /// Encapsulate an inner IP packet into a WireGuard transport datagram for the peer.
-    pub fn encapsulate(&mut self, ip: &[u8]) -> Result<Vec<u8>, WireGuardError> {
+    pub fn encapsulate(&mut self, ip: &[u8]) -> std::result::Result<Vec<u8>, WireGuardError> {
         let mut dst = vec![0u8; ip.len() + 32];
         match self.tunn.encapsulate(ip, &mut dst) {
             TunnResult::WriteToNetwork(p) => Ok(p.to_vec()),
@@ -99,6 +116,239 @@ impl PqWgCore {
         match self.tunn.update_timers(&mut dst) {
             TunnResult::WriteToNetwork(p) => Some(p.to_vec()),
             _ => None,
+        }
+    }
+}
+
+// ---- The nested transport: PQ-WireGuard carried inside a MASQUE tunnel --------------------
+
+const PUMP_QUEUE: usize = 1024;
+
+/// Length-prefix (`u32` BE) each part and concatenate — the control-message framing for the
+/// PQ handshake over the MASQUE control channel. Public so the node responder uses the exact
+/// same codec (anti-drift).
+pub fn encode_parts(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+pub fn decode_parts(mut b: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut parts = Vec::new();
+    while !b.is_empty() {
+        if b.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        b = &b[4..];
+        if b.len() < len {
+            return None;
+        }
+        parts.push(b[..len].to_vec());
+        b = &b[len..];
+    }
+    Some(parts)
+}
+
+struct PqWgSession {
+    inner_session: Session,
+    to_wire: mpsc::Sender<IpPacket>,
+    from_wire: AsyncMutex<mpsc::Receiver<IpPacket>>,
+    shutdown: CancellationToken,
+    _driver: JoinHandle<()>,
+}
+
+/// Inner PQ-WireGuard over an outer MASQUE tunnel (architecture spec §4.2). Implements the
+/// `Transport` seam, so the datapath/cascade use it exactly like plain MASQUE — it just adds a
+/// post-quantum WireGuard crypto core *inside* the QUIC datagrams (the wire stays HTTPS/QUIC).
+///
+/// `connect`: bring up the inner MASQUE tunnel (attested) → exchange the PQ hybrid PSK over the
+/// reliable control channel → run the WireGuard Noise handshake over the datagram channel →
+/// pump IP packets through `Tunn` encapsulate/decapsulate.
+pub struct PqWgTransport {
+    inner: Arc<MasqueTransport>,
+    sessions: Mutex<HashMap<SessionId, Arc<PqWgSession>>>,
+    next_id: AtomicU64,
+}
+
+impl PqWgTransport {
+    pub fn new(inner: Arc<MasqueTransport>) -> Self {
+        Self { inner, sessions: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+    }
+
+    fn state(&self, session: &Session) -> Result<Arc<PqWgSession>> {
+        self.sessions
+            .lock()
+            .map_err(|_| Error::Transport("pqwg session map poisoned".into()))?
+            .get(&session.id)
+            .cloned()
+            .ok_or(Error::SessionNotFound(session.id))
+    }
+
+    /// Usable inner-TUN MTU: the MASQUE tunnel MTU minus WireGuard's 32-byte transport overhead.
+    pub fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
+        let s = self.state(session).ok()?;
+        self.inner.tunnel_mtu(&s.inner_session).map(|m| m.saturating_sub(32))
+    }
+}
+
+#[async_trait]
+impl Transport for PqWgTransport {
+    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
+        let node_wg_pub = target
+            .wg_pub
+            .ok_or_else(|| Error::Transport("PqWg: endpoint carries no node WireGuard key".into()))?;
+
+        // 1. Outer MASQUE tunnel (attestation appraised inside).
+        let inner_session = self.inner.connect(target, creds).await?;
+
+        // 2. PQ hybrid PSK exchange over the reliable control channel. The client (KEM
+        //    initiator) ships its WG static public key + both KEM public keys; the node returns
+        //    the two KEM ciphertexts; both derive the same PSK (which never crosses the wire).
+        let (initiator, offer) = PqInitiator::generate();
+        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let offer_msg =
+            encode_parts(&[client_kp.public.as_bytes(), &offer.mlkem_ek, &offer.mceliece_pk]);
+        self.inner.control_send(&inner_session, offer_msg).await?;
+
+        let cts_msg = tokio::time::timeout(PQWG_HANDSHAKE_TIMEOUT, self.inner.control_recv(&inner_session))
+            .await
+            .map_err(|_| Error::Transport("PQ handshake timed out".into()))??;
+        let parts = decode_parts(&cts_msg).ok_or_else(|| Error::Transport("malformed PQ ciphertexts".into()))?;
+        if parts.len() != 2 {
+            return Err(Error::Transport("PQ ciphertexts: expected 2 parts".into()));
+        }
+        let cts = PqCiphertexts { mlkem_ct: parts[0].clone(), mceliece_ct: parts[1].clone() };
+        let psk = initiator.finish(&cts).map_err(|e| Error::Transport(format!("PQ decapsulate: {e}")))?;
+
+        // 3. WireGuard Noise handshake (IKpsk2, the PSK mixed in) over the datagram channel.
+        let mut core = PqWgCore::new(client_kp.secret, PublicKey::from(node_wg_pub), &psk, 1);
+        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        self.inner.send(&inner_session, IpPacket::new(init)).await?;
+        let resp = tokio::time::timeout(PQWG_HANDSHAKE_TIMEOUT, self.inner.recv(&inner_session))
+            .await
+            .map_err(|_| Error::Transport("wg handshake timed out".into()))??;
+        match core.decapsulate(resp.as_bytes()) {
+            WgStep::Network(keepalive) => {
+                self.inner.send(&inner_session, IpPacket::new(keepalive)).await?;
+            }
+            other => return Err(Error::Transport(format!("wg handshake failed: {other:?}"))),
+        }
+        tracing::info!("PQ-WireGuard tunnel established inside MASQUE");
+
+        // 4. Spawn the data pump (owns the Tunn).
+        let (to_tx, to_rx) = mpsc::channel(PUMP_QUEUE);
+        let (from_tx, from_rx) = mpsc::channel(PUMP_QUEUE);
+        let shutdown = CancellationToken::new();
+        let driver = tokio::spawn(pump(core, self.inner.clone(), inner_session, to_rx, from_tx, shutdown.clone()));
+
+        let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let sess = Arc::new(PqWgSession {
+            inner_session,
+            to_wire: to_tx,
+            from_wire: AsyncMutex::new(from_rx),
+            shutdown,
+            _driver: driver,
+        });
+        self.sessions
+            .lock()
+            .map_err(|_| Error::Transport("pqwg session map poisoned".into()))?
+            .insert(id, sess);
+        // On the wire this is MASQUE/QUIC — the WireGuard layer is hidden inside the datagrams.
+        Ok(Session { id, kind: TransportKind::Masque })
+    }
+
+    async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
+        let s = self.state(session)?;
+        s.to_wire.send(packet).await.map_err(|_| Error::Closed)
+    }
+
+    async fn recv(&self, session: &Session) -> Result<IpPacket> {
+        let s = self.state(session)?;
+        let mut rx = s.from_wire.lock().await;
+        rx.recv().await.ok_or(Error::Closed)
+    }
+
+    async fn close(&self, session: Session) -> Result<()> {
+        let s = {
+            let mut map = self
+                .sessions
+                .lock()
+                .map_err(|_| Error::Transport("pqwg session map poisoned".into()))?;
+            map.remove(&session.id)
+        }
+        .ok_or(Error::SessionNotFound(session.id))?;
+        s.shutdown.cancel();
+        self.inner.close(s.inner_session).await
+    }
+
+    fn kind(&self) -> TransportKind {
+        TransportKind::Masque // MASQUE on the wire; PQ-WireGuard is the hidden inner layer
+    }
+
+    fn fingerprint_profile(&self) -> Profile {
+        Profile::HttpsQuic
+    }
+}
+
+/// The data pump: app IP packets → WG encapsulate → inner MASQUE; inner MASQUE → WG
+/// decapsulate → app. A 250 ms timer drives WireGuard keepalive/rekey.
+async fn pump(
+    mut core: PqWgCore,
+    inner: Arc<MasqueTransport>,
+    inner_session: Session,
+    mut to_rx: mpsc::Receiver<IpPacket>,
+    from_tx: mpsc::Sender<IpPacket>,
+    shutdown: CancellationToken,
+) {
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            pkt = to_rx.recv() => match pkt {
+                Some(ip) => {
+                    if let Ok(wire) = core.encapsulate(ip.as_bytes()) {
+                        if inner.send(&inner_session, IpPacket::new(wire)).await.is_err() { break; }
+                    }
+                }
+                None => break,
+            },
+            wire = inner.recv(&inner_session) => match wire {
+                Ok(dg) => drain_decapsulate(&mut core, &inner, &inner_session, dg.as_bytes(), &from_tx).await,
+                Err(_) => break, // inner tunnel closed → kill-switch holds
+            },
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if let Some(b) = core.tick() {
+                    let _ = inner.send(&inner_session, IpPacket::new(b)).await;
+                }
+            }
+        }
+    }
+}
+
+/// Feed one inbound WireGuard datagram to the core, draining follow-up control writes (the
+/// `decapsulate`-then-poll-with-empty pattern boringtun requires).
+async fn drain_decapsulate(
+    core: &mut PqWgCore,
+    inner: &Arc<MasqueTransport>,
+    inner_session: &Session,
+    datagram: &[u8],
+    from_tx: &mpsc::Sender<IpPacket>,
+) {
+    let mut input = datagram.to_vec();
+    loop {
+        match core.decapsulate(&input) {
+            WgStep::Ip(ip) => {
+                let _ = from_tx.try_send(IpPacket::new(ip));
+                break;
+            }
+            WgStep::Network(b) => {
+                let _ = inner.send(inner_session, IpPacket::new(b)).await;
+                input = Vec::new(); // re-poll with empty to drain any further queued writes
+            }
+            WgStep::Done | WgStep::Err(_) => break,
         }
     }
 }
