@@ -15,6 +15,8 @@
 //! BIP39 length — so we use the wordlist only, never claim BIP39 compatibility.
 
 pub mod account;
+pub mod psk;
 mod error;
 
 pub use error::CryptoError;
+pub use psk::{PqCiphertexts, PqInitiator, PqOffer, Psk, PskError, responder_encapsulate};

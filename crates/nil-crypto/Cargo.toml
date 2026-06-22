@@ -14,6 +14,9 @@ zeroize = { workspace = true }
 subtle = { workspace = true }
 data-encoding = { workspace = true }
 thiserror = { workspace = true }
+# PQ hybrid PSK (Phase 2): ML-KEM-1024 (FS) + Classic McEliece 460896 (auth) → 32-byte WG PSK.
+ml-kem = { workspace = true, features = ["getrandom"] }   # getrandom: system-RNG keygen/encaps
+classic-mceliece-rust = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = "0.3"

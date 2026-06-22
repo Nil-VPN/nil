@@ -62,9 +62,11 @@ sev         = { version = "7", default-features = false, features = ["snp", "cry
 dcap-qvl    = { version = "0.5", default-features = false, features = ["std", "rustcrypto", "default-x509"] }  # Intel TDX DCAP quote verify (pure-Rust, no ring, offline)
 x509-parser = "0.16"                   # parse the RA-TLS leaf cert + custom report extension
 
+# --- Phase 2: PQ hybrid PSK (nil-crypto) — pure-Rust KEMs ---
+ml-kem = "0.3"                         # ML-KEM-1024 (FIPS 203), forward secrecy half
+classic-mceliece-rust = { version = "3", features = ["mceliece460896", "alloc"] }  # Classic McEliece 460896, authentication half
+
 # --- Declared for forward intent; activated in their phase step.
-# ml-kem = "0.3"                       # Phase 2   (PQ hybrid PSK: ML-KEM-1024, FIPS 203)
-# classic-mceliece-rust = "3"          # Phase 2   (PQ hybrid PSK: Classic McEliece 460896)
 # boringtun = "0.7"                    # Phase 2   (inner WireGuard Noise core over MASQUE)
 # quinn = "0.11"                       # prototyping alt QUIC
 
