@@ -157,9 +157,12 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
         };
 
     // When the cascade is on, the AmneziaWG fallback node's traffic must also bypass the tunnel
-    // (else the fallback rung's own UDP to its node would loop through the TUN).
+    // (else the fallback rung's own UDP to its node would loop through the TUN, and — since the
+    // kill-switch only opens the PRIMARY node on :443 — its custom UDP port would be dropped).
+    // Default the fallback host to the primary host (the rung reuses it when NW_NODE_AMNEZIA_HOST
+    // is unset), so the except/allow covers all ports of that node regardless of port config.
     let also_except: Vec<String> = if std::env::var("NW_CASCADE").is_ok() {
-        std::env::var("NW_NODE_AMNEZIA_HOST").ok().into_iter().collect()
+        vec![std::env::var("NW_NODE_AMNEZIA_HOST").unwrap_or_else(|_| host.clone())]
     } else {
         Vec::new()
     };

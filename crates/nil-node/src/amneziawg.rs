@@ -24,6 +24,14 @@ use nil_transport::{connectip, ObfsParams, PqWgCore, WgKeypair, WgStep};
 
 use crate::config::NodeConfig;
 
+/// The single client served (Phase 1): its current source address, the WireGuard responder core,
+/// and whether its handshake has produced real traffic yet.
+struct ClientState {
+    addr: SocketAddr,
+    core: PqWgCore,
+    established: bool,
+}
+
 pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> {
     let socket = UdpSocket::bind(cfg.bind).await?;
     let kp = WgKeypair::generate().map_err(|e| anyhow::anyhow!("node wg keygen: {e}"))?;
@@ -34,9 +42,7 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
     let node_secret: StaticSecret = kp.secret;
     let obfs = ObfsParams::default();
 
-    // Single client (Phase 1): its source address + the WireGuard responder core, built once the
-    // client's preface (its static pubkey) arrives.
-    let mut client: Option<(SocketAddr, PqWgCore)> = None;
+    let mut client: Option<ClientState> = None;
     let mut buf = vec![0u8; 65535];
     let mut tun_buf = vec![0u8; 65535];
 
@@ -50,21 +56,39 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
             r = socket.recv_from(&mut buf) => {
                 let Ok((n, from)) = r else { continue };
                 let wire = &buf[..n];
-                // Preface: the client's WG static pubkey → (re)build the responder for this peer.
+                // Preface: the client's WG static pubkey → (re)build the responder. The preface is
+                // unauthenticated (a public magic header), so DON'T let one from a NEW address tear
+                // down an ESTABLISHED session — that would be a trivial off-path DoS. Accept only a
+                // first client, a same-address reconnect/roam, or a replacement of a session that
+                // never established. (A full multi-client responder, keyed by WG index, is future.)
                 if let Some(client_pub) = obfs.try_preface(wire) {
-                    let core = PqWgCore::without_psk(node_secret.clone(), PublicKey::from(client_pub), 2);
-                    client = Some((from, core));
+                    let accept = match &client {
+                        None => true,
+                        Some(c) => c.addr == from || !c.established,
+                    };
+                    if accept {
+                        let core = PqWgCore::without_psk(node_secret.clone(), PublicKey::from(client_pub), 2);
+                        client = Some(ClientState { addr: from, core, established: false });
+                    } else {
+                        tracing::warn!("ignoring AmneziaWG preface from a new peer while a session is active");
+                    }
                     continue;
                 }
                 // Otherwise a WireGuard message: decapsulate against the current client's core.
                 if let Some(wg) = obfs.deobfuscate(wire) {
-                    if let Some((src, core)) = client.as_mut() {
-                        *src = from; // track the client's current source address
+                    if let Some(c) = client.as_mut() {
                         let mut input = wg;
                         loop {
-                            match core.decapsulate(&input) {
-                                WgStep::Ip(ip) => { let _ = tun.send(&ip).await; break; }
+                            match c.core.decapsulate(&input) {
+                                WgStep::Ip(ip) => {
+                                    // Valid traffic → this is the live peer; track its address.
+                                    c.addr = from;
+                                    c.established = true;
+                                    let _ = tun.send(&ip).await;
+                                    break;
+                                }
                                 WgStep::Network(b) => {
+                                    c.addr = from;
                                     let _ = socket.send_to(&obfs.obfuscate(&b), from).await;
                                     input = Vec::new();
                                 }
@@ -78,16 +102,16 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
                 let Ok(n) = r else { continue };
                 // Internet reply → finalize checksums → encapsulate to the client → obfuscate.
                 nil_core::checksum::fix_l4_checksums(&mut tun_buf[..n]);
-                if let Some((src, core)) = client.as_mut() {
-                    if let Ok(wire) = core.encapsulate(&tun_buf[..n]) {
-                        let _ = socket.send_to(&obfs.obfuscate(&wire), *src).await;
+                if let Some(c) = client.as_mut() {
+                    if let Ok(wire) = c.core.encapsulate(&tun_buf[..n]) {
+                        let _ = socket.send_to(&obfs.obfuscate(&wire), c.addr).await;
                     }
                 }
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {
-                if let Some((src, core)) = client.as_mut() {
-                    if let Some(b) = core.tick() {
-                        let _ = socket.send_to(&obfs.obfuscate(&b), *src).await;
+                if let Some(c) = client.as_mut() {
+                    if let Some(b) = c.core.tick() {
+                        let _ = socket.send_to(&obfs.obfuscate(&b), c.addr).await;
                     }
                 }
             }
