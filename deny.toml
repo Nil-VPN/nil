@@ -1,0 +1,47 @@
+# Supply-chain gate: `cargo deny check` must pass.
+# Config uses cargo-deny v2 schema.
+
+[advisories]
+version = 2
+# Fail on any security advisory in the dependency graph. Add IDs here only with a
+# documented justification.
+ignore = []
+# Gate "unmaintained" status on our OWN (workspace + direct) dependencies. Deep
+# transitive platform bindings pulled by Tauri's Linux webview (the gtk-rs GTK3 crates,
+# RUSTSEC-2024-0411..0420) are unmaintained upstream and tracked by Tauri's own GTK4
+# migration — they are not first-party and are not even compiled on macOS/Windows.
+unmaintained = "workspace"
+
+[licenses]
+version = 2
+# Permitted licenses. Our own crates are AGPL-3.0-or-later; everything pulled from
+# crates.io in Phase 0 is permissive (MIT / Apache-2.0 / BSD / ISC / CC0 / Unicode).
+allow = [
+    "AGPL-3.0-or-later",
+    "AGPL-3.0",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    # Mozilla root-cert data bundle (webpki-roots), pulled by reqwest's rustls TLS.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn (don't fail) on duplicate versions during early development; tighten later.
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

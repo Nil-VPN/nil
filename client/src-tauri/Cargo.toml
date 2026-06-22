@@ -1,0 +1,39 @@
+[package]
+name = "nil-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN client (Tauri v2) — User plane: drives account, control, and the transport engine."
+
+[lib]
+# The `_lib` suffix keeps the lib name distinct from the bin on Windows
+# (see https://github.com/rust-lang/cargo/issues/8519).
+name = "nil_client_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri stack (kept at the template's versions; not centralized in the workspace).
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# Shared NIL crates — the client reuses the exact same code as the services, so the
+# client and node can never drift on the wire format (architecture spec §3).
+nil-core = { workspace = true }
+nil-proto = { workspace = true }
+nil-transport = { workspace = true }
+nil-crypto = { workspace = true }   # Phase 2: recovery-phrase validation, RA-TLS, PQ
+nil-attest = { workspace = true }   # Phase 2: client-side attestation verification
+
+# Async + errors (aligned with the workspace).
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# HTTP to the Portal. rustls (not OpenSSL) to match the project's TLS standard.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

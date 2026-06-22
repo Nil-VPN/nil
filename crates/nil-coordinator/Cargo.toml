@@ -1,0 +1,13 @@
+[package]
+name = "nil-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN Control plane: node registry, trust-split path selection, token verifier."
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

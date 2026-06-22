@@ -1,0 +1,71 @@
+# NIL VPN — Cargo workspace (Phase 0 skeleton).
+# A single workspace produces the three services (Portal/Coordinator/Node) and the
+# Tauri client's Rust core, all sharing nil-core/nil-proto/nil-transport/nil-crypto/
+# nil-attest so the client and the node negotiate the exact same wire format from the
+# exact same code (architecture spec §3).
+[workspace]
+resolver = "2"
+members = [
+    "crates/nil-core",
+    "crates/nil-proto",
+    "crates/nil-crypto",
+    "crates/nil-transport",
+    "crates/nil-attest",
+    "crates/nil-portal",
+    "crates/nil-coordinator",
+    "crates/nil-node",
+    "client/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+authors = ["Nil VPN"]
+homepage = "https://nilvpn.com"
+rust-version = "1.77"
+
+# Versions pinned once, here, so every crate stays in lockstep.
+[workspace.dependencies]
+# --- Active in Phase 0 ---
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower-http = { version = "0.5", features = ["trace"] }
+
+# Crypto (nil-crypto, Phase 0 account derivation)
+bip39 = "2"
+sha2 = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+data-encoding = "2"            # Crockford base32 for account numbers / recovery codes
+
+# --- Declared for forward intent; NO Phase-0 crate references these yet, so cargo
+#     never fetches or builds them (quiche pulls cmake/BoringSSL — kept out of Phase 0).
+#     Uncomment + add `.workspace = true` in the consuming crate when each phase lands.
+# rustls = "0.23"                      # Phase 1+ (RA-TLS integration)
+# quiche = "0.22"                      # Phase 1   (default MASQUE/QUIC transport)
+# quinn = "0.11"                       # prototyping alt QUIC
+# boringtun = "0.6"                    # Phase 1/4 (WireGuard Noise core)
+# ml-kem = "0.2"                       # Phase 2   (PQ hybrid PSK: ML-KEM-1024)
+# classic-mceliece-rust = "3"          # Phase 2   (PQ hybrid PSK: Classic McEliece)
+# tun = "0.6"                          # Phase 1   (desktop TUN device)
+
+# Internal crates (path deps — versioned together; explicit version silences
+# cargo-deny's wildcard-path warning).
+nil-core = { path = "crates/nil-core", version = "0.1.0" }
+nil-proto = { path = "crates/nil-proto", version = "0.1.0" }
+nil-crypto = { path = "crates/nil-crypto", version = "0.1.0" }
+nil-transport = { path = "crates/nil-transport", version = "0.1.0" }
+nil-attest = { path = "crates/nil-attest", version = "0.1.0" }
+
+[profile.release]
+strip = true

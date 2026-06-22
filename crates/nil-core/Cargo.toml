@@ -1,0 +1,11 @@
+[package]
+name = "nil-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN shared domain types and errors (no I/O)."
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }

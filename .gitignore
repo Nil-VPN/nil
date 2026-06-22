@@ -1,0 +1,20 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Tauri client (Node + bundles)
+client/node_modules
+client/dist
+client/src-tauri/target
+client/src-tauri/gen
+
+# Secrets / local env — NEVER commit
+.env
+*.env
+
+# Editor
+client/.vscode/
+
+# macOS
+.DS_Store

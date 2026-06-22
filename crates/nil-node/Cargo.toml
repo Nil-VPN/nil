@@ -1,0 +1,13 @@
+[package]
+name = "nil-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN Data plane node: MASQUE datapath, RA-TLS, entry/middle/exit roles. Runs in a TEE; keeps NO disk logs."
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

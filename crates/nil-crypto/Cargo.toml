@@ -1,0 +1,20 @@
+[package]
+name = "nil-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN crypto core: anonymous account derivation (PQ PSK + RA-TLS in later phases)."
+
+[dependencies]
+sha2 = { workspace = true }
+hkdf = { workspace = true }
+rand_core = { workspace = true }
+zeroize = { workspace = true }
+subtle = { workspace = true }
+data-encoding = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rand_chacha = "0.3"
+hex = "0.4"

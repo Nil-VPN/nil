@@ -1,0 +1,6 @@
+# Pin the toolchain so every contributor (and CI / reproducible node builds) uses the
+# same compiler. Phase 2 reproducible-build measurements depend on this being fixed.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "default"
