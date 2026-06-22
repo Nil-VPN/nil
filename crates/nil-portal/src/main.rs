@@ -29,25 +29,45 @@ use crate::state::AppState;
 use crate::store::{file::FileStore, memory::InMemoryStore, Store};
 use crate::tokens::{token_router, TokenState};
 
+/// The non-Postgres account-store selection: durable JSON file (`NW_PORTAL_STORE`) or volatile
+/// in-memory (dev only). Shared by both `postgres`-feature configurations.
+fn file_or_memory_store() -> Result<Arc<dyn Store>> {
+    match std::env::var("NW_PORTAL_STORE") {
+        Ok(path) => {
+            let s = FileStore::open(&path).map_err(|e| anyhow::anyhow!("open account store {path}: {e}"))?;
+            tracing::info!(%path, "durable account store loaded");
+            Ok(Arc::new(s))
+        }
+        Err(_) => {
+            tracing::warn!("NW_PORTAL_STORE unset — accounts are VOLATILE (dev only; lost on restart)");
+            Ok(Arc::new(InMemoryStore::new()))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    // Account store: durable (JSON file) when NW_PORTAL_STORE is set; otherwise volatile
-    // in-memory + a warning (dev only). Both keep only PII-free records (ADR-0003).
-    let store: Arc<dyn Store> = match std::env::var("NW_PORTAL_STORE") {
-        Ok(path) => {
-            let s = FileStore::open(&path).map_err(|e| anyhow::anyhow!("open account store {path}: {e}"))?;
-            tracing::info!(%path, "durable account store loaded");
+    // Account store selection (ADR-0003), all PII-free:
+    //  - clustered Postgres when NW_PORTAL_PG_URL is set and the `postgres` feature is built;
+    //  - else durable JSON file when NW_PORTAL_STORE is set;
+    //  - else volatile in-memory + a warning (dev only).
+    #[cfg(feature = "postgres")]
+    let store: Arc<dyn Store> = match std::env::var("NW_PORTAL_PG_URL") {
+        Ok(url) => {
+            let s = store::postgres::PgStore::connect(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres account store: {e}"))?;
+            tracing::info!("durable Postgres account store connected (clustered)");
             Arc::new(s)
         }
-        Err(_) => {
-            tracing::warn!("NW_PORTAL_STORE unset — accounts are VOLATILE (dev only; lost on restart)");
-            Arc::new(InMemoryStore::new())
-        }
+        Err(_) => file_or_memory_store()?,
     };
+    #[cfg(not(feature = "postgres"))]
+    let store: Arc<dyn Store> = file_or_memory_store()?;
 
     // Privacy Pass issuer: reload from NW_TOKEN_SECRET (hex DER) or mint a fresh key. The
     // PUBLIC key is logged so the operator can pin it in the Coordinator (NW_TOKEN_PUBKEY).

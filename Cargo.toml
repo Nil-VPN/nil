@@ -79,6 +79,11 @@ tokio-rustls = "0.26"                  # TLS for the WS envelope (rustls, the pr
 rustls = "0.23"                        # custom no-verify config (security is the inner WireGuard)
 futures-util = "0.3"                   # split the WebSocket stream for the bidirectional pump
 
+# --- Clustered durable stores (optional `postgres` feature on nil-portal/nil-coordinator) ---
+# Off by default: the default build ships the file-backed durable stores and pulls no DB driver.
+# Production wires a rustls TLS connector (the connection is the deployment's responsibility).
+tokio-postgres = "0.7"                 # async Postgres client for the clustered account/nullifier stores
+
 # Internal crates (path deps — versioned together; explicit version silences
 # cargo-deny's wildcard-path warning).
 nil-core = { path = "crates/nil-core", version = "0.1.0" }

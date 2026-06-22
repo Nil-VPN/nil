@@ -11,6 +11,7 @@
 
 mod api;
 mod config;
+mod nullifier;
 mod pathsel;
 
 use std::sync::Arc;
@@ -18,6 +19,26 @@ use std::sync::Arc;
 use anyhow::Result;
 use nil_core::durable::DurableSet;
 use tracing_subscriber::EnvFilter;
+
+/// The non-Postgres nullifier-set selection: file-backed [`DurableSet`] (`NW_NULLIFIER_PATH`) or
+/// volatile in-memory (dev only). Shared by both `postgres`-feature configurations.
+fn file_or_volatile_nullifiers(cfg: &Arc<config::CoordConfig>) -> Result<api::CoordState> {
+    match &cfg.nullifier_path {
+        Some(path) => {
+            let set = DurableSet::open(path)
+                .map_err(|e| anyhow::anyhow!("open nullifier store {}: {e}", path.display()))?;
+            tracing::info!(path = %path.display(), spent = set.len(), "durable nullifier set loaded");
+            Ok(api::CoordState::with_nullifiers(cfg.clone(), Arc::new(set)))
+        }
+        None => {
+            tracing::warn!(
+                "NW_NULLIFIER_PATH unset — the spent-token nullifier set is VOLATILE (dev only); \
+                 a restart will re-permit double-spend of every redeemed token"
+            );
+            Ok(api::CoordState::new(cfg.clone()))
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,23 +58,24 @@ async fn main() -> Result<()> {
     );
 
     // The spent-token nullifier set MUST be durable: a restart with a volatile set would
-    // re-permit a double-spend of every already-redeemed token. File-backed when
-    // NW_NULLIFIER_PATH is set; otherwise volatile + a loud warning (dev only).
-    let state = match &cfg.nullifier_path {
-        Some(path) => {
-            let set = DurableSet::open(path)
-                .map_err(|e| anyhow::anyhow!("open nullifier store {}: {e}", path.display()))?;
-            tracing::info!(path = %path.display(), spent = set.len(), "durable nullifier set loaded");
-            api::CoordState::with_nullifiers(cfg.clone(), Arc::new(set))
+    // re-permit a double-spend of every already-redeemed token. Backends (all identity-free):
+    //  - clustered Postgres (cross-instance single-use) when NW_NULLIFIER_PG_URL is set and the
+    //    `postgres` feature is built;
+    //  - else file-backed when NW_NULLIFIER_PATH is set;
+    //  - else volatile in-memory + a loud warning (dev only).
+    #[cfg(feature = "postgres")]
+    let state = match std::env::var("NW_NULLIFIER_PG_URL") {
+        Ok(url) => {
+            let pg = nullifier::PgNullifierStore::connect(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres nullifier store: {e}"))?;
+            tracing::info!("clustered Postgres nullifier set connected (cross-instance single-use)");
+            api::CoordState::with_nullifiers(cfg.clone(), Arc::new(pg))
         }
-        None => {
-            tracing::warn!(
-                "NW_NULLIFIER_PATH unset — the spent-token nullifier set is VOLATILE (dev only); \
-                 a restart will re-permit double-spend of every redeemed token"
-            );
-            api::CoordState::new(cfg.clone())
-        }
+        Err(_) => file_or_volatile_nullifiers(&cfg)?,
     };
+    #[cfg(not(feature = "postgres"))]
+    let state = file_or_volatile_nullifiers(&cfg)?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, api::router(state)).await?;

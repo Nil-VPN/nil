@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{Store, StoreError};
-use crate::account::model::{AccountRecord, Entitlement};
+use super::{ent_from, ent_str, hex32, unhex32, Store, StoreError};
+use crate::account::model::AccountRecord;
 
 /// On-disk representation of one account (hex-encoded; PII-free by construction).
 #[derive(Serialize, Deserialize)]
@@ -24,47 +24,6 @@ struct RecordDto {
     account_number: String,
     recovery_code_hash: String,
     entitlement: String,
-}
-
-fn hex32(b: &[u8; 32]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn unhex32(s: &str) -> Option<[u8; 32]> {
-    let h = s.as_bytes();
-    if h.len() != 64 {
-        return None;
-    }
-    fn nib(c: u8) -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    }
-    let mut out = [0u8; 32];
-    for (i, p) in h.chunks_exact(2).enumerate() {
-        out[i] = (nib(p[0])? << 4) | nib(p[1])?;
-    }
-    Some(out)
-}
-
-fn ent_str(e: Entitlement) -> &'static str {
-    match e {
-        Entitlement::None => "none",
-        Entitlement::Active => "active",
-        Entitlement::Expired => "expired",
-    }
-}
-
-fn ent_from(s: &str) -> Option<Entitlement> {
-    match s {
-        "none" => Some(Entitlement::None),
-        "active" => Some(Entitlement::Active),
-        "expired" => Some(Entitlement::Expired),
-        _ => None,
-    }
 }
 
 impl RecordDto {
@@ -168,6 +127,7 @@ impl Store for FileStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::model::Entitlement;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static N: AtomicU64 = AtomicU64::new(0);
