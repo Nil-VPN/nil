@@ -11,6 +11,7 @@
 //! MASQUE/`quiche` implementation lands in Phase 1.
 
 mod transport;
+pub mod connectip;
 pub mod loopback;
 
 pub use transport::Transport;

@@ -6,7 +6,18 @@ license.workspace = true
 rust-version.workspace = true
 description = "NIL VPN transport trait — the single seam between the engine and any tunnel."
 
+[features]
+default = []
+# MASQUE/QUIC transport (quiche + BoringSSL → needs cmake to build). Off by default so
+# crates that only need the trait + loopback (and the pure `connectip` framing) build light.
+masque = ["dep:quiche", "dep:tokio-util"]
+# Dev-only TLS bypass for Phase 1 (no attestation yet). Never enable in release.
+dev-insecure = []
+
 [dependencies]
 nil-core = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
+quiche = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }

@@ -48,16 +48,18 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 data-encoding = "2"            # Crockford base32 for account numbers / recovery codes
 
-# --- Declared for forward intent; NO Phase-0 crate references these yet, so cargo
-#     never fetches or builds them (quiche pulls cmake/BoringSSL — kept out of Phase 0).
-#     Uncomment + add `.workspace = true` in the consuming crate when each phase lands.
-# rustls = "0.23"                      # Phase 1+ (RA-TLS integration)
-# quiche = "0.22"                      # Phase 1   (default MASQUE/QUIC transport)
+# --- Phase 1: MASQUE/QUIC datapath (quiche vendors BoringSSL → needs cmake/clang) ---
+quiche     = "0.22"                    # default MASQUE/QUIC transport (Cloudflare)
+tun-rs     = { version = "2", features = ["async_tokio"] }  # TUN device (Linux/macOS)
+rcgen      = "0.13"                    # self-signed dev TLS cert for nil-node (Phase 1)
+tokio-util = { version = "0.7", features = ["rt"] }          # CancellationToken for pumps
+
+# --- Declared for forward intent; not referenced yet. Uncomment when each phase lands.
+# rustls = "0.23"                      # Phase 2+ (RA-TLS integration)
 # quinn = "0.11"                       # prototyping alt QUIC
-# boringtun = "0.6"                    # Phase 1/4 (WireGuard Noise core)
+# boringtun = "0.6"                    # Phase 4   (WireGuard Noise core)
 # ml-kem = "0.2"                       # Phase 2   (PQ hybrid PSK: ML-KEM-1024)
 # classic-mceliece-rust = "3"          # Phase 2   (PQ hybrid PSK: Classic McEliece)
-# tun = "0.6"                          # Phase 1   (desktop TUN device)
 
 # Internal crates (path deps — versioned together; explicit version silences
 # cargo-deny's wildcard-path warning).
