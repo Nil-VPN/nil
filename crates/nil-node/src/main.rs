@@ -27,8 +27,8 @@ async fn main() -> Result<()> {
     let cfg = config::NodeConfig::from_env()?;
     tracing::info!(
         bind = %cfg.bind, egress = %cfg.egress, tun = %cfg.tun_name,
-        node_ip = %cfg.node_tun_ip, client_ip = %cfg.client_ip,
-        "nil-node starting (Phase 1 MASQUE exit; no disk logs)"
+        node_ip = %cfg.node_tun_ip, client_ip = %cfg.client_ip, role = ?cfg.role,
+        "nil-node starting (MASQUE/CONNECT-IP; no disk logs)"
     );
 
     let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;

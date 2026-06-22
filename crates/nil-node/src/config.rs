@@ -2,6 +2,27 @@
 
 use std::net::{Ipv4Addr, SocketAddr};
 
+/// A node's position in a trust-split path (architecture spec §6). Entry sees the client IP
+/// but not the destination; exit sees the destination but not the client IP; middle sees
+/// neither. Phase 2/3 implements the exit datapath (NAT to the internet); entry/middle
+/// forwarding to the next hop is the nested-tunnel integration tracked with the inner-WG work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRole {
+    Entry,
+    Middle,
+    Exit,
+}
+
+impl NodeRole {
+    fn from_env_str(s: &str) -> Self {
+        match s {
+            "entry" => NodeRole::Entry,
+            "middle" => NodeRole::Middle,
+            _ => NodeRole::Exit,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
     /// UDP listen address (default `0.0.0.0:443`; privileged port → needs root).
@@ -22,6 +43,8 @@ pub struct NodeConfig {
     pub mtu: u16,
     /// What this node attests to (from the environment). `None` ⇒ serve unattested (dev).
     pub attest: Option<crate::attest::NodeAttest>,
+    /// This node's position in a trust-split path (`NW_NODE_ROLE`: entry|middle|exit).
+    pub role: NodeRole,
 }
 
 impl NodeConfig {
@@ -42,6 +65,9 @@ impl NodeConfig {
             egress,
             mtu: 1280,
             attest: crate::attest::NodeAttest::from_env(),
+            role: NodeRole::from_env_str(
+                &std::env::var("NW_NODE_ROLE").unwrap_or_else(|_| "exit".to_string()),
+            ),
         })
     }
 }

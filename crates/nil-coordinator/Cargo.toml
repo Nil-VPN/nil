@@ -8,6 +8,7 @@ description = "NIL VPN Control plane: node registry, trust-split path selection,
 
 [dependencies]
 nil-proto = { workspace = true }
+nil-crypto = { workspace = true }   # Privacy Pass token verifier (public key only)
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

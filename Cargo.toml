@@ -68,6 +68,9 @@ classic-mceliece-rust = { version = "3", features = ["mceliece460896", "alloc"] 
 
 # --- Declared for forward intent; activated in their phase step.
 boringtun = "0.7"                      # inner WireGuard Noise core (PQ PSK over MASQUE)
+
+# --- Phase 3: unlinkable payments (Privacy Pass blind tokens) ---
+blind-rsa-signatures = "0.17"          # RFC 9474 blind RSA signatures (issuer private / verifier public)
 # quinn = "0.11"                       # prototyping alt QUIC
 
 # Internal crates (path deps — versioned together; explicit version silences

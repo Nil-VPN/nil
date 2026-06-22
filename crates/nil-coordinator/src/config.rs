@@ -1,19 +1,20 @@
-//! Coordinator configuration from the environment. Phase 2 publishes one pinned node + its
-//! measurement; Phase 3 turns this into a node registry with trust-split path selection.
+//! Coordinator configuration from the environment.
 
 use std::net::SocketAddr;
 
-use nil_proto::path::{Hop, Tee};
+use nil_crypto::Verifier;
 
-/// The synthetic dev measurement (matches deploy/compose.yaml). A real deployment sets
-/// `NW_PINNED_MEASUREMENT` from the reproducible build's transparency-log entry.
-const DEFAULT_MEASUREMENT: &str =
-    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
+use crate::pathsel::NodeRegistry;
 
 pub struct CoordConfig {
     pub addr: SocketAddr,
-    /// Phase 2: a single configured hop + the measurement it must attest to.
-    pub hop: Hop,
+    /// Nodes the Coordinator can route through (trust-split selection picks from here).
+    pub registry: NodeRegistry,
+    /// Hops per path (default 3: entry/middle/exit).
+    pub path_hops: usize,
+    /// The Privacy Pass token verifier (public key only). `None` → `/v1/redeem` is disabled
+    /// because no issuer public key was configured.
+    pub verifier: Option<Verifier>,
 }
 
 impl CoordConfig {
@@ -22,18 +23,43 @@ impl CoordConfig {
             .unwrap_or_else(|_| "0.0.0.0:9090".to_string())
             .parse()
             .map_err(|e| anyhow::anyhow!("NW_COORDINATOR_ADDR: {e}"))?;
-        let host = std::env::var("NW_NODE_HOST").unwrap_or_else(|_| "node".to_string());
-        let port: u16 = std::env::var("NW_NODE_PORT")
-            .unwrap_or_else(|_| "443".to_string())
-            .parse()
-            .map_err(|e| anyhow::anyhow!("NW_NODE_PORT: {e}"))?;
-        let measurement =
-            std::env::var("NW_PINNED_MEASUREMENT").unwrap_or_else(|_| DEFAULT_MEASUREMENT.to_string());
-        let tee = match std::env::var("NW_PINNED_TEE").unwrap_or_else(|_| "sev-snp".into()).as_str() {
-            "tdx" => Tee::Tdx,
-            _ => Tee::SevSnp,
+        let path_hops: usize = std::env::var("NW_PATH_HOPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        // The token verifier loads the issuer's PUBLIC key (hex DER) — it can check tokens but
+        // never mint them (the private key stays in the Portal).
+        let verifier = match std::env::var("NW_TOKEN_PUBKEY") {
+            Ok(hex) => match from_hex(hex.trim()) {
+                Some(der) => Some(
+                    Verifier::from_public_der(&der)
+                        .map_err(|e| anyhow::anyhow!("NW_TOKEN_PUBKEY: {e}"))?,
+                ),
+                None => anyhow::bail!("NW_TOKEN_PUBKEY is not valid hex"),
+            },
+            Err(_) => None,
         };
-        let wg_pub = std::env::var("NW_NODE_WG_PUB").ok().filter(|s| !s.is_empty());
-        Ok(Self { addr, hop: Hop { host, port, tee, measurement, wg_pub } })
+        Ok(Self { addr, registry: NodeRegistry::dev_default(), path_hops, verifier })
     }
+}
+
+/// Decode lowercase/uppercase hex; `None` on odd length or a non-hex byte.
+pub fn from_hex(hex: &str) -> Option<Vec<u8>> {
+    let h = hex.as_bytes();
+    if h.len() % 2 != 0 {
+        return None;
+    }
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(h.len() / 2);
+    for p in h.chunks_exact(2) {
+        out.push((nib(p[0])? << 4) | nib(p[1])?);
+    }
+    Some(out)
 }

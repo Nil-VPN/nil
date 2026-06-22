@@ -17,6 +17,9 @@ thiserror = { workspace = true }
 # PQ hybrid PSK (Phase 2): ML-KEM-1024 (FS) + Classic McEliece 460896 (auth) → 32-byte WG PSK.
 ml-kem = { workspace = true, features = ["getrandom"] }   # getrandom: system-RNG keygen/encaps
 classic-mceliece-rust = { workspace = true }
+# Privacy Pass unlinkable blind tokens (Phase 3): issuer signs with the private key, verifier
+# checks with only the public key — the blinding makes redemption unlinkable to issuance.
+blind-rsa-signatures = { workspace = true }
 
 [dev-dependencies]
 rand_chacha = "0.3"

@@ -11,6 +11,7 @@
 
 mod api;
 mod config;
+mod pathsel;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -23,9 +24,15 @@ async fn main() -> Result<()> {
 
     let cfg = std::sync::Arc::new(config::CoordConfig::from_env()?);
     let addr = cfg.addr;
-    tracing::info!(%addr, hop = %cfg.hop.host, "nil-coordinator listening (RequestPath + measurements)");
+    tracing::info!(
+        %addr,
+        nodes = cfg.registry.nodes.len(),
+        path_hops = cfg.path_hops,
+        redeem = cfg.verifier.is_some(),
+        "nil-coordinator listening (redeem + path + measurements)"
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, api::router(cfg)).await?;
+    axum::serve(listener, api::router(api::CoordState::new(cfg))).await?;
     Ok(())
 }
