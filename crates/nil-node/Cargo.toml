@@ -4,9 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "NIL VPN Data plane node: MASQUE datapath, RA-TLS, entry/middle/exit roles. Runs in a TEE; keeps NO disk logs."
+description = "NIL VPN Data plane node: MASQUE/CONNECT-IP server + exit. Runs in a TEE; keeps NO disk logs."
 
 [dependencies]
+nil-core = { workspace = true }
+nil-transport = { workspace = true }   # for the shared connectip framing (no masque feature)
+quiche = { workspace = true }
+tun-rs = { workspace = true }
+rcgen = { workspace = true }
+getrandom = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

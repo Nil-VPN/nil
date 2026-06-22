@@ -1,27 +1,39 @@
-//! NIL VPN Data plane node (`nil-node`).
+//! NIL VPN Data plane node (`nil-node`) — Phase 1 MASQUE/CONNECT-IP exit.
 //!
-//! Carries packets and holds no durable state. Runs INSIDE a TEE; presents an RA-TLS
-//! attestation report on every handshake; keeps **no disk logs** (ephemeral storage,
-//! no access logs on the datapath). Entry sees the client IP not the destination; exit
-//! the reverse; middle neither.
+//! Accepts an HTTP/3 extended `CONNECT` with `:protocol=connect-ip` over QUIC (UDP 443),
+//! decapsulates IP packets from QUIC DATAGRAMs onto a TUN device, and NATs them to the
+//! internet (Linux). Replies route back through the TUN and are re-encapsulated to the
+//! client. Runs inside a Linux container/TEE; keeps **no disk logs** (stdout only) and
+//! persists nothing identifying.
 //!
-//! Phase 0 is a stub: it starts, logs, and idles until Ctrl-C. No tunnel datapath yet
-//! (MASQUE/`quiche` lands in Phase 1).
+//! Phase 1 presents a self-signed dev TLS cert (NOT attestation — RA-TLS is Phase 2, §5).
+
+mod cert;
+mod config;
+mod exit;
+mod server;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Logs go to stdout only — never to disk. The datapath must remain logless.
+    // Logs to stdout only — never to disk (datapath must stay logless).
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    let role = std::env::var("NW_NODE_ROLE").unwrap_or_else(|_| "exit".to_string());
-    tracing::info!(%role, "nil-node starting (Phase 0 stub — data plane, no datapath yet)");
+    let cfg = config::NodeConfig::from_env()?;
+    tracing::info!(
+        bind = %cfg.bind, egress = %cfg.egress, tun = %cfg.tun_name,
+        node_ip = %cfg.node_tun_ip, client_ip = %cfg.client_ip,
+        "nil-node starting (Phase 1 MASQUE exit; no disk logs)"
+    );
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("nil-node shutting down");
+    let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;
+    let exit = exit::Exit::setup(&cfg)?;
+
+    // Runs until Ctrl-C; `exit` drops here and tears down the NAT rules.
+    server::run(&cfg, &cert, exit.tun()).await?;
     Ok(())
 }
