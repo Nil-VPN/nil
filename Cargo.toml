@@ -73,6 +73,12 @@ boringtun = "0.7"                      # inner WireGuard Noise core (PQ PSK over
 blind-rsa-signatures = "0.17"          # RFC 9474 blind RSA signatures (issuer private / verifier public)
 # quinn = "0.11"                       # prototyping alt QUIC
 
+# --- Phase 4: wstunnel cascade rung (WireGuard over WebSocket-over-TLS) ---
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }  # WebSocket client/server
+tokio-rustls = "0.26"                  # TLS for the WS envelope (rustls, the project standard)
+rustls = "0.23"                        # custom no-verify config (security is the inner WireGuard)
+futures-util = "0.3"                   # split the WebSocket stream for the bidirectional pump
+
 # Internal crates (path deps — versioned together; explicit version silences
 # cargo-deny's wildcard-path warning).
 nil-core = { path = "crates/nil-core", version = "0.1.0" }

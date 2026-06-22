@@ -18,6 +18,7 @@ use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind}
 use nil_transport::cascade::{Cascade, CascadeTransport, DnsLivenessProbe};
 use nil_transport::{
     connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport,
+    WstunnelTransport,
 };
 
 use crate::TunnelConfig;
@@ -34,7 +35,7 @@ fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
         return Ok(None);
     }
     let Ok(h) = std::env::var("NW_NODE_AMNEZIA_WG_PUB") else {
-        anyhow::bail!("NW_CASCADE set but NW_NODE_AMNEZIA_WG_PUB (the fallback node's WG key) is missing");
+        return Ok(None); // AmneziaWG rung is optional; a deployment may run wstunnel-only.
     };
     let bytes = connectip::from_hex(h.trim().as_bytes())
         .ok_or_else(|| anyhow::anyhow!("NW_NODE_AMNEZIA_WG_PUB is not valid hex"))?;
@@ -45,6 +46,28 @@ fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
     let host = std::env::var("NW_NODE_AMNEZIA_HOST").ok();
     let port = std::env::var("NW_NODE_AMNEZIA_PORT").ok().and_then(|p| p.parse().ok());
     Ok(Some(AmneziaWgTransport::new(wg_pub, host, port)))
+}
+
+/// The wstunnel cascade fallback rung (WireGuard over WebSocket-over-TLS), if `NW_CASCADE` is set
+/// AND `NW_NODE_WSTUNNEL_WG_PUB` (hex) is given. Endpoint from `NW_NODE_WSTUNNEL_HOST` /
+/// `NW_NODE_WSTUNNEL_PORT` (defaulting to the primary host / 443). Optional: a deployment may run
+/// AmneziaWG, wstunnel, both, or neither as fallbacks.
+fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
+    if std::env::var("NW_CASCADE").is_err() {
+        return Ok(None);
+    }
+    let Ok(h) = std::env::var("NW_NODE_WSTUNNEL_WG_PUB") else {
+        return Ok(None);
+    };
+    let bytes = connectip::from_hex(h.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_NODE_WSTUNNEL_WG_PUB is not valid hex"))?;
+    let wg_pub: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NW_NODE_WSTUNNEL_WG_PUB must be 32 bytes"))?;
+    let host = std::env::var("NW_NODE_WSTUNNEL_HOST").ok();
+    let port = std::env::var("NW_NODE_WSTUNNEL_PORT").ok().and_then(|p| p.parse().ok());
+    Ok(Some(WstunnelTransport::new(wg_pub, host, port)))
 }
 
 /// Whether the environment configures a real node/path (vs. nothing → the GUI uses loopback).
@@ -143,29 +166,52 @@ pub fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
             } else {
                 (Arc::new(MasqueTransport::new()), 1280)
             };
-            // With NW_CASCADE, wrap [primary, AmneziaWG] in a cascade that steps down (timeout /
-            // dead-tunnel) and verifies each rung with a DNS liveness probe before committing.
-            match amneziawg_fallback_from_env()? {
-                Some(awg) => {
-                    tracing::info!("obfuscation cascade enabled (MASQUE primary → AmneziaWG fallback)");
-                    let cascade = Cascade::new(vec![primary, Arc::new(awg)])
-                        .with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
-                    (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
+            // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
+            // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
+            // committing. Each fallback rung is independently optional (a deployment may run
+            // either, both, or neither).
+            let mut rungs: Vec<Arc<dyn Transport>> = vec![primary];
+            if let Some(awg) = amneziawg_fallback_from_env()? {
+                rungs.push(Arc::new(awg));
+            }
+            if let Some(wst) = wstunnel_fallback_from_env()? {
+                rungs.push(Arc::new(wst));
+            }
+            if rungs.len() > 1 {
+                tracing::info!(
+                    rungs = rungs.len(),
+                    "obfuscation cascade enabled (MASQUE primary → {} fallback rung(s))",
+                    rungs.len() - 1
+                );
+                let cascade = Cascade::new(rungs)
+                    .with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
+                (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
+            } else {
+                if std::env::var("NW_CASCADE").is_ok() {
+                    anyhow::bail!(
+                        "NW_CASCADE set but no fallback rung configured — set NW_NODE_AMNEZIA_WG_PUB and/or NW_NODE_WSTUNNEL_WG_PUB"
+                    );
                 }
-                None => (primary, node, base_mtu),
+                (rungs.into_iter().next().expect("primary rung"), node, base_mtu)
             }
         };
 
-    // When the cascade is on, the AmneziaWG fallback node's traffic must also bypass the tunnel
-    // (else the fallback rung's own UDP to its node would loop through the TUN, and — since the
-    // kill-switch only opens the PRIMARY node on :443 — its custom UDP port would be dropped).
-    // Default the fallback host to the primary host (the rung reuses it when NW_NODE_AMNEZIA_HOST
-    // is unset), so the except/allow covers all ports of that node regardless of port config.
-    let also_except: Vec<String> = if std::env::var("NW_CASCADE").is_ok() {
-        vec![std::env::var("NW_NODE_AMNEZIA_HOST").unwrap_or_else(|_| host.clone())]
-    } else {
-        Vec::new()
-    };
+    // When the cascade is on, each fallback node's traffic must also bypass the tunnel (else the
+    // fallback rung's own packets to its node would loop through the TUN, and — since the
+    // kill-switch only opens the PRIMARY node on :443 — its custom port would be dropped). Default
+    // each fallback host to the primary host (a rung reuses it when its *_HOST is unset), so the
+    // except/allow covers all ports of that node regardless of port config. Dedup so we don't pin
+    // the same host twice.
+    let mut also_except: Vec<String> = Vec::new();
+    if std::env::var("NW_CASCADE").is_ok() {
+        also_except.push(std::env::var("NW_NODE_AMNEZIA_HOST").unwrap_or_else(|_| host.clone()));
+        if std::env::var("NW_NODE_WSTUNNEL_WG_PUB").is_ok() {
+            let wh = std::env::var("NW_NODE_WSTUNNEL_HOST").unwrap_or_else(|_| host.clone());
+            if !also_except.contains(&wh) {
+                also_except.push(wh);
+            }
+        }
+    }
 
     let cfg = TunnelConfig {
         node: routing_node,

@@ -10,7 +10,7 @@ description = "NIL VPN client datapath: TUN device, routing, fail-closed kill-sw
 # The shared `launch` builder (env -> transport + TunnelConfig), reused by nil-cli and the
 # desktop GUI engine so they never drift. Pulls the MASQUE / PQ-WireGuard transports. Off by
 # default so a consumer needing only the Tunnel/pump over an externally-built transport stays light.
-launch = ["nil-transport/masque", "nil-transport/pqwg"]
+launch = ["nil-transport/masque", "nil-transport/pqwg", "nil-transport/wstunnel"]
 # Test/dev only: also accept the node's synthetic attestation report (Docker harness).
 synthetic-attest = ["launch", "nil-transport/synthetic-attest"]
 

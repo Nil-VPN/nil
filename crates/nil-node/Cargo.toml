@@ -28,3 +28,8 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# wstunnel responder (WireGuard over WebSocket-over-TLS)
+tokio-tungstenite = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+futures-util = { workspace = true }

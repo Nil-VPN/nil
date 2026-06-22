@@ -17,6 +17,10 @@ synthetic-attest = ["masque", "nil-attest/synthetic"]
 # Inner PQ-WireGuard-over-MASQUE: a boringtun Noise core fed by the nil-crypto hybrid PSK,
 # wrapping the MASQUE transport. (Spec §4.2; shares the PQ core with the Phase 4 cascade.)
 pqwg = ["masque", "dep:boringtun", "dep:nil-crypto", "dep:getrandom"]
+# wstunnel cascade rung: WireGuard (the pqwg core) carried over WebSocket-over-TLS — a distinct
+# HTTPS-shaped wire fingerprint. The inner WireGuard provides the crypto/auth; the TLS is the
+# obfuscation envelope.
+wstunnel = ["pqwg", "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "dep:futures-util"]
 
 [dependencies]
 nil-core = { workspace = true }
@@ -29,3 +33,11 @@ tokio-util = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 boringtun = { workspace = true, optional = true }       # WireGuard Noise core (pqwg)
 nil-crypto = { workspace = true, optional = true }       # PQ hybrid PSK (pqwg)
+tokio-tungstenite = { workspace = true, optional = true } # WebSocket (wstunnel)
+tokio-rustls = { workspace = true, optional = true }     # TLS envelope (wstunnel)
+rustls = { workspace = true, optional = true }           # no-verify client config (wstunnel)
+futures-util = { workspace = true, optional = true }     # split the WS stream (wstunnel)
+
+[dev-dependencies]
+# A throwaway self-signed TLS cert for the in-crate wstunnel round-trip test's WS-TLS responder.
+rcgen = { workspace = true }
