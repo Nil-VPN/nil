@@ -30,4 +30,6 @@ pub use masque::{MasqueConfig, MasqueTransport};
 #[cfg(feature = "masque")]
 pub use path::PathTransport;
 #[cfg(feature = "pqwg")]
+pub use amneziawg::{AmneziaWgConfig, AmneziaWgTransport, ObfsParams};
+#[cfg(feature = "pqwg")]
 pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};

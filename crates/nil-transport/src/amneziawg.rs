@@ -134,6 +134,230 @@ impl ObfsParams {
     }
 }
 
+// ---- The AmneziaWG transport: obfuscated WireGuard directly on UDP (cascade rung 2) ---------
+
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use boringtun::x25519::PublicKey;
+use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use tokio::net::UdpSocket;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio_util::sync::CancellationToken;
+
+use crate::pqwg::{PqWgCore, WgKeypair, WgStep};
+use crate::Transport;
+
+const AWG_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const AWG_QUEUE: usize = 1024;
+const AWG_TICK: Duration = Duration::from_millis(250);
+
+/// Configuration for the AmneziaWG rung.
+pub struct AmneziaWgConfig {
+    /// The node's WireGuard static public key.
+    pub node_wg_pub: [u8; 32],
+    /// UDP port to reach the node's AmneziaWG responder on. `None` ⇒ use the endpoint's port.
+    pub port: Option<u16>,
+    /// Obfuscation parameters (must match the node's).
+    pub obfs: ObfsParams,
+}
+
+struct AwgSession {
+    to_wire: mpsc::Sender<IpPacket>,
+    from_wire: AsyncMutex<mpsc::Receiver<IpPacket>>,
+    shutdown: CancellationToken,
+    _driver: tokio::task::JoinHandle<()>,
+}
+
+/// Obfuscated WireGuard directly on UDP — the cascade's DPI-resistant fallback when MASQUE/QUIC
+/// is blocked. Implements [`Transport`], so the datapath/cascade drive it like any other rung.
+pub struct AmneziaWgTransport {
+    cfg: Arc<AmneziaWgConfig>,
+    sessions: Mutex<HashMap<SessionId, Arc<AwgSession>>>,
+    next_id: AtomicU64,
+}
+
+impl AmneziaWgTransport {
+    pub fn new(node_wg_pub: [u8; 32], port: Option<u16>) -> Self {
+        Self::with_config(AmneziaWgConfig { node_wg_pub, port, obfs: ObfsParams::default() })
+    }
+
+    pub fn with_config(cfg: AmneziaWgConfig) -> Self {
+        Self { cfg: Arc::new(cfg), sessions: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+    }
+
+    fn state(&self, session: &Session) -> Result<Arc<AwgSession>> {
+        self.sessions
+            .lock()
+            .map_err(|_| Error::Transport("amneziawg session map poisoned".into()))?
+            .get(&session.id)
+            .cloned()
+            .ok_or(Error::SessionNotFound(session.id))
+    }
+}
+
+async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
+    let hp = format!("{host}:{port}");
+    let mut addrs = tokio::net::lookup_host(&hp)
+        .await
+        .map_err(|e| Error::Transport(format!("resolve {hp}: {e}")))?;
+    addrs.next().ok_or_else(|| Error::Transport(format!("no address for {hp}")))
+}
+
+#[async_trait]
+impl Transport for AmneziaWgTransport {
+    async fn connect(&self, target: NodeEndpoint, _creds: Grant) -> Result<Session> {
+        let port = self.cfg.port.unwrap_or(target.port);
+        let peer = resolve(&target.host, port).await?;
+        let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let socket = UdpSocket::bind(bind)
+            .await
+            .map_err(|e| Error::Transport(format!("udp bind: {e}")))?;
+        socket.connect(peer).await.map_err(|e| Error::Transport(format!("udp connect: {e}")))?;
+        let obfs = self.cfg.obfs.clone();
+
+        // Pre-handshake junk (the peer ignores it), then the obfuscated WireGuard handshake.
+        for junk in obfs.junk_packets() {
+            let _ = socket.send(&junk).await;
+        }
+        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let mut core = PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
+        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        socket
+            .send(&obfs.obfuscate(&init))
+            .await
+            .map_err(|e| Error::Transport(format!("send handshake: {e}")))?;
+
+        // Await the (obfuscated) handshake response, then send the completing keepalive.
+        let mut buf = vec![0u8; 65535];
+        let resp = tokio::time::timeout(AWG_HANDSHAKE_TIMEOUT, async {
+            loop {
+                let n = socket
+                    .recv(&mut buf)
+                    .await
+                    .map_err(|e| Error::Transport(format!("recv handshake: {e}")))?;
+                if let Some(wg) = obfs.deobfuscate(&buf[..n]) {
+                    return Ok::<Vec<u8>, Error>(wg);
+                }
+                // junk / not ours → keep waiting
+            }
+        })
+        .await
+        .map_err(|_| Error::Transport("amneziawg handshake timed out".into()))??;
+
+        match core.decapsulate(&resp) {
+            WgStep::Network(keepalive) => {
+                socket
+                    .send(&obfs.obfuscate(&keepalive))
+                    .await
+                    .map_err(|e| Error::Transport(format!("send keepalive: {e}")))?;
+            }
+            other => return Err(Error::Transport(format!("amneziawg handshake failed: {other:?}"))),
+        }
+        tracing::info!("AmneziaWG tunnel established (obfuscated WireGuard over UDP)");
+
+        let (to_tx, to_rx) = mpsc::channel(AWG_QUEUE);
+        let (from_tx, from_rx) = mpsc::channel(AWG_QUEUE);
+        let shutdown = CancellationToken::new();
+        let driver = tokio::spawn(awg_driver(socket, core, obfs, to_rx, from_tx, shutdown.clone()));
+
+        let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let sess = Arc::new(AwgSession {
+            to_wire: to_tx,
+            from_wire: AsyncMutex::new(from_rx),
+            shutdown,
+            _driver: driver,
+        });
+        self.sessions
+            .lock()
+            .map_err(|_| Error::Transport("amneziawg session map poisoned".into()))?
+            .insert(id, sess);
+        Ok(Session { id, kind: TransportKind::AmneziaWg })
+    }
+
+    async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
+        let s = self.state(session)?;
+        s.to_wire.send(packet).await.map_err(|_| Error::Closed)
+    }
+
+    async fn recv(&self, session: &Session) -> Result<IpPacket> {
+        let s = self.state(session)?;
+        let mut rx = s.from_wire.lock().await;
+        rx.recv().await.ok_or(Error::Closed)
+    }
+
+    async fn close(&self, session: Session) -> Result<()> {
+        let s = {
+            let mut map = self
+                .sessions
+                .lock()
+                .map_err(|_| Error::Transport("amneziawg session map poisoned".into()))?;
+            map.remove(&session.id)
+        }
+        .ok_or(Error::SessionNotFound(session.id))?;
+        s.shutdown.cancel();
+        Ok(())
+    }
+
+    fn kind(&self) -> TransportKind {
+        TransportKind::AmneziaWg
+    }
+
+    fn fingerprint_profile(&self) -> Profile {
+        Profile::Wireguardish
+    }
+}
+
+/// The data pump: app IP packets → WG encapsulate → obfuscate → UDP; UDP → deobfuscate → WG
+/// decapsulate → app. A timer drives WireGuard keepalive/rekey.
+async fn awg_driver(
+    socket: UdpSocket,
+    mut core: PqWgCore,
+    obfs: ObfsParams,
+    mut to_rx: mpsc::Receiver<IpPacket>,
+    from_tx: mpsc::Sender<IpPacket>,
+    shutdown: CancellationToken,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            pkt = to_rx.recv() => match pkt {
+                Some(ip) => {
+                    if let Ok(wire) = core.encapsulate(ip.as_bytes()) {
+                        let _ = socket.send(&obfs.obfuscate(&wire)).await;
+                    }
+                }
+                None => return,
+            },
+            r = socket.recv(&mut buf) => match r {
+                Ok(n) => {
+                    if let Some(wg) = obfs.deobfuscate(&buf[..n]) {
+                        let mut input = wg;
+                        loop {
+                            match core.decapsulate(&input) {
+                                WgStep::Ip(ip) => { let _ = from_tx.try_send(IpPacket::new(ip)); break; }
+                                WgStep::Network(b) => { let _ = socket.send(&obfs.obfuscate(&b)).await; input = Vec::new(); }
+                                WgStep::Done | WgStep::Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                Err(e) => { tracing::debug!("amneziawg udp recv: {e}"); return; }
+            },
+            _ = tokio::time::sleep(AWG_TICK) => {
+                if let Some(b) = core.tick() {
+                    let _ = socket.send(&obfs.obfuscate(&b)).await;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -76,6 +76,16 @@ impl PqWgCore {
         Self { tunn }
     }
 
+    /// Build a tunnel end with **no** preshared key — classical WireGuard (X25519 Noise only).
+    /// Used by the AmneziaWG cascade rung (a censorship fallback): its PQ hybrid PSK exchange
+    /// (the ~512 KiB McEliece offer) needs a reliable channel the raw-UDP rung doesn't have, so
+    /// for now the rung's security is WireGuard + obfuscation. The default MASQUE transport stays
+    /// PQ-by-default. TODO: a reliable-UDP sublayer to carry the offer so the fallback is PQ too.
+    pub fn without_psk(my_secret: StaticSecret, peer_public: PublicKey, index: u32) -> Self {
+        let tunn = Tunn::new(my_secret, peer_public, None, Some(25), index, None);
+        Self { tunn }
+    }
+
     /// Initiator: produce the first handshake datagram to send to the peer.
     pub fn handshake_init(&mut self) -> std::result::Result<Vec<u8>, WireGuardError> {
         let mut dst = vec![0u8; 2048];
