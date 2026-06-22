@@ -4,6 +4,25 @@
 //! destination; exit sees the destination but not the client IP; the middle sees neither.
 
 use nil_proto::path::{Hop, Tee};
+use serde::Deserialize;
+
+/// On-disk node registry entry (`NW_NODE_REGISTRY` JSON). `tee` defaults to `sev-snp`.
+#[derive(Debug, Deserialize)]
+struct RegistryFileNode {
+    host: String,
+    port: u16,
+    #[serde(default = "default_tee")]
+    tee: String,
+    measurement: String,
+    operator: String,
+    jurisdiction: String,
+    #[serde(default)]
+    wg_pub: Option<String>,
+}
+
+fn default_tee() -> String {
+    "sev-snp".to_string()
+}
 
 /// A node known to the Coordinator, with the diversity attributes path selection enforces.
 #[derive(Debug, Clone)]
@@ -38,6 +57,51 @@ pub struct NodeRegistry {
 }
 
 impl NodeRegistry {
+    /// Load the registry from `NW_NODE_REGISTRY` (a JSON file of nodes, each with its own
+    /// operator/jurisdiction and its **own** Rekor-published measurement), or fall back to the
+    /// built-in dev registry (one shared placeholder measurement) with a loud warning. Pinning a
+    /// distinct measurement per operator is what makes attestation meaningful — the dev default
+    /// pins one constant for every node and must never reach production.
+    pub fn from_env() -> anyhow::Result<Self> {
+        match std::env::var("NW_NODE_REGISTRY") {
+            Ok(path) => Self::from_file(&path),
+            Err(_) => {
+                tracing::warn!(
+                    "NW_NODE_REGISTRY unset — using the built-in DEV registry (one shared \
+                     placeholder measurement); production must pin a per-operator measurement per node"
+                );
+                Ok(Self::dev_default())
+            }
+        }
+    }
+
+    /// Parse a JSON node registry file: an array of `{host, port, tee, measurement, operator,
+    /// jurisdiction, wg_pub?}`. `tee` is `"sev-snp"` (default) or `"tdx"`.
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
+        let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read node registry {path}: {e}"))?;
+        let dtos: Vec<RegistryFileNode> = serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("parse node registry {path}: {e}"))?;
+        if dtos.is_empty() {
+            anyhow::bail!("node registry {path} lists no nodes");
+        }
+        let nodes = dtos
+            .into_iter()
+            .map(|d| RegistryNode {
+                host: d.host,
+                port: d.port,
+                tee: match d.tee.as_str() {
+                    "tdx" => Tee::Tdx,
+                    _ => Tee::SevSnp,
+                },
+                measurement: d.measurement,
+                operator: d.operator,
+                jurisdiction: d.jurisdiction,
+                wg_pub: d.wg_pub,
+            })
+            .collect();
+        Ok(Self { nodes })
+    }
+
     /// A small built-in dev registry: three operators in three jurisdictions, enough for a
     /// trust-split 3-hop path. A real deployment loads this from the node registry.
     pub fn dev_default() -> Self {
@@ -105,6 +169,40 @@ mod tests {
             .collect();
         assert_eq!(ops.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct operators");
         assert_eq!(jurs.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct jurisdictions");
+    }
+
+    #[test]
+    fn loads_per_operator_measurements_from_a_registry_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nil-coord-registry-{}-{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Three operators/jurisdictions, each with its OWN measurement (not one shared constant).
+        std::fs::write(
+            &path,
+            r#"[
+              {"host":"e.example","port":443,"tee":"sev-snp","measurement":"aa","operator":"op-a","jurisdiction":"US"},
+              {"host":"m.example","port":443,"tee":"tdx","measurement":"bb","operator":"op-b","jurisdiction":"DE"},
+              {"host":"x.example","port":443,"measurement":"cc","operator":"op-c","jurisdiction":"CH"}
+            ]"#,
+        )
+        .unwrap();
+
+        let reg = NodeRegistry::from_file(path.to_str().unwrap()).expect("parse registry");
+        assert_eq!(reg.nodes.len(), 3);
+        // Distinct, per-operator measurements survived the load (the production property).
+        let measurements: std::collections::HashSet<&str> =
+            reg.nodes.iter().map(|n| n.measurement.as_str()).collect();
+        assert_eq!(measurements.len(), 3, "each node keeps its own measurement");
+        assert_eq!(reg.nodes[1].tee, Tee::Tdx, "tee parsed");
+        assert_eq!(reg.nodes[2].tee, Tee::SevSnp, "tee defaults to sev-snp");
+        let path3 = reg.select_path(3).expect("a 3-hop diverse path exists");
+        assert_eq!(path3.len(), 3);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

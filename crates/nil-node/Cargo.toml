@@ -10,6 +10,9 @@ description = "NIL VPN Data plane node: MASQUE/CONNECT-IP server + exit. Runs in
 # Synthetic RA-TLS report (test/dev) so the Docker harness can attest without TEE hardware.
 # A real deployment fetches a hardware SEV-SNP/TDX report instead; never ship this.
 synthetic-attest = ["nil-attest/synthetic"]
+# Production: fetch a real SEV-SNP/TDX report from the kernel (Linux configfs-TSM). No extra
+# deps (plain std fs). Compile-checked in CI; only EXERCISED on real TEE hardware.
+hw-attest = []
 
 [dependencies]
 nil-core = { workspace = true }

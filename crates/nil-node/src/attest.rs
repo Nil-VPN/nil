@@ -50,11 +50,25 @@ pub fn report_hex(spki: &[u8], attest: Option<&NodeAttest>, nonce: &[u8; 32]) ->
     }
     #[cfg(not(feature = "synthetic-attest"))]
     {
-        let _ = (spki, attest, nonce);
-        // A real node fetches a hardware SEV-SNP/TDX report here (needs a TEE).
-        tracing::warn!(
-            "attestation configured but no report provider built in (need a TEE or `synthetic-attest`)"
-        );
-        None
+        // Production: fetch a real hardware SEV-SNP/TDX report (configfs-TSM). Compile-checked
+        // everywhere; only succeeds on a TEE guest, else returns None and the client fails closed.
+        #[cfg(feature = "hw-attest")]
+        {
+            match crate::hw::report_evidence(attest.tee, spki, nonce) {
+                Ok(evidence) => Some(nil_transport::connectip::to_hex(&evidence)),
+                Err(e) => {
+                    tracing::error!("hardware attestation report failed: {e}");
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "hw-attest"))]
+        {
+            let _ = (spki, attest, nonce);
+            tracing::warn!(
+                "attestation configured but no report provider built in (need a TEE + `hw-attest`, or `synthetic-attest`)"
+            );
+            None
+        }
     }
 }

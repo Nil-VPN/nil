@@ -44,7 +44,8 @@ impl CoordConfig {
             Err(_) => None,
         };
         let nullifier_path = std::env::var("NW_NULLIFIER_PATH").ok().map(PathBuf::from);
-        Ok(Self { addr, registry: NodeRegistry::dev_default(), path_hops, verifier, nullifier_path })
+        let registry = NodeRegistry::from_env()?;
+        Ok(Self { addr, registry, path_hops, verifier, nullifier_path })
     }
 }
 

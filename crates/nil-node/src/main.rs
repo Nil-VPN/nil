@@ -12,6 +12,8 @@ mod attest;
 mod cert;
 mod config;
 mod exit;
+#[cfg(feature = "hw-attest")]
+mod hw;
 mod pqwg;
 mod server;
 
