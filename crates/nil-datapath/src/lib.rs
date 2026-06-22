@@ -1,0 +1,192 @@
+//! Client-side system datapath: a [`Tunnel`] controller that connects a [`Transport`],
+//! brings up a TUN device, flips the default route through it (with a host-route exception
+//! for the node so the tunnel's own QUIC packets don't loop), arms a fail-closed
+//! kill-switch, and runs the bidirectional packet pump.
+//!
+//! The OS-specific routing/kill-switch/DNS lives behind [`NetControl`]; Phase 1 implements
+//! Linux (verified in Docker). macOS is a Phase-1b stub. The [`Transport`] trait stays the
+//! only seam to the tunnel — this crate never knows which transport is active.
+
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+
+use nil_core::{Grant, IpPacket, NodeEndpoint, Session};
+use nil_transport::Transport;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+#[cfg(target_os = "linux")]
+mod linux;
+
+/// How to bring up the tunnel.
+pub struct TunnelConfig {
+    pub node: NodeEndpoint,
+    pub tun_name: String,
+    pub client_ip: Ipv4Addr,
+    pub peer_ip: Ipv4Addr,
+    pub prefix: u8,
+    pub mtu: u16,
+    pub dns: Vec<IpAddr>,
+    pub kill_switch: bool,
+}
+
+/// Inputs the OS layer needs to arm routing/kill-switch/DNS.
+pub struct ArmParams {
+    pub node_ip: IpAddr,
+    pub tun_name: String,
+    pub dns: Vec<IpAddr>,
+    pub kill_switch: bool,
+}
+
+/// OS-specific routing, kill-switch, and DNS control. `teardown` must be idempotent and
+/// safe to call after a partial `arm`.
+pub trait NetControl: Send {
+    fn arm(&mut self, params: &ArmParams) -> anyhow::Result<()>;
+    fn teardown(&mut self);
+}
+
+/// Fallback for non-Linux targets (macOS datapath is Phase 1b). Compiles everywhere so the
+/// workspace builds on macOS; refuses to arm at runtime.
+struct StubNet;
+impl NetControl for StubNet {
+    fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
+        anyhow::bail!("system datapath is Linux-only in Phase 1 (macOS utun/pf is Phase 1b)")
+    }
+    fn teardown(&mut self) {}
+}
+
+#[cfg(target_os = "linux")]
+fn new_net_control() -> Box<dyn NetControl> {
+    Box::new(linux::LinuxNet::default())
+}
+#[cfg(not(target_os = "linux"))]
+fn new_net_control() -> Box<dyn NetControl> {
+    Box::new(StubNet)
+}
+
+/// A live tunnel: the transport session, the OS networking it armed, and the pump tasks.
+pub struct Tunnel {
+    transport: Arc<dyn Transport>,
+    session: Option<Session>,
+    net: Box<dyn NetControl>,
+    cancel: CancellationToken,
+    pumps: Vec<JoinHandle<()>>,
+    _tun: Arc<tun_rs::AsyncDevice>,
+}
+
+impl Tunnel {
+    /// Connect the transport, bring up the TUN + routes + kill-switch, and start pumping.
+    pub async fn up(transport: Arc<dyn Transport>, cfg: TunnelConfig) -> anyhow::Result<Tunnel> {
+        let node_ip = resolve_ip(&cfg.node).await?;
+        tracing::info!(node = %cfg.node.host, %node_ip, "connecting MASQUE tunnel");
+
+        let session = transport
+            .connect(cfg.node.clone(), Grant::mock())
+            .await
+            .map_err(|e| anyhow::anyhow!("transport connect: {e}"))?;
+        tracing::info!("tunnel session established; bringing up TUN + routes");
+
+        let tun = Arc::new(open_tun(&cfg).map_err(|e| anyhow::anyhow!("open tun: {e}"))?);
+
+        let mut net = new_net_control();
+        if let Err(e) = net.arm(&ArmParams {
+            node_ip,
+            tun_name: cfg.tun_name.clone(),
+            dns: cfg.dns.clone(),
+            kill_switch: cfg.kill_switch,
+        }) {
+            // Bringing up the network failed — tear down what we armed and close the session.
+            net.teardown();
+            let _ = transport.close(session).await;
+            return Err(e);
+        }
+
+        let cancel = CancellationToken::new();
+        let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
+        tracing::info!(tun = %cfg.tun_name, client_ip = %cfg.client_ip, "tunnel up");
+
+        Ok(Tunnel { transport, session: Some(session), net, cancel, pumps, _tun: tun })
+    }
+
+    /// Tear down cleanly: stop the pump, restore networking, close the session.
+    pub async fn down(mut self) -> anyhow::Result<()> {
+        self.cancel.cancel();
+        for h in self.pumps.drain(..) {
+            let _ = h.await;
+        }
+        // Restore routes/DNS/firewall BEFORE closing the session so there is no leak window.
+        self.net.teardown();
+        if let Some(s) = self.session.take() {
+            let _ = self.transport.close(s).await;
+        }
+        tracing::info!("tunnel down; networking restored");
+        Ok(())
+    }
+}
+
+fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
+    tun_rs::DeviceBuilder::new()
+        .name(cfg.tun_name.clone())
+        .ipv4(cfg.client_ip, cfg.prefix, Some(cfg.peer_ip))
+        .mtu(cfg.mtu)
+        .build_async()
+}
+
+fn spawn_pumps(
+    transport: Arc<dyn Transport>,
+    session: Session,
+    tun: Arc<tun_rs::AsyncDevice>,
+    cancel: &CancellationToken,
+) -> Vec<JoinHandle<()>> {
+    // TUN → tunnel: read IP packets off the OS and send them through the transport.
+    let to_wire = {
+        let (tun, transport, cancel) = (tun.clone(), transport.clone(), cancel.child_token());
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = tun.recv(&mut buf) => match r {
+                        Ok(n) => {
+                            if transport.send(&session, IpPacket::new(buf[..n].to_vec())).await.is_err() {
+                                break; // tunnel closed → kill-switch holds
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        })
+    };
+    // tunnel → TUN: receive IP packets from the transport and write them to the OS.
+    let from_wire = {
+        let (tun, transport, cancel) = (tun.clone(), transport.clone(), cancel.child_token());
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = transport.recv(&session) => match r {
+                        Ok(pkt) => {
+                            if tun.send(pkt.as_bytes()).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break, // tunnel closed → kill-switch holds
+                    }
+                }
+            }
+        })
+    };
+    vec![to_wire, from_wire]
+}
+
+async fn resolve_ip(node: &NodeEndpoint) -> anyhow::Result<IpAddr> {
+    let hp = format!("{}:{}", node.host, node.port);
+    let mut addrs = tokio::net::lookup_host(hp.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve {hp}: {e}"))?;
+    addrs
+        .next()
+        .map(|s| s.ip())
+        .ok_or_else(|| anyhow::anyhow!("no address for {hp}"))
+}

@@ -2335,6 +2335,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nil-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nil-core",
+ "nil-datapath",
+ "nil-transport",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nil-client"
 version = "0.1.0"
 dependencies = [
@@ -2385,6 +2398,19 @@ dependencies = [
  "subtle",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "nil-datapath"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nil-core",
+ "nil-transport",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tun-rs",
 ]
 
 [[package]]

@@ -1,0 +1,16 @@
+[package]
+name = "nil-datapath"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN client datapath: TUN device, routing, fail-closed kill-switch, and the packet pump tying a Transport to the OS."
+
+[dependencies]
+nil-core = { workspace = true }
+nil-transport = { workspace = true }   # the Transport trait (no masque feature needed here)
+tun-rs = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

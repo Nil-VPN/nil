@@ -14,6 +14,8 @@ members = [
     "crates/nil-portal",
     "crates/nil-coordinator",
     "crates/nil-node",
+    "crates/nil-datapath",
+    "crates/nil-cli",
     "client/src-tauri",
 ]
 
@@ -69,6 +71,7 @@ nil-proto = { path = "crates/nil-proto", version = "0.1.0" }
 nil-crypto = { path = "crates/nil-crypto", version = "0.1.0" }
 nil-transport = { path = "crates/nil-transport", version = "0.1.0" }
 nil-attest = { path = "crates/nil-attest", version = "0.1.0" }
+nil-datapath = { path = "crates/nil-datapath", version = "0.1.0" }
 
 [profile.release]
 strip = true
