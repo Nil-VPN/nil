@@ -1,0 +1,113 @@
+# Host-safe FULL-STACK end-to-end verification: the whole pipeline on one private bridge —
+# nil-portal (issues an unlinkable Privacy Pass token) → nil-coordinator (verifies the token,
+# enforces single-use, selects a trust-split path) → the datapath (brings up the 3-hop attested
+# MASQUE onion using the granted path) → real traffic. deploy/verify-e2e.sh drives it. Nothing
+# touches the host network.
+#
+# The Portal and Coordinator are deliberately SEPARATE services (Pillar 4: issuer ≠ verifier).
+# The Coordinator runs as `sleep infinity` and the script starts nil-coordinator via exec, once
+# it has read the Portal's issuer public key from the Portal log and written the node registry —
+# so the committed compose bakes no key. All three planes share the image (deploy/Dockerfile.e2e).
+
+x-node-base: &node-base
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.e2e
+  command: ["nil-node"]
+  cap_add: ["NET_ADMIN"]
+  devices: ["/dev/net/tun"]
+  sysctls:
+    - net.ipv4.ip_forward=1
+
+services:
+  # Business plane: mints anonymous Privacy Pass tokens. NW_MOCK_PAID stands in for confirmed
+  # Monero payments (dev/integration only — no live monerod in CI).
+  portal:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.e2e
+    command: ["nil-portal"]
+    environment:
+      - NW_PORTAL_ADDR=0.0.0.0:8080
+      - NW_MOCK_PAID=e2e-pay-redeem,e2e-pay-tunnel,e2e-pay-spare
+      - RUST_LOG=info,nil_portal=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.5
+
+  # Control plane: verifies tokens (Portal's PUBLIC key only), keeps the spent-token nullifier,
+  # selects an operator/jurisdiction-diverse path. Started by the script via exec.
+  coordinator:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.e2e
+    command: ["sleep", "infinity"]
+    environment:
+      - RUST_LOG=info,nil_coordinator=debug
+    depends_on: [portal]
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.6
+
+  entry:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=entry
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.11
+
+  middle:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=middle
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.12
+
+  exit:
+    <<: *node-base
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=exit
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - RUST_LOG=info,nil_node=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.13
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.e2e
+    command: ["sleep", "infinity"]
+    environment:
+      - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+      # The Portal/Coordinator are reached over plaintext http on this trusted private bridge;
+      # opt into an insecure control plane (dev/test only — production requires https/loopback).
+      - NW_INSECURE_CONTROL_PLANE=1
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    depends_on: [portal, coordinator, entry, middle, exit]
+    networks:
+      nilnet:
+        ipv4_address: 10.82.0.30
+
+networks:
+  nilnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.82.0.0/24

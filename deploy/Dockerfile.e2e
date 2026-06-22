@@ -1,0 +1,35 @@
+# Full-stack integration image: builds ALL the binaries the end-to-end pipeline needs —
+# nil-portal (Business plane), nil-coordinator (Control plane), nil-provision (client token
+# acquisition), and nil-node + nil-cli (data plane, built with `synthetic-attest` so the client
+# can attest the nodes' synthetic RA-TLS reports without real TEE hardware). Used by
+# deploy/verify-e2e.sh; nothing touches the host network.
+FROM rust:1.96.0-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CARGO_INCREMENTAL=0 \
+    LC_ALL=C \
+    TZ=UTC \
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+WORKDIR /build
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release --locked -p nil-node --features synthetic-attest && \
+    cargo build --release --locked -p nil-cli --features synthetic-attest && \
+    cargo build --release --locked -p nil-portal && \
+    cargo build --release --locked -p nil-coordinator && \
+    cargo build --release --locked -p nil-provision && \
+    mkdir -p /out && \
+    cp target/release/nil-node target/release/nil-cli target/release/nil-portal \
+       target/release/nil-coordinator target/release/nil-provision /out/
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        iproute2 iptables procps ethtool curl ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /out/nil-node /usr/local/bin/nil-node
+COPY --from=builder /out/nil-cli /usr/local/bin/nil-cli
+COPY --from=builder /out/nil-portal /usr/local/bin/nil-portal
+COPY --from=builder /out/nil-coordinator /usr/local/bin/nil-coordinator
+COPY --from=builder /out/nil-provision /usr/local/bin/nil-provision

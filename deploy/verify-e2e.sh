@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Full-stack end-to-end verification — the WHOLE NIL pipeline in Docker, host untouched.
+#
+#   nil-portal   issues an unlinkable Privacy Pass token (gated on a confirmed payment)
+#        ↓ (blinded; the issuer never sees the token the verifier later does — Pillar 4)
+#   nil-coordinator  verifies the token, enforces single-use (nullifier), grants a trust-split path
+#        ↓
+#   the datapath  redeems the token, builds the 3-hop attested MASQUE onion over the granted path
+#        ↓
+#   real HTTPS traffic flows end to end.
+#
+# Each piece is unit/integration-tested in isolation elsewhere; this proves they COMPOSE. The
+# synthetic RA-TLS report stands in for real TEE hardware (the nil-attest KATs cover the genuine
+# vendor-root path).
+set -uo pipefail
+cd "$(dirname "$0")"
+fail=0
+DC="docker compose -f compose.e2e.yaml"
+
+# Must equal the entry/middle/exit NW_NODE_MEASUREMENT in compose.e2e.yaml.
+M="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+PORTAL=10.82.0.5; COORD=10.82.0.6
+ENTRY=10.82.0.11; MIDDLE=10.82.0.12; EXIT=10.82.0.13
+DEST=1.1.1.1
+
+cleanup() { echo; echo "==> teardown"; $DC down -v >/dev/null 2>&1; }
+trap cleanup EXIT
+
+echo "==> build + start portal, coordinator, entry/middle/exit, client"
+$DC up -d --build || { echo "compose up failed"; exit 1; }
+sleep 6
+
+echo "==> read the Portal's Privacy Pass issuer public key from its log"
+PUBKEY=$($DC logs portal 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -oE 'token_pubkey=[0-9a-f]+' | head -1 | cut -d= -f2)
+if [ -z "$PUBKEY" ]; then
+  echo "  FAIL: Portal did not report an issuer public key"; $DC logs portal 2>/dev/null | tail -8; exit 1
+fi
+echo "  issuer pubkey: ${PUBKEY:0:32}… (${#PUBKEY} hex chars)"
+
+echo "==> write the Coordinator node registry (3 operator/jurisdiction-diverse nodes, all pinned to \$M)"
+$DC exec -T coordinator sh -c 'cat > /tmp/registry.json' <<EOF
+[
+  {"host":"$ENTRY","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-a","jurisdiction":"jur-a"},
+  {"host":"$MIDDLE","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-b","jurisdiction":"jur-b"},
+  {"host":"$EXIT","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-c","jurisdiction":"jur-c"}
+]
+EOF
+
+echo "==> start the Coordinator (verifier = the Portal's PUBLIC key only; 3-hop diverse paths)"
+$DC exec -e NW_COORDINATOR_ADDR=0.0.0.0:9000 -e NW_TOKEN_PUBKEY="$PUBKEY" \
+  -e NW_NODE_REGISTRY=/tmp/registry.json -e NW_PATH_HOPS=3 \
+  -d coordinator sh -c 'nil-coordinator > /tmp/coord.log 2>&1'
+cup=0
+for _ in $(seq 1 20); do
+  if $DC exec -T client curl -s -o /dev/null --max-time 2 "http://$COORD:9000/healthz"; then cup=1; break; fi
+  sleep 1
+done
+[ "$cup" = 1 ] && echo "  coordinator listening" \
+  || { echo "  FAIL: coordinator did not start"; $DC exec -T coordinator tail -n 15 /tmp/coord.log 2>/dev/null; exit 1; }
+
+# Acquire a token from the Portal for a given (mock-paid) payment id; echoes the NW_TOKEN_* lines.
+acquire() {
+  $DC exec -T -e NW_PORTAL_URL="http://$PORTAL:8080" -e NW_PAYMENT_ID="$1" client nil-provision 2>/dev/null | tr -d '\r'
+}
+
+echo
+echo "================ CONTROL PLANE: issue → redeem → single-use ================"
+prov=$(acquire e2e-pay-redeem)
+MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
+TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
+if [ -z "$MSG" ] || [ -z "$TOK" ]; then
+  echo "  FAIL: token acquisition produced no token"; printf '%s\n' "$prov"; fail=1
+else
+  echo "  PASS: acquired an unlinkable token from the Portal (msg ${MSG:0:16}…)"
+  body="{\"msg\":\"$MSG\",\"token\":\"$TOK\"}"
+  c1=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
+  c2=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
+  echo "  redeem #1 → HTTP $c1   redeem #2 → HTTP $c2"
+  [ "$c1" = "200" ] && echo "  PASS: first redemption granted a trust-split path" || { echo "  FAIL: first redemption not 200"; fail=1; }
+  [ "$c2" = "409" ] && echo "  PASS: replay rejected — single-use nullifier holds" || { echo "  FAIL: replay not rejected (want 409, got $c2)"; fail=1; }
+fi
+
+echo
+echo "================ DATA PLANE: token → coordinator-granted onion → real traffic ================"
+prov=$(acquire e2e-pay-tunnel)
+MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
+TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
+if [ -z "$TOK" ]; then
+  echo "  FAIL: token acquisition (tunnel) failed"; fail=1
+else
+  echo "==> nil-cli redeems the token at the Coordinator and brings up the GRANTED 3-hop onion"
+  $DC exec -e NW_COORDINATOR_URL="http://$COORD:9000" -e NW_TOKEN_MSG="$MSG" -e NW_TOKEN="$TOK" -d client \
+    sh -c 'nil-cli > /tmp/e2e.log 2>&1'
+  up=0
+  for _ in $(seq 1 50); do
+    $DC exec -T client grep -q "tunnel up" /tmp/e2e.log 2>/dev/null && { up=1; break; }
+    $DC exec -T client grep -qE "Error|panicked|refus" /tmp/e2e.log 2>/dev/null && break
+    sleep 1
+  done
+  echo "---- client log ----"; $DC exec -T client sed 's/\x1b\[[0-9;]*m//g' /tmp/e2e.log 2>/dev/null | tail -n 20
+  if [ "$up" != 1 ]; then
+    echo "  FAIL: onion did not come up from the coordinator-granted path"; fail=1
+  else
+    echo "  PASS: datapath redeemed the token and built the granted 3-hop onion"
+    code=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$DEST/cdn-cgi/trace" 2>/dev/null)
+    echo "  tunneled HTTP ${code:-none}"
+    if { [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; } 2>/dev/null; then
+      echo "  PASS: real traffic flows Portal-issued → Coordinator-granted → onion → $DEST"
+    else
+      echo "  FAIL: no traffic through the granted onion"; fail=1
+    fi
+  fi
+fi
+
+echo
+[ "$fail" = 0 ] && echo "RESULT: FULL-STACK E2E PASSED ✅" || echo "RESULT: FAILURES ❌"
+exit "$fail"

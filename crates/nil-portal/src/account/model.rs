@@ -25,7 +25,7 @@ impl From<Entitlement> for EntitlementDto {
 /// There is deliberately no email, no name, no signup IP, and no timestamp field — the
 /// absence *is* the privacy guarantee (a hard privacy invariant; architecture spec §7.5).
 /// Even a full Portal compromise yields no personal identity for an anonymous account.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
     /// `= H(secret)`; doubles as the store's lookup key.
     pub account_number: [u8; 32],

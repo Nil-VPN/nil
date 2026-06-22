@@ -23,6 +23,8 @@ pub mod path;
 pub mod amneziawg;
 #[cfg(feature = "pqwg")]
 pub mod pqwg;
+#[cfg(feature = "wstunnel")]
+pub mod wstunnel;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]
@@ -33,3 +35,5 @@ pub use path::PathTransport;
 pub use amneziawg::{AmneziaWgConfig, AmneziaWgTransport, ObfsParams};
 #[cfg(feature = "pqwg")]
 pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};
+#[cfg(feature = "wstunnel")]
+pub use wstunnel::{WstunnelConfig, WstunnelTransport};

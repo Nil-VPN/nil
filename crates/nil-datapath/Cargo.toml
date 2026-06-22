@@ -10,16 +10,23 @@ description = "NIL VPN client datapath: TUN device, routing, fail-closed kill-sw
 # The shared `launch` builder (env -> transport + TunnelConfig), reused by nil-cli and the
 # desktop GUI engine so they never drift. Pulls the MASQUE / PQ-WireGuard transports. Off by
 # default so a consumer needing only the Tunnel/pump over an externally-built transport stays light.
-launch = ["nil-transport/masque", "nil-transport/pqwg"]
+launch = [
+    "nil-transport/masque", "nil-transport/pqwg", "nil-transport/wstunnel",
+    "dep:nil-proto", "dep:reqwest", "dep:serde_json",   # client → Coordinator /v1/redeem
+]
 # Test/dev only: also accept the node's synthetic attestation report (Docker harness).
 synthetic-attest = ["launch", "nil-transport/synthetic-attest"]
 
 [dependencies]
 nil-core = { workspace = true }
 nil-transport = { workspace = true }   # the Transport trait (masque/pqwg pulled by `launch`)
+nil-proto = { workspace = true, optional = true }  # RedeemRequest / PathResponse DTOs (launch)
 tun-rs = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 getrandom = { workspace = true }       # per-connection attestation freshness nonce
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# Redeem a Privacy Pass token at the Coordinator. rustls (not OpenSSL) to match the project TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+serde_json = { workspace = true, optional = true }   # parse the Coordinator PathResponse (launch)

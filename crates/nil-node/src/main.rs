@@ -17,6 +17,7 @@ mod exit;
 mod hw;
 mod pqwg;
 mod server;
+mod wstunnel;
 
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
@@ -45,6 +46,9 @@ async fn main() -> Result<()> {
     if std::env::var("NW_NODE_AMNEZIA").is_ok() {
         tracing::info!("node mode: AmneziaWG responder (obfuscated WireGuard cascade fallback)");
         amneziawg::run(&cfg, exit.tun()).await?;
+    } else if std::env::var("NW_NODE_WSTUNNEL").is_ok() {
+        tracing::info!("node mode: wstunnel responder (WireGuard over WebSocket-over-TLS cascade fallback)");
+        wstunnel::run(&cfg, exit.tun()).await?;
     } else {
         let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;
         server::run(&cfg, &cert, exit.tun()).await?;

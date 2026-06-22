@@ -20,6 +20,8 @@ use nil_transport::Transport;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::tokens::StoredToken;
+
 /// Observable connection state, mirrored to the frontend as a lowercase string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,6 +40,8 @@ pub enum EngineError {
     NotConnected(ConnState),
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("no connection token — buy one before connecting")]
+    NoTokens,
 }
 
 /// What is currently connected.
@@ -80,7 +84,9 @@ impl AppEngine {
     }
 
     /// Connect: the real datapath if a node/path is configured (desktop), else the loopback mock.
-    pub async fn connect(&self) -> Result<ConnState, EngineError> {
+    /// `token` is the unblinded Privacy Pass token consumed for this session (required when a
+    /// Coordinator is configured; ignored on the loopback/mobile path).
+    pub async fn connect(&self, token: Option<StoredToken>) -> Result<ConnState, EngineError> {
         let mut g = self.0.lock().await;
         if g.state != ConnState::Disconnected {
             return Err(EngineError::NotDisconnected(g.state));
@@ -92,7 +98,7 @@ impl AppEngine {
         #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         {
             if nil_datapath::launch::is_configured() {
-                return match Self::bring_up_real().await {
+                return match Self::bring_up_configured(token).await {
                     Ok(tunnel) => {
                         g.active = Active::Tunnel(tunnel);
                         g.state = ConnState::Connected;
@@ -105,6 +111,8 @@ impl AppEngine {
                 };
             }
         }
+
+        let _ = token; // unused on the loopback / mobile path
 
         // Loopback fallback: open a session and round-trip a probe to prove the seam works.
         match Self::bring_up_loopback().await {
@@ -140,12 +148,22 @@ impl AppEngine {
         Ok((transport, session))
     }
 
-    /// Build the transport + config from the environment (shared with `nil-cli`) and bring up
-    /// the real attested tunnel.
+    /// Build the transport + config (shared with `nil-cli`) and bring up the real attested tunnel.
+    /// With a Coordinator configured (`NW_COORDINATOR_URL`), the path is redeemed using the
+    /// in-process `token` (no bearer credential in the environment); otherwise the path comes from
+    /// `NW_PATH` / a single `NW_NODE_HOST` and no token is needed.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
-    async fn bring_up_real() -> Result<nil_datapath::Tunnel, EngineError> {
-        let (transport, cfg) =
-            nil_datapath::launch::from_env().map_err(|e| EngineError::Transport(e.to_string()))?;
+    async fn bring_up_configured(token: Option<StoredToken>) -> Result<nil_datapath::Tunnel, EngineError> {
+        let (transport, cfg) = if let Ok(coord) = std::env::var("NW_COORDINATOR_URL") {
+            let tok = token.ok_or(EngineError::NoTokens)?;
+            nil_datapath::launch::from_env_with_token(&coord, &tok.msg, &tok.token)
+                .await
+                .map_err(|e| EngineError::Transport(e.to_string()))?
+        } else {
+            nil_datapath::launch::from_env()
+                .await
+                .map_err(|e| EngineError::Transport(e.to_string()))?
+        };
         // No node address in logs (SOUL §3 / PD-2); structured tracing, not raw stderr.
         tracing::debug!("bringing up real datapath");
         nil_datapath::Tunnel::up(transport, cfg)
@@ -198,7 +216,7 @@ mod tests {
         assert_unconfigured();
         let engine = AppEngine::new();
         assert_eq!(engine.state().await, ConnState::Disconnected);
-        assert_eq!(engine.connect().await.expect("connect"), ConnState::Connected);
+        assert_eq!(engine.connect(None).await.expect("connect"), ConnState::Connected);
         assert_eq!(engine.state().await, ConnState::Connected);
         assert_eq!(engine.disconnect().await.expect("disconnect"), ConnState::Disconnected);
     }
@@ -207,9 +225,9 @@ mod tests {
     async fn double_connect_is_rejected() {
         assert_unconfigured();
         let engine = AppEngine::new();
-        engine.connect().await.expect("first connect");
+        engine.connect(None).await.expect("first connect");
         assert!(matches!(
-            engine.connect().await,
+            engine.connect(None).await,
             Err(EngineError::NotDisconnected(ConnState::Connected))
         ));
         engine.disconnect().await.expect("cleanup");

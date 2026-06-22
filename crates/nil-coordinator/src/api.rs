@@ -16,15 +16,17 @@ use nil_proto::path::{MeasurementsResponse, PathRequest, PathResponse, PinnedMea
 use nil_proto::token::RedeemRequest;
 
 use crate::config::{from_hex, CoordConfig};
+use crate::nullifier::NullifierStore;
 
 /// Shared state: the immutable config + the durable spent-token nullifier set.
 #[derive(Clone)]
 pub struct CoordState {
     pub cfg: Arc<CoordConfig>,
     /// Spent token messages (hex). Identity-free — just "this token was already redeemed".
-    /// Durable across restarts (file-backed in production), or a restart would re-permit a
-    /// double-spend of every already-redeemed token.
-    pub nullifiers: Arc<DurableSet>,
+    /// Durable across restarts (file-backed, or clustered Postgres in production); a volatile set
+    /// would re-permit a double-spend of every already-redeemed token. Behind the
+    /// [`NullifierStore`] trait so the backend is swappable.
+    pub nullifiers: Arc<dyn NullifierStore>,
 }
 
 impl CoordState {
@@ -34,7 +36,7 @@ impl CoordState {
     }
 
     /// Production state with a caller-provided (durable) nullifier set.
-    pub fn with_nullifiers(cfg: Arc<CoordConfig>, nullifiers: Arc<DurableSet>) -> Self {
+    pub fn with_nullifiers(cfg: Arc<CoordConfig>, nullifiers: Arc<dyn NullifierStore>) -> Self {
         Self { cfg, nullifiers }
     }
 }
@@ -67,7 +69,7 @@ pub enum RedeemError {
 
 /// Core redemption logic (HTTP-free, unit-tested): verify the token, enforce single-use via
 /// the nullifier set, and select a trust-split path. Returns the path only on success.
-pub fn redeem_logic(state: &CoordState, req: &RedeemRequest) -> Result<PathResponse, RedeemError> {
+pub async fn redeem_logic(state: &CoordState, req: &RedeemRequest) -> Result<PathResponse, RedeemError> {
     let verifier = state.cfg.verifier.as_ref().ok_or(RedeemError::NotConfigured)?;
     let msg = from_hex(&req.msg).ok_or(RedeemError::Malformed)?;
     let token = from_hex(&req.token).ok_or(RedeemError::Malformed)?;
@@ -79,7 +81,7 @@ pub fn redeem_logic(state: &CoordState, req: &RedeemRequest) -> Result<PathRespo
     // the token itself — there is no account or identity in the nullifier set. We persist BEFORE
     // selecting a path, and fail closed if the record can't be made durable (a path granted on
     // an unpersisted nullifier would be double-spendable after a restart).
-    match state.nullifiers.insert(&req.msg) {
+    match state.nullifiers.insert_once(&req.msg).await {
         Ok(true) => {}                                        // newly spent — proceed
         Ok(false) => return Err(RedeemError::AlreadyRedeemed), // replay
         Err(e) => {
@@ -95,7 +97,7 @@ async fn redeem(
     State(state): State<CoordState>,
     Json(req): Json<RedeemRequest>,
 ) -> Result<Json<PathResponse>, StatusCode> {
-    match redeem_logic(&state, &req) {
+    match redeem_logic(&state, &req).await {
         Ok(path) => Ok(Json(path)),
         Err(RedeemError::NotConfigured) => Err(StatusCode::NOT_IMPLEMENTED),
         Err(RedeemError::Malformed) => Err(StatusCode::BAD_REQUEST),
@@ -169,18 +171,18 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    #[test]
-    fn valid_token_redeems_for_a_diverse_path_exactly_once() {
+    #[tokio::test]
+    async fn valid_token_redeems_for_a_diverse_path_exactly_once() {
         let (state, req) = state_and_token();
         // First redemption: a 3-hop trust-split path.
-        let path = redeem_logic(&state, &req).expect("valid token redeems");
+        let path = redeem_logic(&state, &req).await.expect("valid token redeems");
         assert_eq!(path.hops.len(), 3);
         // Replay: the same token is now spent (nullifier) — double-spend rejected.
-        assert!(matches!(redeem_logic(&state, &req), Err(RedeemError::AlreadyRedeemed)));
+        assert!(matches!(redeem_logic(&state, &req).await, Err(RedeemError::AlreadyRedeemed)));
     }
 
-    #[test]
-    fn redeemed_token_stays_spent_across_a_coordinator_restart() {
+    #[tokio::test]
+    async fn redeemed_token_stays_spent_across_a_coordinator_restart() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -198,29 +200,29 @@ mod tests {
 
         // Boot 1: file-backed nullifier. First redemption of this token succeeds.
         let boot1 = CoordState::with_nullifiers(cfg.clone(), Arc::new(DurableSet::open(&path).unwrap()));
-        assert!(redeem_logic(&boot1, &req).is_ok(), "first redemption succeeds");
+        assert!(redeem_logic(&boot1, &req).await.is_ok(), "first redemption succeeds");
         drop(boot1); // simulate a Coordinator crash/restart
 
         // Boot 2: same verifier, nullifier reloaded from the SAME file. The replayed token must
         // be rejected — this is the regression guard for the volatile-state double-spend bug.
         let boot2 = CoordState::with_nullifiers(cfg, Arc::new(DurableSet::open(&path).unwrap()));
         assert!(
-            matches!(redeem_logic(&boot2, &req), Err(RedeemError::AlreadyRedeemed)),
+            matches!(redeem_logic(&boot2, &req).await, Err(RedeemError::AlreadyRedeemed)),
             "a token redeemed before the restart must stay spent after it"
         );
 
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn forged_token_is_rejected() {
+    #[tokio::test]
+    async fn forged_token_is_rejected() {
         let (state, mut req) = state_and_token();
         req.token = hex(&vec![0u8; 256]); // not the issuer's signature
-        assert!(matches!(redeem_logic(&state, &req), Err(RedeemError::BadToken)));
+        assert!(matches!(redeem_logic(&state, &req).await, Err(RedeemError::BadToken)));
     }
 
-    #[test]
-    fn redemption_disabled_without_an_issuer_key() {
+    #[tokio::test]
+    async fn redemption_disabled_without_an_issuer_key() {
         let cfg = CoordConfig {
             addr: "127.0.0.1:9090".parse().unwrap(),
             registry: NodeRegistry::dev_default(),
@@ -230,6 +232,6 @@ mod tests {
         };
         let state = CoordState::new(Arc::new(cfg));
         let req = RedeemRequest { msg: "00".into(), token: "00".into() };
-        assert!(matches!(redeem_logic(&state, &req), Err(RedeemError::NotConfigured)));
+        assert!(matches!(redeem_logic(&state, &req).await, Err(RedeemError::NotConfigured)));
     }
 }

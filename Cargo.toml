@@ -16,6 +16,7 @@ members = [
     "crates/nil-node",
     "crates/nil-datapath",
     "crates/nil-cli",
+    "crates/nil-provision",
     "client/src-tauri",
 ]
 
@@ -72,6 +73,17 @@ boringtun = "0.7"                      # inner WireGuard Noise core (PQ PSK over
 # --- Phase 3: unlinkable payments (Privacy Pass blind tokens) ---
 blind-rsa-signatures = "0.17"          # RFC 9474 blind RSA signatures (issuer private / verifier public)
 # quinn = "0.11"                       # prototyping alt QUIC
+
+# --- Phase 4: wstunnel cascade rung (WireGuard over WebSocket-over-TLS) ---
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }  # WebSocket client/server
+tokio-rustls = "0.26"                  # TLS for the WS envelope (rustls, the project standard)
+rustls = "0.23"                        # custom no-verify config (security is the inner WireGuard)
+futures-util = "0.3"                   # split the WebSocket stream for the bidirectional pump
+
+# --- Clustered durable stores (optional `postgres` feature on nil-portal/nil-coordinator) ---
+# Off by default: the default build ships the file-backed durable stores and pulls no DB driver.
+# Production wires a rustls TLS connector (the connection is the deployment's responsibility).
+tokio-postgres = "0.7"                 # async Postgres client for the clustered account/nullifier stores
 
 # Internal crates (path deps — versioned together; explicit version silences
 # cargo-deny's wildcard-path warning).

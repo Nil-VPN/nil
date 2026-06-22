@@ -29,25 +29,45 @@ use crate::state::AppState;
 use crate::store::{file::FileStore, memory::InMemoryStore, Store};
 use crate::tokens::{token_router, TokenState};
 
+/// The non-Postgres account-store selection: durable JSON file (`NW_PORTAL_STORE`) or volatile
+/// in-memory (dev only). Shared by both `postgres`-feature configurations.
+fn file_or_memory_store() -> Result<Arc<dyn Store>> {
+    match std::env::var("NW_PORTAL_STORE") {
+        Ok(path) => {
+            let s = FileStore::open(&path).map_err(|e| anyhow::anyhow!("open account store {path}: {e}"))?;
+            tracing::info!(%path, "durable account store loaded");
+            Ok(Arc::new(s))
+        }
+        Err(_) => {
+            tracing::warn!("NW_PORTAL_STORE unset — accounts are VOLATILE (dev only; lost on restart)");
+            Ok(Arc::new(InMemoryStore::new()))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    // Account store: durable (JSON file) when NW_PORTAL_STORE is set; otherwise volatile
-    // in-memory + a warning (dev only). Both keep only PII-free records (ADR-0003).
-    let store: Arc<dyn Store> = match std::env::var("NW_PORTAL_STORE") {
-        Ok(path) => {
-            let s = FileStore::open(&path).map_err(|e| anyhow::anyhow!("open account store {path}: {e}"))?;
-            tracing::info!(%path, "durable account store loaded");
+    // Account store selection (ADR-0003), all PII-free:
+    //  - clustered Postgres when NW_PORTAL_PG_URL is set and the `postgres` feature is built;
+    //  - else durable JSON file when NW_PORTAL_STORE is set;
+    //  - else volatile in-memory + a warning (dev only).
+    #[cfg(feature = "postgres")]
+    let store: Arc<dyn Store> = match std::env::var("NW_PORTAL_PG_URL") {
+        Ok(url) => {
+            let s = store::postgres::PgStore::connect(&url)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect Postgres account store: {e}"))?;
+            tracing::info!("durable Postgres account store connected (clustered)");
             Arc::new(s)
         }
-        Err(_) => {
-            tracing::warn!("NW_PORTAL_STORE unset — accounts are VOLATILE (dev only; lost on restart)");
-            Arc::new(InMemoryStore::new())
-        }
+        Err(_) => file_or_memory_store()?,
     };
+    #[cfg(not(feature = "postgres"))]
+    let store: Arc<dyn Store> = file_or_memory_store()?;
 
     // Privacy Pass issuer: reload from NW_TOKEN_SECRET (hex DER) or mint a fresh key. The
     // PUBLIC key is logged so the operator can pin it in the Coordinator (NW_TOKEN_PUBKEY).
@@ -59,12 +79,39 @@ async fn main() -> Result<()> {
     // for confirmed transfers), else a dev mock.
     let watcher: Arc<dyn PaymentWatcher> = match std::env::var("NW_MONERO_RPC") {
         Ok(url) => {
-            tracing::info!(%url, "watching self-hosted monero-wallet-rpc for confirmed payments");
-            let w = Arc::new(MoneroRpcWatcher::new(url));
+            // Refuse a plaintext, non-loopback (unauthenticated) wallet-rpc before we ever poll it.
+            monero::validate_rpc_url(&url)?;
+            // Minimum accepted payment, atomic units (1 XMR = 1e12). Unset ⇒ accept any confirmed
+            // amount (dev only) + a loud warning — the founder sets the per-plan price.
+            let min_atomic = match std::env::var("NW_MONERO_MIN_ATOMIC").ok().map(|s| s.parse::<u64>()) {
+                Some(Ok(v)) => v,
+                Some(Err(_)) => anyhow::bail!("NW_MONERO_MIN_ATOMIC must be a u64 of atomic units"),
+                None => {
+                    tracing::warn!(
+                        "NW_MONERO_MIN_ATOMIC unset — accepting ANY confirmed amount (dev only; set \
+                         the per-plan minimum in atomic units, 1 XMR = 1_000_000_000_000)"
+                    );
+                    0
+                }
+            };
+            tracing::info!("watching self-hosted monero-wallet-rpc for confirmed payments");
+            let w = Arc::new(MoneroRpcWatcher::new(url, min_atomic));
             tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
             w
         }
-        Err(_) => Arc::new(MockWatcher::with_paid(std::iter::empty())),
+        // Dev only: seed the mock watcher with already-"paid" payment ids from NW_MOCK_PAID
+        // (comma-separated). Lets the integration harness mint a token without a live monerod;
+        // never use in production (NW_MONERO_RPC takes precedence above).
+        Err(_) => {
+            let paid: Vec<String> = std::env::var("NW_MOCK_PAID")
+                .ok()
+                .map(|s| s.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect())
+                .unwrap_or_default();
+            if !paid.is_empty() {
+                tracing::warn!(count = paid.len(), "NW_MOCK_PAID set — mock payment watcher (dev/integration only)");
+            }
+            Arc::new(MockWatcher::with_paid(paid))
+        }
     };
 
     // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning

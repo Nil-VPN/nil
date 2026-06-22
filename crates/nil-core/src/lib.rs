@@ -11,6 +11,7 @@
 
 pub mod checksum;
 pub mod durable;
+pub mod net;
 
 use serde::{Deserialize, Serialize};
 

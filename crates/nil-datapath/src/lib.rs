@@ -19,6 +19,8 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(feature = "launch")]
 pub mod launch;
+#[cfg(feature = "launch")]
+mod redeem;
 
 #[cfg(target_os = "linux")]
 mod linux;

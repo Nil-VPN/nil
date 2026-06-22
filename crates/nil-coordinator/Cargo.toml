@@ -6,6 +6,12 @@ license.workspace = true
 rust-version.workspace = true
 description = "NIL VPN Control plane: node registry, trust-split path selection, token verifier."
 
+[features]
+default = []
+# Clustered, cross-instance nullifier set (PgNullifierStore) for multi-coordinator deployments.
+# Off by default — the default build ships the file-backed DurableSet and pulls no DB driver.
+postgres = ["dep:tokio-postgres"]
+
 [dependencies]
 nil-core = { workspace = true }     # durable nullifier set (restart-safe single-use)
 nil-proto = { workspace = true }
@@ -15,5 +21,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+async-trait = { workspace = true }  # the swappable NullifierStore trait
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Clustered nullifier set (PgNullifierStore), behind the `postgres` feature.
+tokio-postgres = { workspace = true, optional = true }

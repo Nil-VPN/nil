@@ -1,9 +1,14 @@
 # Reproducible build of the PRODUCTION nil-node — the binary whose SHA-256 is "the
-# measurement" the Coordinator pins and clients appraise. No `synthetic-attest`, exact
-# toolchain, deterministic flags. Built twice (deploy/reproducible-build.sh) it must hash
-# identically. Honest note: this dev measurement is the hash of the userspace ELF; a real
-# SEV-SNP/TDX measurement covers the whole guest launch state (firmware+kernel+initrd+cmdline).
-# The *interface* (a pinned hex the client appraises) is identical when the real source swaps in.
+# measurement" the Coordinator pins and clients appraise. Built with `hw-attest` (the real
+# SEV-SNP/TDX report provider) and WITHOUT `synthetic-attest`, so the measured binary is the
+# one that actually runs in the TEE. Exact toolchain, deterministic flags. Built twice
+# (deploy/reproducible-build.sh) it must hash identically.
+# Honest note: this dev measurement is the hash of the userspace ELF; a real SEV-SNP/TDX
+# measurement covers the whole guest launch state (firmware+kernel+initrd+cmdline). The
+# *interface* (a pinned hex the client appraises) is identical when the real source swaps in.
+# TODO(prod): pin the base by digest — `FROM rust:1.96.0-bookworm@sha256:<digest>` — so a
+# re-tag of the floating tag can't change the measurement (resolve via `docker buildx
+# imagetools inspect rust:1.96.0-bookworm`).
 FROM rust:1.96.0-bookworm AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
@@ -16,4 +21,4 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
 WORKDIR /build
 COPY . .
 # No cache mounts here — a clean, hermetic build each time so the double-build comparison is meaningful.
-RUN cargo build --release --locked -p nil-node && cp target/release/nil-node /nil-node
+RUN cargo build --release --locked -p nil-node --features hw-attest && cp target/release/nil-node /nil-node
