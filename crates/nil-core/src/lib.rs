@@ -46,13 +46,45 @@ pub enum Profile {
     Internal,
 }
 
-/// Where to reach a node. In later phases this carries the node's public key and
-/// the expected TEE measurement; Phase 0 keeps it to addressing only.
+/// Which TEE family produced an attestation report. The verifier (`nil-attest`) picks the
+/// parse + signature-chain path from this. Kept here (not in `nil-attest`) so `NodeEndpoint`
+/// can carry an expectation without a dependency cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Tee {
+    /// AMD SEV-SNP.
+    SevSnp,
+    /// Intel TDX.
+    Tdx,
+}
+
+/// An expected code measurement, opaque bytes compared for equality during appraisal. For
+/// SEV-SNP this is the 48-byte launch `MEASUREMENT`; for TDX a domain-separated digest over
+/// the TD measurements (`MRTD`/`RTMR`s) so both TEEs compare uniformly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Measurement(pub Vec<u8>);
+
+/// What the client expects a node to attest to — the Coordinator publishes this and the
+/// client refuses to tunnel unless the node's report matches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttestExpectation {
+    pub tee: Tee,
+    pub measurement: Measurement,
+}
+
+/// Where to reach a node, plus (from Phase 2) the node's WireGuard static public key and the
+/// expected TEE attestation. Loopback/pre-attestation endpoints leave the optionals `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeEndpoint {
     pub host: String,
     pub port: u16,
     pub kind: TransportKind,
+    /// The node's WireGuard static public key (Curve25519) for the inner PQ-WireGuard
+    /// handshake. `None` for loopback or transports without an inner WG layer.
+    pub wg_pub: Option<[u8; 32]>,
+    /// What the node must attest to before any packet flows. `None` disables appraisal
+    /// (loopback / tests only — a real MASQUE endpoint always carries one).
+    pub expected: Option<AttestExpectation>,
 }
 
 impl NodeEndpoint {
@@ -62,6 +94,8 @@ impl NodeEndpoint {
             host: "loopback".to_string(),
             port: 0,
             kind: TransportKind::Loopback,
+            wg_pub: None,
+            expected: None,
         }
     }
 }
@@ -72,12 +106,17 @@ impl NodeEndpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     pub token: Vec<u8>,
+    /// Fresh per-connection nonce. The client generates it, sends it to the node in the
+    /// RA-TLS challenge, and `nil-attest` requires it to be bound into the report's
+    /// `report_data` — proving the report was minted for *this* connection (freshness).
+    pub nonce: [u8; 32],
 }
 
 impl Grant {
-    /// A placeholder grant for transports (e.g. loopback) that don't check it yet.
+    /// A placeholder grant for transports (e.g. loopback) that don't check it yet. The
+    /// zero nonce is fine here because loopback performs no attestation.
     pub fn mock() -> Self {
-        Self { token: Vec::new() }
+        Self { token: Vec::new(), nonce: [0u8; 32] }
     }
 }
 

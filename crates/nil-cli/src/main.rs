@@ -38,7 +38,13 @@ async fn main() -> Result<()> {
 
     let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::new());
     let cfg = TunnelConfig {
-        node: NodeEndpoint { host: host.clone(), port, kind: TransportKind::Masque },
+        node: NodeEndpoint {
+            host: host.clone(),
+            port,
+            kind: TransportKind::Masque,
+            wg_pub: None,     // wired from NW_NODE_WG_PUB in the PqWgTransport step
+            expected: None,   // wired from the Coordinator's pinned measurement in the wiring step
+        },
         tun_name,
         client_ip,
         peer_ip,

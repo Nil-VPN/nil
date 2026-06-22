@@ -7,4 +7,28 @@ rust-version.workspace = true
 description = "NIL VPN attestation: SEV-SNP/TDX report parse + RA-TLS appraisal (Phase 2)."
 
 [dependencies]
+nil-core = { workspace = true }                 # shared Tee / Measurement / AttestExpectation
+sev = { workspace = true }                      # AMD SEV-SNP report parse + cert-chain verification
+dcap-qvl = { workspace = true }                 # Intel TDX DCAP quote verification (offline)
+x509-parser = { workspace = true }              # RA-TLS leaf cert + custom report extension
+serde_json = { workspace = true }               # TDX DCAP collateral is JSON
+sha2 = { workspace = true }                     # report_data binding (SHA-256/512)
+subtle = { workspace = true }                   # constant-time measurement/nonce comparison
 thiserror = { workspace = true }
+# Synthetic attestation signer/verifier (Ed25519) — only compiled with the `synthetic` feature.
+ed25519-dalek = { version = "2", optional = true }
+
+[features]
+# Test-only synthetic attestation: a report signed by an Ed25519 CA we control, so the Docker
+# accept/reject harness needs no real TEE hardware. NEVER enabled in a release client — the
+# synthetic trust anchor is unreachable without this feature.
+synthetic = ["dep:ed25519-dalek"]
+
+[dev-dependencies]
+hex = "0.4"
+serde_json = { workspace = true }
+chrono = "0.4"
+x509-cert = "0.2"
+der = "0.7"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand_core = { workspace = true }

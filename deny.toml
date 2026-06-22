@@ -5,7 +5,14 @@
 version = 2
 # Fail on any security advisory in the dependency graph. Add IDs here only with a
 # documented justification.
-ignore = []
+ignore = [
+    # Marvin Attack (timing sidechannel in the `rsa` crate), pulled transitively by `sev`
+    # to verify the AMD ARK/ASK RSA-4096 certificate chain. The sidechannel affects RSA
+    # PRIVATE-key operations (decryption/signing); `nil-attest` only ever VERIFIES signatures
+    # with AMD's PUBLIC keys — it performs no RSA private-key operation — so the attack does
+    # not apply to our usage. No fixed `rsa` release exists yet; revisit when one ships.
+    "RUSTSEC-2023-0071",
+]
 # Gate "unmaintained" status on our OWN (workspace + direct) dependencies. Deep
 # transitive platform bindings pulled by Tauri's Linux webview (the gtk-rs GTK3 crates,
 # RUSTSEC-2024-0411..0420) are unmaintained upstream and tracked by Tauri's own GTK4
