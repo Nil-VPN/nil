@@ -40,6 +40,38 @@ pub const MAX_VARINT: u64 = (1u64 << 62) - 1;
 /// payload to pick a safe TUN MTU.
 pub const MAX_FRAMING_OVERHEAD: usize = 8 + 1;
 
+/// Lowercase-hex encode (for the attestation nonce/report H3 header values). Shared by the
+/// client and node so the encoding can't drift.
+pub fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// Decode lowercase/uppercase hex bytes; `None` on odd length or a non-hex byte.
+pub fn from_hex(hex: &[u8]) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    fn nibble(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
 /// Encode an IP packet into a CONNECT-IP HTTP Datagram payload: `[ varint(0) | ip ]`.
 /// Context 0 encodes to a single `0x00` byte, so the result is `1 + ip.len()` bytes.
 pub fn encode(ip: &[u8]) -> Vec<u8> {

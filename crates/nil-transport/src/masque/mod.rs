@@ -493,7 +493,7 @@ fn attest_peer(
         .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
     let report_hex = header_value(headers, connectip::ATTEST_REPORT_HEADER.as_bytes())
         .ok_or_else(|| Error::Transport("attestation failed: node returned no report".into()))?;
-    let evidence = hex_decode(report_hex)
+    let evidence = connectip::from_hex(report_hex)
         .ok_or_else(|| Error::Transport("attestation failed: malformed report header".into()))?;
     let verdict = appraise(&evidence, &spki, policy, nonce)
         .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
@@ -507,26 +507,6 @@ fn header_value<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'
     headers.iter().find(|h| h.name() == name).map(|h| h.value())
 }
 
-/// Decode lowercase/uppercase hex bytes to a byte vector (reverse of [`hex32`]).
-fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    fn nibble(c: u8) -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for pair in hex.chunks_exact(2) {
-        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
-    }
-    Some(out)
-}
-
 fn connect_ip_headers(authority: &str, nonce: &[u8; 32]) -> Vec<quiche::h3::Header> {
     use quiche::h3::Header;
     vec![
@@ -538,19 +518,8 @@ fn connect_ip_headers(authority: &str, nonce: &[u8; 32]) -> Vec<quiche::h3::Head
         Header::new(b"capsule-protocol", b"?1"),
         // RA-TLS freshness challenge: the node must bind this nonce into its report's
         // report_data, proving the report was minted for this connection.
-        Header::new(connectip::ATTEST_NONCE_HEADER.as_bytes(), hex32(nonce).as_bytes()),
+        Header::new(connectip::ATTEST_NONCE_HEADER.as_bytes(), connectip::to_hex(nonce).as_bytes()),
     ]
-}
-
-/// Lowercase hex of a 32-byte value (header-safe; avoids a hex dependency).
-fn hex32(b: &[u8; 32]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(64);
-    for &x in b {
-        s.push(HEX[(x >> 4) as usize] as char);
-        s.push(HEX[(x & 0xf) as usize] as char);
-    }
-    s
 }
 
 fn status_of(list: &[quiche::h3::Header]) -> Option<u16> {
