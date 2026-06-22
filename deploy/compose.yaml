@@ -1,0 +1,43 @@
+# Host-safe Phase 1 verification: a MASQUE node + a headless client in throwaway
+# containers on a private bridge. Nothing touches the host's networking.
+#   cd deploy && ./verify.sh        (build, run, prove tunnel + kill-switch, tear down)
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["nil-node"]
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - RUST_LOG=info,nil_node=debug
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      nilnet:
+        ipv4_address: 10.80.0.10
+
+  client:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["sleep", "infinity"] # the tunnel + curl checks are driven by verify.sh
+    environment:
+      - NW_NODE_HOST=10.80.0.10
+      - NW_NODE_PORT=443
+      - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    depends_on: [node]
+    networks:
+      nilnet:
+
+networks:
+  nilnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.80.0.0/24

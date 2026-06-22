@@ -5,6 +5,8 @@
 //! formats and API DTOs live in `nil-proto`; this crate stays free of serde framing
 //! decisions so the transport seam never recompiles when the wire format evolves.
 
+pub mod checksum;
+
 use serde::{Deserialize, Serialize};
 
 /// Opaque identifier for a live transport session.

@@ -24,8 +24,18 @@ impl Exit {
             .map_err(|e| anyhow::anyhow!("create TUN {}: {e}", cfg.tun_name))?;
         tracing::info!(tun = %cfg.tun_name, ip = %cfg.node_tun_ip, mtu = cfg.mtu, "TUN up");
 
+        // Disable TX checksum offload: a TUN otherwise hands userspace forwarded packets
+        // with partial (CHECKSUM_PARTIAL) L4 checksums, which we'd relay verbatim and the
+        // peer would drop. With it off the kernel finalizes checksums.
+        if let Err(e) = sh("ethtool", &["-K", &cfg.tun_name, "tx", "off"]) {
+            tracing::warn!("ethtool disable tx offload on {}: {e}", cfg.tun_name);
+        }
+
         // Forward + NAT the tunnel subnet out the egress interface (Linux).
-        sh("sysctl", &["-w", "net.ipv4.ip_forward=1"])?;
+        // ip_forward is also set via the compose `sysctls:` key, so this is best-effort.
+        if let Err(e) = sh("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
+            tracing::warn!("sysctl ip_forward (continuing; likely already set by the container): {e}");
+        }
         sh(
             "iptables",
             &["-t", "nat", "-A", "POSTROUTING", "-s", &cfg.tunnel_cidr, "-o", &cfg.egress, "-j", "MASQUERADE"],

@@ -449,11 +449,23 @@ fn build_client_config(insecure_dev: bool) -> Result<quiche::Config> {
     config.set_initial_max_streams_uni(100);
     config.enable_dgram(true, 65536, 65536);
     if insecure_dev {
-        // Phase 1 dev only — NOT attestation. Replaced by nil-attest RA-TLS in Phase 2.
-        config.verify_peer(false);
-        tracing::warn!(
-            "DEV INSECURE: TLS peer verification DISABLED — connection is NOT attested (Phase 1 dev only)"
-        );
+        // The insecure path only exists when the `dev-insecure` feature is compiled in, so a
+        // build without it can NEVER silently skip TLS verification (defense against the
+        // feature leaking into a shipped binary).
+        #[cfg(feature = "dev-insecure")]
+        {
+            // Phase 1 dev only — NOT attestation. Replaced by nil-attest RA-TLS in Phase 2.
+            config.verify_peer(false);
+            tracing::warn!(
+                "DEV INSECURE: TLS peer verification DISABLED — connection is NOT attested (Phase 1 dev only)"
+            );
+        }
+        #[cfg(not(feature = "dev-insecure"))]
+        {
+            tracing::error!(
+                "insecure_dev requested but the `dev-insecure` feature is not built in — keeping TLS verification ON"
+            );
+        }
     }
     Ok(config)
 }

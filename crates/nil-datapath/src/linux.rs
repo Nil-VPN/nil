@@ -25,6 +25,12 @@ impl NetControl for LinuxNet {
         self.node_ip = Some(p.node_ip);
         self.tun_name = Some(p.tun_name.clone());
 
+        // 0. Disable TX checksum offload on the TUN — otherwise the kernel hands us packets
+        //    with partial L4 checksums that the node/peer then drops (TUN offload gotcha).
+        if let Err(e) = sh("ethtool", &["-K", &p.tun_name, "tx", "off"]) {
+            tracing::warn!("ethtool disable tx offload on {}: {e}", p.tun_name);
+        }
+
         // 1. Capture the original default route so we can restore it.
         self.orig_default = capture_default_route();
 

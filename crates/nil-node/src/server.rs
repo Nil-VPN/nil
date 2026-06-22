@@ -66,7 +66,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             r = tun.recv(&mut tun_buf) => {
                 match r {
                     Ok(n) => {
-                        // Internet reply → encapsulate to the established client.
+                        // Internet reply → finalize checksums (the kernel may hand us a
+                        // partial-checksum forwarded packet) → encapsulate to the client.
+                        nil_core::checksum::fix_ipv4_checksums(&mut tun_buf[..n]);
                         if let Some(client) = clients.values_mut().find(|c| c.tunnel_up) {
                             let dg = connectip::encode_datagram(client.flow_id, &tun_buf[..n]);
                             let _ = client.conn.dgram_send(&dg);

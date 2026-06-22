@@ -1,10 +1,15 @@
 //! The connection lifecycle / state machine (architecture spec §9).
 //!
-//! Phase 0 is a *mock*: it drives the real [`Transport`] seam through the in-memory
-//! loopback echo transport, so the UI and the state machine are exercised end to end
-//! without a real tunnel. All tunnel logic stays behind the `Transport` trait — the
-//! engine never knows which transport is active. Phase 1 swaps loopback for MASQUE
-//! with zero changes here.
+//! The desktop GUI drives the real [`Transport`] seam through the in-memory loopback echo
+//! transport, so the UI and state machine are exercised end to end without touching the
+//! host network. All tunnel logic stays behind the `Transport` trait — the engine never
+//! knows which transport is active.
+//!
+//! The real MASQUE datapath shipped in Phase 1 lives in `nil-cli` and `nil-datapath`
+//! (verified in Docker). Wiring it into this macOS GUI engine (`utun`, `pf` kill-switch,
+//! DNS) is **Phase 1b**; until then the GUI stays on the loopback mock so it never
+//! half-changes your real networking. Swapping the transport here is a one-line change
+//! once the macOS datapath lands.
 
 use std::sync::Arc;
 

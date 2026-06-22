@@ -148,6 +148,8 @@ fn spawn_pumps(
                     _ = cancel.cancelled() => break,
                     r = tun.recv(&mut buf) => match r {
                         Ok(n) => {
+                            // Finalize checksums in case the kernel handed us a partial-checksum packet.
+                            nil_core::checksum::fix_ipv4_checksums(&mut buf[..n]);
                             if transport.send(&session, IpPacket::new(buf[..n].to_vec())).await.is_err() {
                                 break; // tunnel closed → kill-switch holds
                             }
