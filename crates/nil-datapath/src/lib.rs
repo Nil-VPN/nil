@@ -17,6 +17,8 @@ use tokio_util::sync::CancellationToken;
 
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// How to bring up the tunnel.
 pub struct TunnelConfig {
@@ -47,10 +49,12 @@ pub trait NetControl: Send {
 
 /// Fallback for non-Linux targets (macOS datapath is Phase 1b). Compiles everywhere so the
 /// workspace builds on macOS; refuses to arm at runtime.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 struct StubNet;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl NetControl for StubNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
-        anyhow::bail!("system datapath is Linux-only in Phase 1 (macOS utun/pf is Phase 1b)")
+        anyhow::bail!("system datapath is implemented for Linux and macOS only")
     }
     fn teardown(&mut self) {}
 }
@@ -59,7 +63,11 @@ impl NetControl for StubNet {
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(linux::LinuxNet::default())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn new_net_control() -> Box<dyn NetControl> {
+    Box::new(macos::MacNet::default())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(StubNet)
 }
@@ -87,11 +95,13 @@ impl Tunnel {
         tracing::info!("tunnel session established; bringing up TUN + routes");
 
         let tun = Arc::new(open_tun(&cfg).map_err(|e| anyhow::anyhow!("open tun: {e}"))?);
+        // Resolve the actual interface name (macOS auto-assigns utunN; Linux honors our name).
+        let tun_name = tun.name().map_err(|e| anyhow::anyhow!("tun name: {e}"))?;
 
         let mut net = new_net_control();
         if let Err(e) = net.arm(&ArmParams {
             node_ip,
-            tun_name: cfg.tun_name.clone(),
+            tun_name: tun_name.clone(),
             dns: cfg.dns.clone(),
             kill_switch: cfg.kill_switch,
         }) {
@@ -103,7 +113,7 @@ impl Tunnel {
 
         let cancel = CancellationToken::new();
         let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
-        tracing::info!(tun = %cfg.tun_name, client_ip = %cfg.client_ip, "tunnel up");
+        tracing::info!(tun = %tun_name, client_ip = %cfg.client_ip, "tunnel up");
 
         Ok(Tunnel { transport, session: Some(session), net, cancel, pumps, _tun: tun })
     }
@@ -125,11 +135,16 @@ impl Tunnel {
 }
 
 fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
-    tun_rs::DeviceBuilder::new()
-        .name(cfg.tun_name.clone())
+    #[allow(unused_mut)]
+    let mut builder = tun_rs::DeviceBuilder::new()
         .ipv4(cfg.client_ip, cfg.prefix, Some(cfg.peer_ip))
-        .mtu(cfg.mtu)
-        .build_async()
+        .mtu(cfg.mtu);
+    // macOS requires a `utun*` name (auto-assigned); Linux honors our chosen name.
+    #[cfg(target_os = "linux")]
+    {
+        builder = builder.name(cfg.tun_name.clone());
+    }
+    builder.build_async()
 }
 
 fn spawn_pumps(
