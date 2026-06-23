@@ -4,14 +4,16 @@ import * as api from "./lib/commands";
 import type { AnonymousAccount } from "./lib/types";
 import { ErrorBanner } from "./components";
 import {
+  BuyTokensScreen,
   EmailSignupScreen,
   FirstRunScreen,
   MainScreen,
   RecoverAccountScreen,
   RecoveryPhraseScreen,
+  SettingsScreen,
 } from "./screens";
 
-type Screen = "firstrun" | "email" | "phrase" | "recover" | "main";
+type Screen = "firstrun" | "email" | "phrase" | "recover" | "main" | "buy" | "settings";
 
 function App() {
   const [screen, setScreen] = useState<Screen>("firstrun");
@@ -61,6 +63,21 @@ function App() {
     }
   }
 
+  async function handleBuy(paymentId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.buyTokens(paymentId);
+      setScreen("main"); // balance refreshes on the main screen
+    } catch (e) {
+      // The Rust side returns honest, user-facing messages (e.g. payment not confirmed,
+      // already issued) — surface them verbatim.
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <main className="app">
       <ErrorBanner message={error} onDismiss={() => setError(null)} />
@@ -74,23 +91,21 @@ function App() {
         />
       )}
       {screen === "email" && (
-        <EmailSignupScreen
-          busy={busy}
-          onSubmit={handleEmail}
-          onBack={() => setScreen("firstrun")}
-        />
+        <EmailSignupScreen busy={busy} onSubmit={handleEmail} onBack={() => setScreen("firstrun")} />
       )}
       {screen === "phrase" && account && (
         <RecoveryPhraseScreen account={account} onContinue={() => setScreen("main")} />
       )}
       {screen === "recover" && (
-        <RecoverAccountScreen
-          busy={busy}
-          onSubmit={handleRecover}
-          onBack={() => setScreen("firstrun")}
-        />
+        <RecoverAccountScreen busy={busy} onSubmit={handleRecover} onBack={() => setScreen("firstrun")} />
       )}
-      {screen === "main" && <MainScreen onError={showError} />}
+      {screen === "main" && <MainScreen onError={showError} onNavigate={setScreen} />}
+      {screen === "buy" && (
+        <BuyTokensScreen busy={busy} onBuy={handleBuy} onBack={() => setScreen("main")} />
+      )}
+      {screen === "settings" && (
+        <SettingsScreen onError={showError} onBack={() => setScreen("main")} />
+      )}
     </main>
   );
 }

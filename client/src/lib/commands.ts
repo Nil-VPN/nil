@@ -4,7 +4,13 @@
 // string — callers catch it and show an error banner.
 
 import { invoke } from "@tauri-apps/api/core";
-import type { AnonymousAccount, ConnState, Location, RecoverResult } from "./types";
+import type {
+  AnonymousAccount,
+  ConnState,
+  Location,
+  PortalConfig,
+  RecoverResult,
+} from "./types";
 
 export const createAnonymousAccount = () =>
   invoke<AnonymousAccount>("create_anonymous_account");
@@ -26,3 +32,12 @@ export const setSplitTunnel = (enabled: boolean, apps: string[]) =>
   invoke<void>("set_split_tunnel", { enabled, apps });
 export const toggleKillSwitch = (enabled: boolean) =>
   invoke<void>("toggle_kill_switch", { enabled });
+
+// Tokens: buy (blind→issue→finalize against the Portal) and the local on-device count.
+export const buyTokens = (paymentId: string) =>
+  invoke<number>("buy_tokens", { paymentId });
+export const tokenBalance = () => invoke<number>("token_balance");
+
+// Settings: operator endpoints + toggles, persisted and applied to the datapath.
+export const getConfig = () => invoke<PortalConfig>("get_config");
+export const setConfig = (cfg: PortalConfig) => invoke<void>("set_config", { cfg });

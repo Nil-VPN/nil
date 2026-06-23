@@ -308,3 +308,89 @@ h2 {
   cursor: pointer;
   padding: 0 4px;
 }
+
+/* Top bar (balance + settings) */
+.topbar {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.icon-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  font-size: 16px;
+  width: 34px;
+  height: 34px;
+  cursor: pointer;
+}
+
+.icon-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+/* Token balance badge */
+.badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  background: rgba(63, 182, 168, 0.1);
+}
+
+.badge-empty {
+  border-color: var(--border);
+  color: var(--muted);
+  background: none;
+}
+
+/* Honest-limits block */
+.limits {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+  text-align: left;
+}
+
+.limits h3 {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin: 0 0 8px;
+}
+
+.limits ul {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.limits li {
+  margin-bottom: 6px;
+}
+
+/* Settings disclosure */
+details {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 12px;
+}
+
+details > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+details[open] > summary {
+  margin-bottom: 10px;
+}
