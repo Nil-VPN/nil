@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import * as api from "./lib/commands";
-import type { AnonymousAccount, ConnState } from "./lib/types";
-import { HonestyBanner, StatusPill } from "./components";
+import type { AnonymousAccount, ConnState, PortalConfig } from "./lib/types";
+import { HonestLimits, HonestyBanner, StatusPill, TokenBalanceBadge } from "./components";
 
 /** First-run: choose how to create/recover an account. Anonymous is the default. */
 export function FirstRunScreen({
@@ -184,15 +184,30 @@ export function EmailSignupScreen({
   );
 }
 
-/** Main screen: connect/disconnect toggle + status, driven by the loopback engine. */
-export function MainScreen({ onError }: { onError: (msg: string) => void }) {
+/** Main screen: connect/disconnect + status + on-device token balance, driven by the engine. */
+export function MainScreen({
+  onError,
+  onNavigate,
+}: {
+  onError: (msg: string) => void;
+  onNavigate: (screen: "buy" | "settings") => void;
+}) {
   const [state, setState] = useState<ConnState>("disconnected");
+  const [balance, setBalance] = useState<number | null>(null);
+  const [cfg, setCfg] = useState<PortalConfig | null>(null);
 
   useEffect(() => {
     api.status().then(setState).catch((e) => onError(String(e)));
+    api.tokenBalance().then(setBalance).catch(() => setBalance(null));
+    api.getConfig().then(setCfg).catch(() => setCfg(null));
   }, [onError]);
 
   const busy = state === "connecting" || state === "disconnecting";
+  const connected = state === "connected";
+  // A real (attested) path is configured when a Coordinator URL is set.
+  const realPath = !!cfg && cfg.coordinator_url.trim().length > 0;
+  // Fail-closed: with a Coordinator configured you need a token to connect.
+  const needToken = realPath && balance === 0;
 
   async function toggle() {
     try {
@@ -206,18 +221,26 @@ export function MainScreen({ onError }: { onError: (msg: string) => void }) {
     } catch (e) {
       onError(String(e));
       setState(await api.status().catch(() => "disconnected" as ConnState));
+    } finally {
+      api.tokenBalance().then(setBalance).catch(() => {});
     }
   }
 
-  const connected = state === "connected";
   return (
     <div className="screen main">
+      <div className="topbar">
+        <TokenBalanceBadge count={balance} />
+        <button className="icon-btn" title="Settings" onClick={() => onNavigate("settings")}>
+          ⚙
+        </button>
+      </div>
+
       <h1 className="brand">NIL VPN</h1>
       <StatusPill state={state} />
 
       <button
         className={`toggle ${connected ? "toggle-on" : "toggle-off"}`}
-        disabled={busy}
+        disabled={busy || needToken}
         onClick={toggle}
       >
         {connected ? "Disconnect" : "Connect"}
@@ -225,9 +248,182 @@ export function MainScreen({ onError }: { onError: (msg: string) => void }) {
 
       <p className="hint">
         {connected
-          ? "Connected via NIL (Phase 0 demo: loopback transport — no real tunnel yet)."
-          : "Tap Connect to exercise the engine through the loopback transport."}
+          ? realPath
+            ? "Connected through an attested node — the client verified its hardware report before any packet flowed."
+            : "Connected via the in-memory loopback transport (no Coordinator configured — no real tunnel)."
+          : needToken
+            ? "Buy a connection token to connect (fail-closed — no token, no tunnel)."
+            : realPath
+              ? "Tap Connect to redeem a token and bring up the attested tunnel."
+              : "Tap Connect to exercise the engine through the loopback transport."}
       </p>
+
+      <button className="btn btn-secondary" disabled={busy} onClick={() => onNavigate("buy")}>
+        Buy connection tokens
+      </button>
+
+      <HonestLimits />
+    </div>
+  );
+}
+
+/** Buy connection tokens: pay (Monero / comp id), then claim a blind-signed, unlinkable token. */
+export function BuyTokensScreen({
+  busy,
+  onBuy,
+  onBack,
+}: {
+  busy: boolean;
+  onBuy: (paymentId: string) => void;
+  onBack: () => void;
+}) {
+  const [paymentId, setPaymentId] = useState("");
+  const [cfg, setCfg] = useState<PortalConfig | null>(null);
+  useEffect(() => {
+    api.getConfig().then(setCfg).catch(() => setCfg(null));
+  }, []);
+
+  const address = cfg?.monero_address?.trim() ?? "";
+  return (
+    <div className="screen">
+      <h2>Buy connection tokens</h2>
+      <p className="hint">
+        Pay, then claim a token. The token is blind-signed, so what you pay is mathematically
+        unlinkable to what you do (Pillar 4). One token = one connection; top up anytime.
+      </p>
+
+      {address ? (
+        <div className="field">
+          <span className="field-label">Monero deposit address</span>
+          <code className="code">{address}</code>
+          <span className="hint">Send payment, then enter the payment id you received below.</span>
+        </div>
+      ) : (
+        <p className="hint">
+          No Monero address is configured. For the closed alpha, enter a comp / invite payment id
+          from the operator. (Set a deposit address in Settings for self-serve Monero.)
+        </p>
+      )}
+
+      <label className="field">
+        <span className="field-label">Payment id</span>
+        <input
+          className="input"
+          value={paymentId}
+          placeholder="payment-or-comp-id"
+          onChange={(e) => setPaymentId(e.target.value)}
+        />
+      </label>
+
+      <button
+        className="btn btn-primary"
+        disabled={busy || paymentId.trim().length === 0}
+        onClick={() => onBuy(paymentId.trim())}
+      >
+        Claim token
+      </button>
+      <button className="link" disabled={busy} onClick={onBack}>
+        ← Back
+      </button>
+    </div>
+  );
+}
+
+/** Settings: operator endpoints + toggles. "Restore live defaults" points at api/ctrl.nilvpn.com. */
+export function SettingsScreen({
+  onError,
+  onBack,
+}: {
+  onError: (msg: string) => void;
+  onBack: () => void;
+}) {
+  const [cfg, setCfg] = useState<PortalConfig | null>(null);
+  const [saved, setSaved] = useState(false);
+  useEffect(() => {
+    api.getConfig().then(setCfg).catch((e) => onError(String(e)));
+  }, [onError]);
+
+  if (!cfg) {
+    return (
+      <div className="screen">
+        <h2>Settings</h2>
+        <p className="hint">Loading…</p>
+      </div>
+    );
+  }
+
+  const set = (patch: Partial<PortalConfig>) => {
+    setCfg({ ...cfg, ...patch });
+    setSaved(false);
+  };
+
+  async function save() {
+    try {
+      await api.setConfig(cfg!);
+      setSaved(true);
+    } catch (e) {
+      onError(String(e));
+    }
+  }
+
+  return (
+    <div className="screen">
+      <h2>Settings</h2>
+      <label className="field">
+        <span className="field-label">Portal URL (accounts + tokens)</span>
+        <input className="input" value={cfg.portal_url} onChange={(e) => set({ portal_url: e.target.value })} />
+      </label>
+      <label className="field">
+        <span className="field-label">Coordinator URL (attested path)</span>
+        <input className="input" value={cfg.coordinator_url} onChange={(e) => set({ coordinator_url: e.target.value })} />
+        <span className="hint">Empty = loopback dev mode (no real tunnel).</span>
+      </label>
+      <label className="field">
+        <span className="field-label">Monero deposit address (optional)</span>
+        <input className="input" value={cfg.monero_address} onChange={(e) => set({ monero_address: e.target.value })} />
+      </label>
+      <label className="checkbox">
+        <input
+          type="checkbox"
+          checked={cfg.kill_switch}
+          onChange={(e) => set({ kill_switch: e.target.checked })}
+        />
+        Kill-switch — block all traffic if the tunnel drops (recommended).
+      </label>
+
+      <details>
+        <summary>Advanced</summary>
+        <label className="field">
+          <span className="field-label">Direct node host (bypass Coordinator)</span>
+          <input className="input" value={cfg.node_host} onChange={(e) => set({ node_host: e.target.value })} />
+        </label>
+        <label className="field">
+          <span className="field-label">Pinned measurement (hex; blank on the Coordinator path)</span>
+          <input className="input" value={cfg.expected_measurement} onChange={(e) => set({ expected_measurement: e.target.value })} />
+        </label>
+        <label className="field">
+          <span className="field-label">TEE</span>
+          <select className="input" value={cfg.expected_tee} onChange={(e) => set({ expected_tee: e.target.value })}>
+            <option value="sev-snp">AMD SEV-SNP</option>
+            <option value="tdx">Intel TDX</option>
+          </select>
+        </label>
+      </details>
+
+      <button className="btn btn-primary" onClick={save}>
+        {saved ? "Saved ✓" : "Save"}
+      </button>
+      <button
+        className="link"
+        onClick={() => set({ portal_url: "https://api.nilvpn.com", coordinator_url: "https://ctrl.nilvpn.com" })}
+      >
+        Restore live defaults (nilvpn.com)
+      </button>
+      <button className="link" onClick={onBack}>
+        ← Back
+      </button>
+
+      <HonestLimits />
     </div>
   );
 }

@@ -46,6 +46,8 @@ impl RegistryNode {
             tee: self.tee,
             measurement: self.measurement.clone(),
             wg_pub: self.wg_pub.clone(),
+            grant: None,
+            grant_nonce: None,
         }
     }
 }
@@ -78,7 +80,8 @@ impl NodeRegistry {
     /// Parse a JSON node registry file: an array of `{host, port, tee, measurement, operator,
     /// jurisdiction, wg_pub?}`. `tee` is `"sev-snp"` (default) or `"tdx"`.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        let bytes = std::fs::read(path).map_err(|e| anyhow::anyhow!("read node registry {path}: {e}"))?;
+        let bytes =
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("read node registry {path}: {e}"))?;
         let dtos: Vec<RegistryFileNode> = serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("parse node registry {path}: {e}"))?;
         if dtos.is_empty() {
@@ -161,14 +164,36 @@ mod tests {
         // Re-derive operators/jurisdictions by matching hosts back to the registry.
         let ops: Vec<&str> = path
             .iter()
-            .map(|h| reg.nodes.iter().find(|n| n.host == h.host).unwrap().operator.as_str())
+            .map(|h| {
+                reg.nodes
+                    .iter()
+                    .find(|n| n.host == h.host)
+                    .unwrap()
+                    .operator
+                    .as_str()
+            })
             .collect();
         let jurs: Vec<&str> = path
             .iter()
-            .map(|h| reg.nodes.iter().find(|n| n.host == h.host).unwrap().jurisdiction.as_str())
+            .map(|h| {
+                reg.nodes
+                    .iter()
+                    .find(|n| n.host == h.host)
+                    .unwrap()
+                    .jurisdiction
+                    .as_str()
+            })
             .collect();
-        assert_eq!(ops.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct operators");
-        assert_eq!(jurs.iter().collect::<std::collections::HashSet<_>>().len(), 3, "distinct jurisdictions");
+        assert_eq!(
+            ops.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "distinct operators"
+        );
+        assert_eq!(
+            jurs.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "distinct jurisdictions"
+        );
     }
 
     #[test]
@@ -210,11 +235,30 @@ mod tests {
         // Two nodes, same operator → cannot build even a 2-hop diverse path.
         let reg = NodeRegistry {
             nodes: vec![
-                RegistryNode { host: "a".into(), port: 443, tee: Tee::SevSnp, measurement: "aa".into(), operator: "op-x".into(), jurisdiction: "US".into(), wg_pub: None },
-                RegistryNode { host: "b".into(), port: 443, tee: Tee::SevSnp, measurement: "bb".into(), operator: "op-x".into(), jurisdiction: "DE".into(), wg_pub: None },
+                RegistryNode {
+                    host: "a".into(),
+                    port: 443,
+                    tee: Tee::SevSnp,
+                    measurement: "aa".into(),
+                    operator: "op-x".into(),
+                    jurisdiction: "US".into(),
+                    wg_pub: None,
+                },
+                RegistryNode {
+                    host: "b".into(),
+                    port: 443,
+                    tee: Tee::SevSnp,
+                    measurement: "bb".into(),
+                    operator: "op-x".into(),
+                    jurisdiction: "DE".into(),
+                    wg_pub: None,
+                },
             ],
         };
-        assert!(reg.select_path(2).is_none(), "same-operator hops must be refused");
+        assert!(
+            reg.select_path(2).is_none(),
+            "same-operator hops must be refused"
+        );
         assert!(reg.select_path(1).is_some(), "a single hop is always fine");
     }
 }

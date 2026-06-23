@@ -25,7 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
@@ -64,7 +66,10 @@ const DEFAULT_NESTED_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 74, 0, 2);
 const NESTED_CLIENT_PORT: u16 = 51820;
 
 /// Client-side MASQUE configuration.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` is hand-written (not derived) because the android `socket_hook` is a closure, which is
+/// not `Debug`; the impl formats the data fields and omits the hook.
+#[derive(Clone, Default)]
 pub struct MasqueConfig {
     /// TLS SNI / `:authority`. Defaults to the target host at connect time.
     pub server_name: Option<String>,
@@ -77,6 +82,23 @@ pub struct MasqueConfig {
     /// tunnel refuses to come up, so a forgotten `NW_EXPECTED_MEASUREMENT` cannot silently carry
     /// traffic unattested. Set `true` (e.g. `NW_ALLOW_UNATTESTED=1`) only for local dev.
     pub allow_unattested: bool,
+    /// **Android only.** Invoked with the raw fd of the outer UDP socket right after `bind` and
+    /// before `connect`, so the app can `VpnService.protect(fd)` it — otherwise the tunnel's own
+    /// QUIC to the node would be routed back into the VpnService TUN (a loop). Returning `false`
+    /// aborts the connection fail-closed. Absent on other platforms (the desktop datapath pins a
+    /// host route to the node instead).
+    #[cfg(target_os = "android")]
+    pub socket_hook: Option<std::sync::Arc<dyn Fn(std::os::fd::RawFd) -> bool + Send + Sync>>,
+}
+
+impl std::fmt::Debug for MasqueConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueConfig")
+            .field("server_name", &self.server_name)
+            .field("nested_client_ip", &self.nested_client_ip)
+            .field("allow_unattested", &self.allow_unattested)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Heavy per-session state, owned by the transport and keyed by [`SessionId`].
@@ -108,14 +130,20 @@ impl MasqueTransport {
     }
 
     pub fn with_config(config: MasqueConfig) -> Self {
-        Self { config, ..Default::default() }
+        Self {
+            config,
+            ..Default::default()
+        }
     }
 
     /// Usable tunnel MTU for a session (datagram payload minus CONNECT-IP framing overhead),
     /// so the datapath can size the TUN device.
     pub fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
         let s = self.state(session).ok()?;
-        Some(s.max_dgram_payload.saturating_sub(connectip::MAX_FRAMING_OVERHEAD))
+        Some(
+            s.max_dgram_payload
+                .saturating_sub(connectip::MAX_FRAMING_OVERHEAD),
+        )
     }
 
     fn state(&self, session: &Session) -> Result<Arc<MasqueSession>> {
@@ -123,7 +151,9 @@ impl MasqueTransport {
             .sessions
             .lock()
             .map_err(|_| Error::Transport("masque session map poisoned".into()))?;
-        map.get(&session.id).cloned().ok_or(Error::SessionNotFound(session.id))
+        map.get(&session.id)
+            .cloned()
+            .ok_or(Error::SessionNotFound(session.id))
     }
 
     /// Send a reliable, ordered control message over the CONNECT-IP request stream (not the
@@ -155,15 +185,17 @@ impl MasqueTransport {
         let peer_v4 = match peer {
             SocketAddr::V4(v4) => v4,
             SocketAddr::V6(_) => {
-                return Err(Error::Transport("nested MASQUE requires an IPv4 next hop".into()))
+                return Err(Error::Transport(
+                    "nested MASQUE requires an IPv4 next hop".into(),
+                ))
             }
         };
         // The inner QUIC packets ride the outer tunnel as IPv4/UDP, so they must fit in the
         // outer's usable MTU after udpip wrapping. Shrink this hop's QUIC payload accordingly;
         // reject if it would fall below QUIC's mandatory floor (the path is too deep).
-        let outer_mtu = outer
-            .tunnel_mtu(&outer_session)
-            .ok_or_else(|| Error::Transport("nested MASQUE: outer tunnel has no negotiated MTU".into()))?;
+        let outer_mtu = outer.tunnel_mtu(&outer_session).ok_or_else(|| {
+            Error::Transport("nested MASQUE: outer tunnel has no negotiated MTU".into())
+        })?;
         let max_udp_payload = outer_mtu
             .checked_sub(UDPIP_OVERHEAD)
             .filter(|&m| m >= MIN_QUIC_UDP_PAYLOAD)
@@ -175,12 +207,25 @@ impl MasqueTransport {
             })?;
         // A fixed inner client address (inside the nodes' tunnel CIDR); the outer node NATs it
         // away before the next hop, and the reply routes back through the node's TUN.
-        let inner_ip = self.config.nested_client_ip.unwrap_or(DEFAULT_NESTED_CLIENT_IP);
+        let inner_ip = self
+            .config
+            .nested_client_ip
+            .unwrap_or(DEFAULT_NESTED_CLIENT_IP);
         let local = SocketAddrV4::new(inner_ip, NESTED_CLIENT_PORT);
-        let authority = self.config.server_name.clone().unwrap_or_else(|| target.host.clone());
+        let authority = self
+            .config
+            .server_name
+            .clone()
+            .unwrap_or_else(|| target.host.clone());
         let policy = policy_for(&target);
-        let chan = PacketChannel::Tunnel(TunnelChannel { outer, outer_session, local, peer: peer_v4 });
-        self.finish_connect(chan, peer, authority, creds.nonce, policy, max_udp_payload).await
+        let chan = PacketChannel::Tunnel(TunnelChannel {
+            outer,
+            outer_session,
+            local,
+            peer: peer_v4,
+        });
+        self.finish_connect(chan, peer, authority, creds, policy, max_udp_payload)
+            .await
     }
 
     /// Spawn the driver over `chan` and register the session once the CONNECT-IP handshake
@@ -190,7 +235,7 @@ impl MasqueTransport {
         chan: PacketChannel,
         peer: SocketAddr,
         authority: String,
-        nonce: [u8; 32],
+        grant: Grant,
         policy: Option<AppraisalPolicy>,
         max_udp_payload: usize,
     ) -> Result<Session> {
@@ -202,8 +247,19 @@ impl MasqueTransport {
         let shutdown = CancellationToken::new();
 
         let driver = tokio::spawn(driver_run(
-            chan, peer, authority, nonce, policy, self.config.allow_unattested, max_udp_payload,
-            to_rx, from_tx, ctrl_to_rx, ctrl_from_tx, ready_tx, shutdown.clone(),
+            chan,
+            peer,
+            authority,
+            grant,
+            policy,
+            self.config.allow_unattested,
+            max_udp_payload,
+            to_rx,
+            from_tx,
+            ctrl_to_rx,
+            ctrl_from_tx,
+            ready_tx,
+            shutdown.clone(),
         ));
 
         let ready = match tokio::time::timeout(HANDSHAKE_TIMEOUT, ready_rx).await {
@@ -214,7 +270,9 @@ impl MasqueTransport {
             }
             Ok(Err(_)) => {
                 shutdown.cancel();
-                return Err(Error::Transport("masque driver exited before handshake".into()));
+                return Err(Error::Transport(
+                    "masque driver exited before handshake".into(),
+                ));
             }
             Err(_) => {
                 shutdown.cancel();
@@ -236,7 +294,10 @@ impl MasqueTransport {
             .lock()
             .map_err(|_| Error::Transport("masque session map poisoned".into()))?
             .insert(id, state);
-        Ok(Session { id, kind: TransportKind::Masque })
+        Ok(Session {
+            id,
+            kind: TransportKind::Masque,
+        })
     }
 }
 
@@ -255,13 +316,29 @@ impl Transport for MasqueTransport {
         let local = socket
             .local_addr()
             .map_err(|e| Error::Transport(format!("local_addr: {e}")))?;
-        let authority = self.config.server_name.clone().unwrap_or_else(|| target.host.clone());
+        // Android: hand the bound socket's fd to the app so it can `VpnService.protect()` it, so
+        // the tunnel's own QUIC to the node bypasses the VpnService TUN (no loop). The bind →
+        // protect → connect ordering matters. No-op / absent on other platforms.
+        #[cfg(target_os = "android")]
+        if let Some(hook) = &self.config.socket_hook {
+            use std::os::fd::AsRawFd;
+            if !hook(socket.as_raw_fd()) {
+                return Err(Error::Transport(
+                    "android VpnService.protect refused the QUIC socket".into(),
+                ));
+            }
+        }
+        let authority = self
+            .config
+            .server_name
+            .clone()
+            .unwrap_or_else(|| target.host.clone());
         let policy = policy_for(&target);
         self.finish_connect(
             PacketChannel::Udp { socket, local },
             peer,
             authority,
-            creds.nonce,
+            creds,
             policy,
             MAX_UDP_PAYLOAD,
         )
@@ -332,7 +409,10 @@ fn policy_for(target: &NodeEndpoint) -> Option<AppraisalPolicy> {
 /// an outer CONNECT-IP tunnel via [`TunnelChannel`]. The driver loop is identical either way —
 /// this is the only seam.
 enum PacketChannel {
-    Udp { socket: UdpSocket, local: SocketAddr },
+    Udp {
+        socket: UdpSocket,
+        local: SocketAddr,
+    },
     Tunnel(TunnelChannel),
 }
 
@@ -418,7 +498,7 @@ async fn driver_run(
     chan: PacketChannel,
     peer: SocketAddr,
     authority: String,
-    nonce: [u8; 32],
+    grant: Grant,
     policy: Option<AppraisalPolicy>,
     allow_unattested: bool,
     max_udp_payload: usize,
@@ -533,7 +613,7 @@ async fn driver_run(
         if h3.is_none() && conn.is_established() {
             match quiche::h3::Connection::with_transport(&mut conn, &h3_config) {
                 Ok(mut h3c) => {
-                    let headers = connect_ip_headers(&authority, &nonce);
+                    let headers = connect_ip_headers(&authority, &grant);
                     match h3c.send_request(&mut conn, &headers, false) {
                         Ok(sid) => {
                             ci_stream = Some(sid);
@@ -566,12 +646,24 @@ async fn driver_run(
                                     // THE attestation gate: appraise the node's RA-TLS cert
                                     // before signaling ready. This is the only ready-Ok site,
                                     // so a failed/absent appraisal can never yield a tunnel.
-                                    match attest_peer(&conn, &list, policy.as_ref(), allow_unattested, &nonce) {
+                                    match attest_peer(
+                                        &conn,
+                                        &list,
+                                        policy.as_ref(),
+                                        allow_unattested,
+                                        &grant.nonce,
+                                    ) {
                                         Ok(()) => {
                                             if let Some(tx) = ready_tx.take() {
-                                                let mdp = conn.dgram_max_writable_len().unwrap_or(1200);
-                                                let _ = tx.send(Ok(ReadyInfo { max_dgram_payload: mdp }));
-                                                tracing::info!(flow_id, "MASQUE CONNECT-IP established");
+                                                let mdp =
+                                                    conn.dgram_max_writable_len().unwrap_or(1200);
+                                                let _ = tx.send(Ok(ReadyInfo {
+                                                    max_dgram_payload: mdp,
+                                                }));
+                                                tracing::info!(
+                                                    flow_id,
+                                                    "MASQUE CONNECT-IP established"
+                                                );
                                             }
                                         }
                                         Err(e) => {
@@ -610,7 +702,9 @@ async fn driver_run(
                                 ctrl_in.extend_from_slice(&buf[..n]);
                             }
                             while ctrl_in.len() >= 4 {
-                                let len = u32::from_be_bytes([ctrl_in[0], ctrl_in[1], ctrl_in[2], ctrl_in[3]]) as usize;
+                                let len = u32::from_be_bytes([
+                                    ctrl_in[0], ctrl_in[1], ctrl_in[2], ctrl_in[3],
+                                ]) as usize;
                                 if ctrl_in.len() < 4 + len {
                                     break;
                                 }
@@ -733,9 +827,9 @@ fn attest_peer(
     let Some(policy) = policy else {
         return unattested_gate(allow_unattested);
     };
-    let cert = conn
-        .peer_cert()
-        .ok_or_else(|| Error::Transport("attestation failed: node presented no certificate".into()))?;
+    let cert = conn.peer_cert().ok_or_else(|| {
+        Error::Transport("attestation failed: node presented no certificate".into())
+    })?;
     let spki = nil_attest::ratls::spki_of(cert)
         .map_err(|e| Error::Transport(format!("attestation failed: {e}")))?;
     let report_hex = header_value(headers, connectip::ATTEST_REPORT_HEADER.as_bytes())
@@ -754,7 +848,9 @@ fn attest_peer(
 /// (PD-2 / Pillar 2: "no attestation pass → kill-switch holds → no traffic"). Pure + unit-tested.
 fn unattested_gate(allow_unattested: bool) -> Result<()> {
     if allow_unattested {
-        tracing::warn!("MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only");
+        tracing::warn!(
+            "MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only"
+        );
         return Ok(());
     }
     Err(Error::Transport(
@@ -770,9 +866,9 @@ fn header_value<'a>(headers: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'
     headers.iter().find(|h| h.name() == name).map(|h| h.value())
 }
 
-fn connect_ip_headers(authority: &str, nonce: &[u8; 32]) -> Vec<quiche::h3::Header> {
+fn connect_ip_headers(authority: &str, grant: &Grant) -> Vec<quiche::h3::Header> {
     use quiche::h3::Header;
-    vec![
+    let mut headers = vec![
         Header::new(b":method", b"CONNECT"),
         Header::new(b":protocol", b"connect-ip"),
         Header::new(b":scheme", b"https"),
@@ -781,8 +877,18 @@ fn connect_ip_headers(authority: &str, nonce: &[u8; 32]) -> Vec<quiche::h3::Head
         Header::new(b"capsule-protocol", b"?1"),
         // RA-TLS freshness challenge: the node must bind this nonce into its report's
         // report_data, proving the report was minted for this connection.
-        Header::new(connectip::ATTEST_NONCE_HEADER.as_bytes(), connectip::to_hex(nonce).as_bytes()),
-    ]
+        Header::new(
+            connectip::ATTEST_NONCE_HEADER.as_bytes(),
+            connectip::to_hex(&grant.nonce).as_bytes(),
+        ),
+    ];
+    if !grant.token.is_empty() {
+        headers.push(Header::new(
+            connectip::TUNNEL_GRANT_HEADER.as_bytes(),
+            connectip::to_hex(&grant.token).as_bytes(),
+        ));
+    }
+    headers
 }
 
 fn status_of(list: &[quiche::h3::Header]) -> Option<u16> {
@@ -807,14 +913,23 @@ mod tests {
     #[test]
     fn default_config_is_fail_closed() {
         // Secure by default: a transport built with no explicit opt-out must require attestation.
-        assert!(!MasqueConfig::default().allow_unattested, "default must fail closed");
+        assert!(
+            !MasqueConfig::default().allow_unattested,
+            "default must fail closed"
+        );
     }
 
     #[test]
     fn unattested_gate_fails_closed_unless_explicitly_allowed() {
         // No pinned measurement + not allowed → tunnel refused (the fix for the fail-open bug).
-        assert!(unattested_gate(false).is_err(), "missing measurement must refuse the tunnel");
+        assert!(
+            unattested_gate(false).is_err(),
+            "missing measurement must refuse the tunnel"
+        );
         // Explicit dev opt-in → permitted (loopback/dev).
-        assert!(unattested_gate(true).is_ok(), "explicit opt-in permits unattested dev use");
+        assert!(
+            unattested_gate(true).is_ok(),
+            "explicit opt-in permits unattested dev use"
+        );
     }
 }

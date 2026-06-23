@@ -43,6 +43,7 @@ COPY --from=builder /nil-node /usr/local/bin/nil-node
 #   NW_NODE_TEE              sev-snp | tdx
 #   NW_NODE_MEASUREMENT      48-byte hex guest-launch measurement (captured on first real boot,
 #                            then pinned in the Coordinator registry)
+#   NW_GRANT_KEY_FILE        shared Coordinator→node grant key file (hex); required in production
 #   NW_VCEK_PATH             AMD VCEK DER (SEV-SNP) — fetched once from AMD KDS at provisioning
 #   NW_TDX_COLLATERAL        Intel DCAP collateral JSON (TDX) — from Intel PCS
 # Needs CAP_NET_ADMIN + /dev/net/tun. Keeps NO disk logs (stdout only) — do not mount a log volume.

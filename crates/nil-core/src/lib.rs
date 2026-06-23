@@ -11,6 +11,7 @@
 
 pub mod checksum;
 pub mod durable;
+pub mod grant;
 pub mod net;
 
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,11 @@ pub struct NodeEndpoint {
     /// What the node must attest to before any packet flows. `None` disables appraisal
     /// (loopback / tests only — a real MASQUE endpoint always carries one).
     pub expected: Option<AttestExpectation>,
+    /// Optional short-lived Coordinator grant for this hop. Production Coordinator paths fill
+    /// this and the node verifies it before accepting CONNECT-IP. Direct-node/dev paths may
+    /// leave it empty only when the node explicitly allows ungranted tunnels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<Grant>,
 }
 
 impl NodeEndpoint {
@@ -102,13 +108,14 @@ impl NodeEndpoint {
             kind: TransportKind::Loopback,
             wg_pub: None,
             expected: None,
+            grant: None,
         }
     }
 }
 
-/// A short-lived, identity-free credential issued by the Coordinator against a
-/// redeemed Privacy Pass token. Phase 0 treats it as an opaque byte blob; the real
-/// grant format lands with the Coordinator in Phase 3.
+/// A short-lived, identity-free credential issued by the Coordinator against a redeemed Privacy
+/// Pass token. `token` is intentionally opaque to clients/transports; the Coordinator mints it
+/// and the node verifies it via [`grant`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     pub token: Vec<u8>,
@@ -122,7 +129,10 @@ impl Grant {
     /// A placeholder grant for transports (e.g. loopback) that don't check it yet. The
     /// zero nonce is fine here because loopback performs no attestation.
     pub fn mock() -> Self {
-        Self { token: Vec::new(), nonce: [0u8; 32] }
+        Self {
+            token: Vec::new(),
+            nonce: [0u8; 32],
+        }
     }
 }
 

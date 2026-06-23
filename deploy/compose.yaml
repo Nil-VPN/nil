@@ -15,6 +15,7 @@ services:
       # verify-attest.sh pins this exact value for the ACCEPT case and a different one to REJECT.
       - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
       - NW_NODE_TEE=sev-snp
+      - NW_ALLOW_UNGRANTED=1
       - RUST_LOG=info,nil_node=debug
     cap_add: ["NET_ADMIN"]
     devices: ["/dev/net/tun"]

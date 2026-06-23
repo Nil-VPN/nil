@@ -1,0 +1,10 @@
+[
+  {
+    "host": "node.example.net",
+    "port": 443,
+    "tee": "sev-snp",
+    "measurement": "REPLACE_WITH_48_BYTE_HEX_GUEST_LAUNCH_MEASUREMENT",
+    "operator": "op-1",
+    "jurisdiction": "BG"
+  }
+]

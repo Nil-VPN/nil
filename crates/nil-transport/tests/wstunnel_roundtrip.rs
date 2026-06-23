@@ -103,11 +103,15 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
         kind: TransportKind::Wstunnel,
         wg_pub: Some(node_pub),
         expected: None,
+        grant: None,
     };
-    let session = tokio::time::timeout(Duration::from_secs(10), transport.connect(target, Grant::mock()))
-        .await
-        .expect("connect timed out")
-        .expect("wstunnel connect failed");
+    let session = tokio::time::timeout(
+        Duration::from_secs(10),
+        transport.connect(target, Grant::mock()),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("wstunnel connect failed");
 
     // A minimal well-formed IPv4 packet (header only; the echo responder doesn't inspect it).
     let mut pkt = vec![0u8; 20];
@@ -119,13 +123,20 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
     pkt[2] = total[0];
     pkt[3] = total[1];
 
-    transport.send(&session, IpPacket::new(pkt.clone())).await.unwrap();
+    transport
+        .send(&session, IpPacket::new(pkt.clone()))
+        .await
+        .unwrap();
 
     let got = tokio::time::timeout(Duration::from_secs(10), transport.recv(&session))
         .await
         .expect("recv timed out")
         .expect("recv failed");
-    assert_eq!(got.as_bytes(), pkt.as_slice(), "echoed packet must match what we sent");
+    assert_eq!(
+        got.as_bytes(),
+        pkt.as_slice(),
+        "echoed packet must match what we sent"
+    );
 
     transport.close(session).await.unwrap();
 }

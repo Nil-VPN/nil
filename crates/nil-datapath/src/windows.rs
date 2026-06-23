@@ -9,7 +9,7 @@
 //! disarm the kill-switch *last*. We add two `/1` routes through the TUN (leaving the real
 //! default in the table) so teardown is just "delete what we added".
 //!
-//! ## Kill-switch via the Windows Firewall (NetSecurity cmdlets) — PENDING VM VERIFICATION
+//! ## Kill-switch via the Windows Firewall (NetSecurity cmdlets) — explicit experimental opt-in
 //! `netsh advfirewall` can only scope allow-rules by `interfacetype` (lan/wireless/ras), never
 //! by a specific adapter — so a coarse "block all except the node" rule would block real app
 //! traffic before it enters the tunnel (its destination is an arbitrary internet IP, not the
@@ -23,13 +23,10 @@
 //! node. Loopback is exempt from the firewall by default. Teardown removes our rule group and
 //! restores the captured default action.
 //!
-//! **This is implemented but NOT yet verified** — it cannot be compiled or run on the build
-//! host (no Windows target/linker), only on the Windows-on-ARM VM. It is built as plain
-//! `std::process` cmdlet shell-outs (no unsafe FFI), and arming is fail-closed: any cmdlet
-//! error aborts the bring-up (the tunnel refuses to come up) rather than running unprotected.
-//! A future hardening pass may replace it with a dynamic WFP filter set (WireGuard-for-Windows
-//! style: a `FwpmEngineOpen0` session whose filters auto-remove if the process dies), which
-//! avoids mutating the user's firewall profile at all — see the recipe in `arm_kill_switch`.
+//! The NetSecurity implementation still mutates global profile defaults, so production builds
+//! refuse to use it unless `NW_WINDOWS_EXPERIMENTAL_KILLSWITCH=1` is set. A production Windows
+//! kill-switch should use a dynamic WFP filter set (WireGuard-for-Windows style: filters tied to
+//! a process-owned `FwpmEngineOpen0` dynamic session that auto-removes on crash).
 
 use std::net::IpAddr;
 use std::process::Command;
@@ -61,14 +58,22 @@ impl NetControl for WinNet {
         // Fail-closed: arm the kill-switch BEFORE flipping the default route (no leak window).
         // Any cmdlet error aborts the whole bring-up rather than running unprotected.
         if p.kill_switch {
+            if !nil_core::net::env_flag("NW_WINDOWS_EXPERIMENTAL_KILLSWITCH") {
+                anyhow::bail!(
+                    "Windows kill-switch is not production-safe yet: dynamic WFP filters are not \
+                     implemented. Set NW_WINDOWS_EXPERIMENTAL_KILLSWITCH=1 only in a test VM to use \
+                     the NetSecurity fallback."
+                );
+            }
             self.ks_saved = Some(arm_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?);
             self.kill_switch = true;
         }
         self.also_except = p.also_except.clone();
 
         // Resolve interface indices we need for routing.
-        let tun_idx = if_index_for_name(&p.tun_name)
-            .ok_or_else(|| anyhow::anyhow!("could not find interface index for TUN {}", p.tun_name))?;
+        let tun_idx = if_index_for_name(&p.tun_name).ok_or_else(|| {
+            anyhow::anyhow!("could not find interface index for TUN {}", p.tun_name)
+        })?;
         self.tun_idx = Some(tun_idx);
 
         // 1. Pin a /32 to the node via the original default gateway so the tunnel's own QUIC
@@ -79,13 +84,39 @@ impl NetControl for WinNet {
             let pfx = format!("prefix={}/32", p.node_ip);
             let ifc = format!("interface={orig_idx}");
             let nh = format!("nexthop={gw}");
-            if let Err(e) = sh("netsh", &["interface", "ipv4", "add", "route", &pfx, &ifc, &nh, "metric=1", "store=active"]) {
+            if let Err(e) = sh(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "route",
+                    &pfx,
+                    &ifc,
+                    &nh,
+                    "metric=1",
+                    "store=active",
+                ],
+            ) {
                 tracing::warn!("pin node route (continuing; may be on-link): {e}");
             }
             // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
             for ip in &p.also_except {
                 let pfx = format!("prefix={ip}/32");
-                if let Err(e) = sh("netsh", &["interface", "ipv4", "add", "route", &pfx, &ifc, &nh, "metric=1", "store=active"]) {
+                if let Err(e) = sh(
+                    "netsh",
+                    &[
+                        "interface",
+                        "ipv4",
+                        "add",
+                        "route",
+                        &pfx,
+                        &ifc,
+                        &nh,
+                        "metric=1",
+                        "store=active",
+                    ],
+                ) {
                     tracing::warn!("pin fallback node route (continuing): {e}");
                 }
             }
@@ -96,8 +127,30 @@ impl NetControl for WinNet {
         // 2. Route all traffic through the TUN via two /1 routes (on-link nexthop). This leaves
         //    the real default route untouched, so teardown only deletes our additions.
         let ifc = format!("interface={tun_idx}");
-        sh("netsh", &["interface", "ipv4", "add", "route", "prefix=0.0.0.0/1", &ifc, "store=active"])?;
-        sh("netsh", &["interface", "ipv4", "add", "route", "prefix=128.0.0.0/1", &ifc, "store=active"])?;
+        sh(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "prefix=0.0.0.0/1",
+                &ifc,
+                "store=active",
+            ],
+        )?;
+        sh(
+            "netsh",
+            &[
+                "interface",
+                "ipv4",
+                "add",
+                "route",
+                "prefix=128.0.0.0/1",
+                &ifc,
+                "store=active",
+            ],
+        )?;
 
         // 3. Point the TUN adapter's DNS at the tunnel resolver(s). With the TUN as the
         //    default route, the system prefers its resolvers; the (future) WFP kill-switch
@@ -118,17 +171,57 @@ impl NetControl for WinNet {
         // Remove our default routes.
         if let Some(idx) = self.tun_idx {
             let ifc = format!("interface={idx}");
-            let _ = sh("netsh", &["interface", "ipv4", "delete", "route", "prefix=0.0.0.0/1", &ifc]);
-            let _ = sh("netsh", &["interface", "ipv4", "delete", "route", "prefix=128.0.0.0/1", &ifc]);
+            let _ = sh(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "delete",
+                    "route",
+                    "prefix=0.0.0.0/1",
+                    &ifc,
+                ],
+            );
+            let _ = sh(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "delete",
+                    "route",
+                    "prefix=128.0.0.0/1",
+                    &ifc,
+                ],
+            );
         }
         // Remove the pinned node route(s).
         if let Some(orig) = self.orig_idx {
             let ifc = format!("interface={orig}");
             if let Some(ip) = self.node_ip {
-                let _ = sh("netsh", &["interface", "ipv4", "delete", "route", &format!("prefix={ip}/32"), &ifc]);
+                let _ = sh(
+                    "netsh",
+                    &[
+                        "interface",
+                        "ipv4",
+                        "delete",
+                        "route",
+                        &format!("prefix={ip}/32"),
+                        &ifc,
+                    ],
+                );
             }
             for ip in &self.also_except {
-                let _ = sh("netsh", &["interface", "ipv4", "delete", "route", &format!("prefix={ip}/32"), &ifc]);
+                let _ = sh(
+                    "netsh",
+                    &[
+                        "interface",
+                        "ipv4",
+                        "delete",
+                        "route",
+                        &format!("prefix={ip}/32"),
+                        &ifc,
+                    ],
+                );
             }
         }
         // The wintun adapter (and its per-interface DNS) disappears when tun-rs drops the
@@ -146,14 +239,19 @@ impl NetControl for WinNet {
 /// Map an interface name (the wintun adapter name, e.g. `nil0`) to its interface index by
 /// parsing `netsh interface ipv4 show interfaces`. Columns: `Idx Met MTU State Name`.
 fn if_index_for_name(name: &str) -> Option<u32> {
-    let out = Command::new("netsh").args(["interface", "ipv4", "show", "interfaces"]).output().ok()?;
+    let out = Command::new("netsh")
+        .args(["interface", "ipv4", "show", "interfaces"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines() {
         let t = line.trim();
         // Data rows start with the numeric index; the Name is the trailing field.
         let mut toks = t.split_whitespace();
         let Some(first) = toks.next() else { continue };
-        let Ok(idx) = first.parse::<u32>() else { continue };
+        let Ok(idx) = first.parse::<u32>() else {
+            continue;
+        };
         if t.trim_end().ends_with(name) {
             return Some(idx);
         }
@@ -164,7 +262,10 @@ fn if_index_for_name(name: &str) -> Option<u32> {
 /// Parse the IPv4 default route (`0.0.0.0/0`) from `netsh interface ipv4 show route`,
 /// returning `(interface_index, gateway)`. Columns: `Publish Type Met Prefix Idx Gateway`.
 fn default_route() -> Option<(u32, String)> {
-    let out = Command::new("netsh").args(["interface", "ipv4", "show", "route"]).output().ok()?;
+    let out = Command::new("netsh")
+        .args(["interface", "ipv4", "show", "route"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     for line in s.lines() {
         let toks: Vec<&str> = line.split_whitespace().collect();
@@ -184,10 +285,35 @@ fn set_dns(tun: &str, dns: &[IpAddr]) {
     for (i, ip) in dns.iter().enumerate() {
         let res = if first {
             first = false;
-            sh("netsh", &["interface", "ipv4", "set", "dnsservers", &name, "static", &ip.to_string(), "primary", "validate=no"])
+            sh(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "set",
+                    "dnsservers",
+                    &name,
+                    "static",
+                    &ip.to_string(),
+                    "primary",
+                    "validate=no",
+                ],
+            )
         } else {
             let idx = format!("index={}", i + 1);
-            sh("netsh", &["interface", "ipv4", "add", "dnsservers", &name, &ip.to_string(), &idx, "validate=no"])
+            sh(
+                "netsh",
+                &[
+                    "interface",
+                    "ipv4",
+                    "add",
+                    "dnsservers",
+                    &name,
+                    &ip.to_string(),
+                    &idx,
+                    "validate=no",
+                ],
+            )
         };
         if let Err(e) = res {
             tracing::warn!("set tunnel DNS {ip} on {tun}: {e}");
@@ -207,6 +333,7 @@ const KS_GROUP: &str = "NIL-VPN-killswitch";
 ///      node — loopback is firewall-exempt by default,
 ///   3. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
 ///      anything trying to bypass the tunnel) is dropped.
+///
 /// Allows precede the Block flip, so the only transient state is "more blocked", never a leak.
 /// Any cmdlet error returns `Err`, aborting the bring-up (fail-closed) rather than running open.
 ///
@@ -218,12 +345,12 @@ const KS_GROUP: &str = "NIL-VPN-killswitch";
 fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<String> {
     let node = node_ip.to_string();
     // 1. Capture the current default outbound action per profile (e.g. "Domain=Allow;...").
-    let saved = ps(
-        "(Get-NetFirewallProfile -Profile Domain,Private,Public | \
-         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'",
-    )?;
+    let saved = ps("(Get-NetFirewallProfile -Profile Domain,Private,Public | \
+         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'")?;
     // Clear any stale rules from a previous run (idempotent).
-    let _ = ps(&format!("Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"));
+    let _ = ps(&format!(
+        "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
+    ));
     // 2. Allow the tunnel interface and the encapsulated QUIC/TCP to the node.
     ps(&format!(
         "New-NetFirewallRule -DisplayName 'NIL allow TUN' -Group '{KS_GROUP}' -Direction Outbound \
@@ -264,7 +391,9 @@ fn disarm_kill_switch(saved: Option<&str>) {
             }
         }
     }
-    let _ = ps(&format!("Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"));
+    let _ = ps(&format!(
+        "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
+    ));
 }
 
 /// Run a PowerShell command, returning trimmed stdout. Errors on a non-zero exit.
@@ -275,7 +404,10 @@ fn ps(script: &str) -> anyhow::Result<String> {
         .output()
         .map_err(|e| anyhow::anyhow!("spawn powershell: {e}"))?;
     if !out.status.success() {
-        anyhow::bail!("powershell `{script}` failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "powershell `{script}` failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }

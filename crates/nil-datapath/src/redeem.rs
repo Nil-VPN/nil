@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_proto::path::{Hop, PathResponse, Tee as WireTee};
 use nil_proto::token::RedeemRequest;
 use nil_transport::connectip;
@@ -74,17 +74,28 @@ pub async fn redeem_path(coord_url: &str, msg: &str, token: &str) -> Result<Vec<
             .map_err(|e| anyhow::anyhow!("NW_COORDINATOR_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local network)"))?;
     }
 
-    let req = RedeemRequest { msg: msg.to_owned(), token: token.to_owned() };
+    let req = RedeemRequest {
+        msg: msg.to_owned(),
+        token: token.to_owned(),
+    };
     let url = format!("{}/v1/redeem", coord_url.trim_end_matches('/'));
     let http = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
         .context("build coordinator http client")?;
-    let mut resp = http.post(&url).json(&req).send().await.context("POST /v1/redeem")?;
+    let mut resp = http
+        .post(&url)
+        .json(&req)
+        .send()
+        .await
+        .context("POST /v1/redeem")?;
     if !resp.status().is_success() {
         // No token/identifier in the log — only the status (PD-2).
-        anyhow::bail!("coordinator rejected token redemption: HTTP {}", resp.status().as_u16());
+        anyhow::bail!(
+            "coordinator rejected token redemption: HTTP {}",
+            resp.status().as_u16()
+        );
     }
     // Read the body with a hard cap (don't trust the Coordinator's Content-Length / stream length).
     let mut body = Vec::new();
@@ -105,7 +116,10 @@ fn path_from_response(body: &[u8]) -> Result<Vec<NodeEndpoint>> {
         anyhow::bail!("coordinator returned an empty path");
     }
     if resp.hops.len() > MAX_HOPS {
-        anyhow::bail!("coordinator returned {} hops (> {MAX_HOPS})", resp.hops.len());
+        anyhow::bail!(
+            "coordinator returned {} hops (> {MAX_HOPS})",
+            resp.hops.len()
+        );
     }
     if resp.hops.len() == 1 {
         // Honest about the limit (SOUL §6): one hop is not trust-split.
@@ -114,7 +128,11 @@ fn path_from_response(body: &[u8]) -> Result<Vec<NodeEndpoint>> {
              (acceptable only for the single-hop alpha; trust-split is the next milestone)"
         );
     }
-    resp.hops.into_iter().enumerate().map(|(i, h)| hop_to_endpoint(i, h)).collect()
+    resp.hops
+        .into_iter()
+        .enumerate()
+        .map(|(i, h)| hop_to_endpoint(i, h))
+        .collect()
 }
 
 /// Convert a wire [`Hop`] into a [`NodeEndpoint`] with its per-hop pinned attestation expectation.
@@ -131,23 +149,45 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
     // NOTE: a hop's `wg_pub` is validated here but NOT yet consumed — the trust-split onion runs
     // plain nested MASQUE today (ADR-0004); wiring per-hop PQ-WireGuard-over-MASQUE through
     // PathTransport is a deferred composition. Keep validating it so a malformed key fails closed.
-    let wg_pub = match h.wg_pub {
-        Some(s) => {
-            let bytes = connectip::from_hex(s.trim().as_bytes())
-                .ok_or_else(|| anyhow::anyhow!("redeemed path hop {idx}: wg_pub is not hex"))?;
-            Some(
-                <[u8; 32]>::try_from(bytes.as_slice())
-                    .map_err(|_| anyhow::anyhow!("redeemed path hop {idx}: wg_pub must be 32 bytes"))?,
-            )
+    let wg_pub =
+        match h.wg_pub {
+            Some(s) => {
+                let bytes = connectip::from_hex(s.trim().as_bytes())
+                    .ok_or_else(|| anyhow::anyhow!("redeemed path hop {idx}: wg_pub is not hex"))?;
+                Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                    anyhow::anyhow!("redeemed path hop {idx}: wg_pub must be 32 bytes")
+                })?)
+            }
+            None => None,
+        };
+    let grant = match (h.grant, h.grant_nonce) {
+        (Some(token_hex), Some(nonce_hex)) => {
+            let token = connectip::from_hex(token_hex.trim().as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("redeemed path hop {idx}: grant is not hex"))?;
+            let nonce_bytes =
+                connectip::from_hex(nonce_hex.trim().as_bytes()).ok_or_else(|| {
+                    anyhow::anyhow!("redeemed path hop {idx}: grant_nonce is not hex")
+                })?;
+            let nonce = <[u8; 32]>::try_from(nonce_bytes.as_slice()).map_err(|_| {
+                anyhow::anyhow!("redeemed path hop {idx}: grant_nonce must be 32 bytes")
+            })?;
+            Some(Grant { token, nonce })
         }
-        None => None,
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "redeemed path hop {idx}: grant and grant_nonce must be provided together"
+        ),
     };
     Ok(NodeEndpoint {
         host: h.host,
         port: h.port,
         kind: TransportKind::Masque,
         wg_pub,
-        expected: Some(AttestExpectation { tee, measurement: Measurement(measurement) }),
+        expected: Some(AttestExpectation {
+            tee,
+            measurement: Measurement(measurement),
+        }),
+        grant,
     })
 }
 
@@ -169,13 +209,33 @@ mod tests {
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].host, "entry.example");
         // Every hop pins its own measurement — never unattested.
-        assert!(hops.iter().all(|h| h.expected.is_some()), "each hop must carry a pinned measurement");
+        assert!(
+            hops.iter().all(|h| h.expected.is_some()),
+            "each hop must carry a pinned measurement"
+        );
         assert_eq!(hops[1].expected.as_ref().unwrap().tee, Tee::Tdx);
     }
 
     #[test]
+    fn parses_per_hop_grant() {
+        let m = "ab".repeat(48);
+        let grant = "cd".repeat(90);
+        let nonce = "11".repeat(32);
+        let body = format!(
+            r#"{{"hops":[{{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{nonce}"}}]}}"#
+        );
+        let hops = path_from_response(body.as_bytes()).expect("parse");
+        let g = hops[0].grant.as_ref().expect("grant");
+        assert_eq!(g.token, vec![0xcd; 90]);
+        assert_eq!(g.nonce, [0x11; 32]);
+    }
+
+    #[test]
     fn empty_path_fails_closed() {
-        assert!(path_from_response(br#"{"hops":[]}"#).is_err(), "an empty path must be rejected");
+        assert!(
+            path_from_response(br#"{"hops":[]}"#).is_err(),
+            "an empty path must be rejected"
+        );
     }
 
     #[test]
@@ -183,10 +243,15 @@ mod tests {
         // The closed alpha ships single-hop (trust-split is the next milestone); a 1-hop path is
         // accepted (with a not-trust-split warning) and still pins its measurement. 0 hops is rejected.
         let m = "ab".repeat(48);
-        let body = format!(r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#);
+        let body = format!(
+            r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+        );
         let hops = path_from_response(body.as_bytes()).expect("single-hop accepted for the alpha");
         assert_eq!(hops.len(), 1);
-        assert!(hops[0].expected.is_some(), "the single hop still pins a measurement (attested)");
+        assert!(
+            hops[0].expected.is_some(),
+            "the single hop still pins a measurement (attested)"
+        );
     }
 
     #[test]

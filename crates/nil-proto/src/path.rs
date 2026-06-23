@@ -1,9 +1,9 @@
 //! Coordinator path-selection + measurement-publishing DTOs (architecture spec §8).
 //!
-//! The client calls `RequestPath` to learn which node(s) to connect to and the measurement
-//! each must attest to; it then refuses to tunnel unless `nil-attest` confirms the node's
-//! report matches. Phase 2 returns a single hop; Phase 3 adds trust-split multi-hop paths
-//! with operator/jurisdiction diversity. Pure serde data — no logic.
+//! The client redeems a Privacy Pass token at `/v1/redeem` to learn which node(s) to connect to
+//! and the measurement each must attest to; it then refuses to tunnel unless `nil-attest` confirms
+//! the node's report matches. A single-hop path is the closed alpha; trust-split multi-hop paths
+//! with operator/jurisdiction diversity are the next milestone. Pure serde data — no logic.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,14 +13,6 @@ use serde::{Deserialize, Serialize};
 pub enum Tee {
     SevSnp,
     Tdx,
-}
-
-/// `POST /v1/path` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PathRequest {
-    /// Proof of entitlement — a redeemed Privacy Pass token. Phase 2 accepts any non-empty
-    /// value; the real token verifier (kept separate from the issuer) lands in Phase 3.
-    pub entitlement: String,
 }
 
 /// One hop the client should connect to, with the measurement it must attest to.
@@ -34,9 +26,16 @@ pub struct Hop {
     /// Node WireGuard static public key (lowercase hex) for the inner PQ-WireGuard handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wg_pub: Option<String>,
+    /// Short-lived opaque Coordinator grant for this hop, lowercase hex. The client never
+    /// interprets it; it forwards it to the node in CONNECT-IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// Fresh nonce bound into both the grant and the node's attestation report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_nonce: Option<String>,
 }
 
-/// `POST /v1/path` response: the (ordered) hops forming the path.
+/// `POST /v1/redeem` response: the (ordered) hops forming the path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PathResponse {
     pub hops: Vec<Hop>,

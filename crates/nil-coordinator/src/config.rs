@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use nil_crypto::Verifier;
 
@@ -19,6 +20,11 @@ pub struct CoordConfig {
     /// Where to durably persist the spent-token nullifier set (`NW_NULLIFIER_PATH`). `None` ⇒
     /// volatile in-memory nullifiers (dev only — a restart re-permits double-spend).
     pub nullifier_path: Option<PathBuf>,
+    /// Shared Coordinator→node grant MAC key (`NW_GRANT_KEY`, hex). Production nodes require
+    /// grants; leaving this unset keeps old local/dev coordinator flows grantless.
+    pub grant_key: Option<Vec<u8>>,
+    /// Lifetime of node grants minted after token redemption.
+    pub grant_ttl: Duration,
 }
 
 impl CoordConfig {
@@ -41,20 +47,57 @@ impl CoordConfig {
                     .split(',')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .map(|h| from_hex(h).ok_or_else(|| anyhow::anyhow!("NW_TOKEN_PUBKEY entry is not valid hex")))
+                    .map(|h| {
+                        from_hex(h).ok_or_else(|| {
+                            anyhow::anyhow!("NW_TOKEN_PUBKEY entry is not valid hex")
+                        })
+                    })
                     .collect::<anyhow::Result<_>>()?;
                 if ders.is_empty() {
                     None
                 } else {
-                    Some(Verifier::from_public_ders(&ders).map_err(|e| anyhow::anyhow!("NW_TOKEN_PUBKEY: {e}"))?)
+                    Some(
+                        Verifier::from_public_ders(&ders)
+                            .map_err(|e| anyhow::anyhow!("NW_TOKEN_PUBKEY: {e}"))?,
+                    )
                 }
             }
             Err(_) => None,
         };
         let nullifier_path = std::env::var("NW_NULLIFIER_PATH").ok().map(PathBuf::from);
+        let grant_key = load_grant_key()?;
+        let grant_ttl = std::env::var("NW_GRANT_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| Duration::from_secs(300));
         let registry = NodeRegistry::from_env()?;
-        Ok(Self { addr, registry, path_hops, verifier, nullifier_path })
+        Ok(Self {
+            addr,
+            registry,
+            path_hops,
+            verifier,
+            nullifier_path,
+            grant_key,
+            grant_ttl,
+        })
     }
+}
+
+fn load_grant_key() -> anyhow::Result<Option<Vec<u8>>> {
+    let raw = if let Ok(path) = std::env::var("NW_GRANT_KEY_FILE") {
+        Some(
+            std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("read NW_GRANT_KEY_FILE {path}: {e}"))?,
+        )
+    } else {
+        std::env::var("NW_GRANT_KEY").ok()
+    };
+    let Some(raw) = raw else { return Ok(None) };
+    let key = nil_core::grant::from_hex(raw.trim())
+        .ok_or_else(|| anyhow::anyhow!("NW_GRANT_KEY must be hex"))?;
+    nil_core::grant::validate_key(&key).map_err(|e| anyhow::anyhow!("NW_GRANT_KEY: {e}"))?;
+    Ok(Some(key))
 }
 
 /// Decode lowercase/uppercase hex; `None` on odd length or a non-hex byte.

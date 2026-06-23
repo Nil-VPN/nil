@@ -4,7 +4,7 @@
 //! single client (the demo). No identifying state is persisted.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -59,6 +59,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
     };
 
     let mut clients: HashMap<Vec<u8>, Client> = HashMap::new();
+    let mut client_routes: HashMap<IpAddr, Vec<u8>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
     let mut tun_buf = vec![0u8; 65535];
     let mut out = vec![0u8; MAX_UDP_PAYLOAD];
@@ -93,14 +94,17 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         // us a partial-checksum forwarded packet) → (PQ-WireGuard encapsulate, if
                         // enabled) → encapsulate to the client as a CONNECT-IP datagram.
                         nil_core::checksum::fix_l4_checksums(&mut tun_buf[..n]);
-                        if let Some(client) = clients.values_mut().find(|c| c.tunnel_up) {
-                            let payload = match client.pqwg.as_mut().and_then(|p| p.tunn.as_mut()) {
-                                Some(tunn) => tunn.encapsulate(&tun_buf[..n]).ok(),
-                                None => Some(tun_buf[..n].to_vec()),
-                            };
-                            if let Some(pl) = payload {
-                                let dg = connectip::encode_datagram(client.flow_id, &pl);
-                                let _ = client.conn.dgram_send(&dg);
+                        let dst = packet_dst_ip(&tun_buf[..n]);
+                        if let Some(client_id) = dst.and_then(|ip| client_routes.get(&ip).cloned()) {
+                            if let Some(client) = clients.get_mut(&client_id).filter(|c| c.tunnel_up) {
+                                let payload = match client.pqwg.as_mut().and_then(|p| p.tunn.as_mut()) {
+                                    Some(tunn) => tunn.encapsulate(&tun_buf[..n]).ok(),
+                                    None => Some(tun_buf[..n].to_vec()),
+                                };
+                                if let Some(pl) = payload {
+                                    let dg = connectip::encode_datagram(client.flow_id, &pl);
+                                    let _ = client.conn.dgram_send(&dg);
+                                }
                             }
                         }
                     }
@@ -117,8 +121,8 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
         // Drive H3 + the control channel, then bring inbound client datagrams to the TUN
         // (PQ-WireGuard-decapsulating them first when that layer is active).
         let mut to_tun: Vec<Vec<u8>> = Vec::new();
-        for client in clients.values_mut() {
-            drive_h3(client, &h3_config, &cert.spki, cfg.attest.as_ref(), node_wg.as_ref());
+        for (client_id, client) in clients.iter_mut() {
+            drive_h3(client, &h3_config, &cert.spki, cfg, node_wg.as_ref());
             if client.h3.is_none() {
                 continue;
             }
@@ -129,7 +133,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             }
             let mut net_replies: Vec<Vec<u8>> = Vec::new();
             for dg in raw {
-                let Ok((_fid, payload)) = connectip::decode_datagram(&dg) else { continue };
+                let Ok((_fid, payload)) = connectip::decode_datagram(&dg) else {
+                    continue;
+                };
                 match client.pqwg.as_mut().and_then(|p| p.tunn.as_mut()) {
                     // PQ-WireGuard active: the datagram is a WG transport message.
                     Some(tunn) => {
@@ -137,7 +143,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         loop {
                             match tunn.decapsulate(&input) {
                                 WgStep::Ip(ip) => {
-                                    to_tun.push(ip);
+                                    if learn_client_route(&mut client_routes, client_id, &ip) {
+                                        to_tun.push(ip);
+                                    }
                                     break;
                                 }
                                 WgStep::Network(b) => {
@@ -149,7 +157,11 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         }
                     }
                     // Plain MASQUE: the datagram is a raw IP packet.
-                    None => to_tun.push(payload.to_vec()),
+                    None => {
+                        if learn_client_route(&mut client_routes, client_id, payload) {
+                            to_tun.push(payload.to_vec());
+                        }
+                    }
                 }
             }
             for r in net_replies {
@@ -165,6 +177,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             flush(&mut client.conn, &socket, &mut out).await;
         }
         clients.retain(|_, c| !c.conn.is_closed());
+        client_routes.retain(|_, id| clients.contains_key(id));
     }
     Ok(())
 }
@@ -205,7 +218,11 @@ fn handle_packet(
         ci_stream: None,
         flow_id: 0,
         tunnel_up: false,
-        pqwg: if pqwg_enabled { Some(ClientPqWg::default()) } else { None },
+        pqwg: if pqwg_enabled {
+            Some(ClientPqWg::default())
+        } else {
+            None
+        },
     };
     let _ = client.conn.recv(pkt, info);
     clients.insert(scid.to_vec(), client);
@@ -216,7 +233,7 @@ fn drive_h3(
     client: &mut Client,
     h3_config: &quiche::h3::Config,
     node_spki: &[u8],
-    attest: Option<&crate::attest::NodeAttest>,
+    cfg: &NodeConfig,
     node_secret: Option<&StaticSecret>,
 ) {
     if client.h3.is_none() && client.conn.is_established() {
@@ -238,16 +255,28 @@ fn drive_h3(
                 if method.as_deref() == Some(&b"CONNECT"[..])
                     && protocol.as_deref() == Some(&b"connect-ip"[..])
                 {
+                    if let Err(reason) = authorize_connect(&list, cfg) {
+                        tracing::warn!(reason, "CONNECT-IP refused before tunnel setup");
+                        let resp = [quiche::h3::Header::new(b":status", b"403")];
+                        let _ = h3.send_response(&mut client.conn, stream_id, &resp, true);
+                        continue;
+                    }
                     let mut resp = vec![
                         quiche::h3::Header::new(b":status", b"200"),
                         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
                     ];
                     // RA-TLS: bind a report to our TLS key + the client's nonce and return it
                     // so the client can appraise us before sending traffic (spec §5).
-                    if let Some(nonce_hex) = header_value(&list, connectip::ATTEST_NONCE_HEADER.as_bytes()) {
+                    if let Some(nonce_hex) =
+                        header_value(&list, connectip::ATTEST_NONCE_HEADER.as_bytes())
+                    {
                         if let Some(nb) = connectip::from_hex(&nonce_hex) {
                             if let Ok(nonce) = <[u8; 32]>::try_from(nb.as_slice()) {
-                                if let Some(report) = crate::attest::report_hex(node_spki, attest, &nonce) {
+                                if let Some(report) = crate::attest::report_hex(
+                                    node_spki,
+                                    cfg.attest.as_ref(),
+                                    &nonce,
+                                ) {
                                     resp.push(quiche::h3::Header::new(
                                         connectip::ATTEST_REPORT_HEADER.as_bytes(),
                                         report.as_bytes(),
@@ -256,7 +285,10 @@ fn drive_h3(
                             }
                         }
                     }
-                    if h3.send_response(&mut client.conn, stream_id, &resp, false).is_ok() {
+                    if h3
+                        .send_response(&mut client.conn, stream_id, &resp, false)
+                        .is_ok()
+                    {
                         client.ci_stream = Some(stream_id);
                         client.flow_id = stream_id / 4;
                         client.tunnel_up = true;
@@ -323,8 +355,14 @@ async fn flush(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]
 }
 
 fn build_server_config(cert: &DevCert) -> anyhow::Result<quiche::Config> {
-    let cert_path = cert.cert_path.to_str().ok_or_else(|| anyhow::anyhow!("cert path"))?;
-    let key_path = cert.key_path.to_str().ok_or_else(|| anyhow::anyhow!("key path"))?;
+    let cert_path = cert
+        .cert_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("cert path"))?;
+    let key_path = cert
+        .key_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("key path"))?;
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
     config.load_cert_chain_from_pem_file(cert_path)?;
     config.load_priv_key_from_pem_file(key_path)?;
@@ -344,5 +382,89 @@ fn build_server_config(cert: &DevCert) -> anyhow::Result<quiche::Config> {
 
 fn header_value(list: &[quiche::h3::Header], name: &[u8]) -> Option<Vec<u8>> {
     use quiche::h3::NameValue;
-    list.iter().find(|h| h.name() == name).map(|h| h.value().to_vec())
+    list.iter()
+        .find(|h| h.name() == name)
+        .map(|h| h.value().to_vec())
+}
+
+fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result<(), &'static str> {
+    let nonce_hex = header_value(headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
+        .ok_or("missing attestation nonce")?;
+    let nonce_bytes = connectip::from_hex(&nonce_hex).ok_or("malformed attestation nonce")?;
+    let nonce =
+        <[u8; 32]>::try_from(nonce_bytes.as_slice()).map_err(|_| "malformed attestation nonce")?;
+
+    let Some(key) = cfg.grant_key.as_ref() else {
+        if cfg.allow_ungranted {
+            tracing::warn!("accepting grantless CONNECT-IP because NW_ALLOW_UNGRANTED=1");
+            return Ok(());
+        }
+        return Err("grant verifier not configured");
+    };
+    let attest = cfg
+        .attest
+        .as_ref()
+        .ok_or("attested node identity not configured")?;
+    let binding = nil_core::grant::binding_for(attest.tee, &attest.measurement);
+    let grant_hex = header_value(headers, connectip::TUNNEL_GRANT_HEADER.as_bytes())
+        .ok_or("missing tunnel grant")?;
+    let grant = connectip::from_hex(&grant_hex).ok_or("malformed tunnel grant")?;
+    let verified = nil_core::grant::verify(&grant, key, &binding, nil_core::grant::now_unix_secs())
+        .map_err(|_| "invalid tunnel grant")?;
+    if verified.nonce != nonce {
+        return Err("tunnel grant nonce mismatch");
+    }
+    Ok(())
+}
+
+fn learn_client_route(
+    routes: &mut HashMap<IpAddr, Vec<u8>>,
+    client_id: &[u8],
+    packet: &[u8],
+) -> bool {
+    let Some(src) = packet_src_ip(packet) else {
+        tracing::debug!("dropping malformed client IP packet");
+        return false;
+    };
+    match routes.get(&src) {
+        Some(owner) if owner.as_slice() != client_id => {
+            tracing::warn!("dropping packet from duplicate tunnel source address");
+            false
+        }
+        Some(_) => true,
+        None => {
+            routes.insert(src, client_id.to_vec());
+            true
+        }
+    }
+}
+
+fn packet_src_ip(packet: &[u8]) -> Option<IpAddr> {
+    packet_ip(packet, true)
+}
+
+fn packet_dst_ip(packet: &[u8]) -> Option<IpAddr> {
+    packet_ip(packet, false)
+}
+
+fn packet_ip(packet: &[u8], source: bool) -> Option<IpAddr> {
+    let version = packet.first()? >> 4;
+    match version {
+        4 if packet.len() >= 20 => {
+            let offset = if source { 12 } else { 16 };
+            Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                packet[offset],
+                packet[offset + 1],
+                packet[offset + 2],
+                packet[offset + 3],
+            )))
+        }
+        6 if packet.len() >= 40 => {
+            let offset = if source { 8 } else { 24 };
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[offset..offset + 16]);
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
 }
