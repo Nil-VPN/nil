@@ -1,0 +1,23 @@
+[package]
+name = "nil-ios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN iOS engine (C-ABI staticlib) for the NEPacketTunnelProvider Network Extension."
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# Reuse the MASQUE transport unchanged. Deliberately NO nil-datapath dep (it hard-depends on
+# tun-rs; iOS has no TUN fd — packets flow over the extension's NEPacketTunnelFlow via callbacks).
+nil-core = { workspace = true }
+nil-transport = { workspace = true, features = ["masque"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+getrandom = { workspace = true }   # per-connection attestation freshness nonce
+
+[build-dependencies]
+cbindgen = "0.27"
