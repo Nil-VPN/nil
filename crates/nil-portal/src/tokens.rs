@@ -57,6 +57,12 @@ pub struct TokenState {
     /// already-spent payment. Payment ids are non-identifying (they index a Monero payment, not
     /// a person), so this stays PII-free.
     pub issued: Arc<DurableSet>,
+    /// Server-minted checkout references awaiting payment (one per `/v1/billing/checkout`).
+    /// Issuance is gated on the `payment_id` being a reference WE minted — this is what blocks
+    /// front-running of a confirmed payment id by a stranger. Durable for the same reason as
+    /// `issued`: a restart must not forget which references are legitimate. References are opaque
+    /// and non-identifying (they index a payment, never a person), so this stays PII-free.
+    pub pending: Arc<DurableSet>,
 }
 
 impl TokenState {
@@ -64,18 +70,26 @@ impl TokenState {
         Arc::new(RateLimiter::new(ISSUE_RATE_MAX, ISSUE_RATE_WINDOW))
     }
 
-    /// Dev/test state with a volatile (in-memory) one-token-per-payment set.
+    /// Dev/test state with volatile (in-memory) one-token-per-payment and pending-reference sets.
+    #[allow(dead_code)] // used by tests; production uses `with_issued` for durable sets
     pub fn new(issuer: Arc<dyn TokenSigner>, watcher: Arc<dyn PaymentWatcher>) -> Self {
-        Self { issuer, watcher, issued: Arc::new(DurableSet::in_memory()), limiter: Self::limiter() }
+        Self {
+            issuer,
+            watcher,
+            issued: Arc::new(DurableSet::in_memory()),
+            pending: Arc::new(DurableSet::in_memory()),
+            limiter: Self::limiter(),
+        }
     }
 
-    /// Production state with a caller-provided (durable) one-token-per-payment set.
+    /// Production state with caller-provided (durable) one-token-per-payment and pending sets.
     pub fn with_issued(
         issuer: Arc<dyn TokenSigner>,
         watcher: Arc<dyn PaymentWatcher>,
         issued: Arc<DurableSet>,
+        pending: Arc<DurableSet>,
     ) -> Self {
-        Self { issuer, watcher, issued, limiter: Self::limiter() }
+        Self { issuer, watcher, issued, pending, limiter: Self::limiter() }
     }
 }
 
@@ -88,6 +102,10 @@ pub fn token_router(state: TokenState) -> Router {
 
 #[derive(Debug)]
 pub enum IssueError {
+    /// The `payment_id` is not a reference this Portal minted via `/v1/billing/checkout`. This
+    /// is the front-running guard: a stranger who learns a confirmed Monero payment id still
+    /// cannot redeem it, because issuance only proceeds for our own (unguessable) references.
+    UnknownReference,
     /// No confirmed payment for this payment id.
     Unpaid,
     /// A token was already issued for this payment id.
@@ -104,6 +122,12 @@ pub enum IssueError {
 /// Core issuance logic (HTTP-free, unit-tested): require a confirmed payment, enforce one
 /// token per payment, then blind-sign. The issuer never learns the unblinded token.
 pub fn issue_logic(state: &TokenState, req: &IssueRequest) -> Result<Vec<u8>, IssueError> {
+    // Front-running guard: the payment id MUST be a reference we minted via checkout. Checked
+    // before the payment lookup so an unminted id is rejected even if some payment confirmed for
+    // it. The reference is unguessable (256-bit CSPRNG), so a stranger cannot supply a valid one.
+    if !crate::billing::is_known_reference(&state.pending, &req.payment_id) {
+        return Err(IssueError::UnknownReference);
+    }
     if !state.watcher.is_confirmed(&req.payment_id) {
         return Err(IssueError::Unpaid);
     }
@@ -132,6 +156,9 @@ async fn issue(
     }
     match issue_logic(&state, &req) {
         Ok(sig) => Ok(Json(IssueResponse { blind_sig: to_hex(&sig) })),
+        // Treat an unknown reference like an unpaid one (402): don't reveal to a prober whether a
+        // given id is a real-but-unpaid reference vs never minted at all.
+        Err(IssueError::UnknownReference) => Err(StatusCode::PAYMENT_REQUIRED),
         Err(IssueError::Unpaid) => Err(StatusCode::PAYMENT_REQUIRED),
         Err(IssueError::AlreadyIssued) => Err(StatusCode::CONFLICT),
         Err(IssueError::Malformed) => Err(StatusCode::BAD_REQUEST),
@@ -182,13 +209,20 @@ mod tests {
         let pub_der = issuer.public_der().unwrap();
         let watcher = Arc::new(MockWatcher::with_paid(["pay-1".to_string()]));
         let state = TokenState::new(issuer, watcher);
+        // "pay-1" is a checkout reference the Portal minted (front-running guard).
+        state.pending.insert("pay-1").unwrap();
 
         // Client blinds a fresh token message.
         let msg = b"token-nonce-0123456789abcdef0123".to_vec();
         let req = token::blind(&pub_der, &msg).unwrap();
 
-        // Unpaid payment id → refused.
-        let unpaid = IssueRequest { payment_id: "pay-unknown".into(), blind_msg: to_hex(&req.blind_msg) };
+        // A payment id we never minted via checkout → refused even though no payment confirmed.
+        let unminted = IssueRequest { payment_id: "pay-unknown".into(), blind_msg: to_hex(&req.blind_msg) };
+        assert!(matches!(issue_logic(&state, &unminted), Err(IssueError::UnknownReference)));
+
+        // A minted-but-unpaid reference → refused (no confirmed payment).
+        state.pending.insert("pay-unpaid").unwrap();
+        let unpaid = IssueRequest { payment_id: "pay-unpaid".into(), blind_msg: to_hex(&req.blind_msg) };
         assert!(matches!(issue_logic(&state, &unpaid), Err(IssueError::Unpaid)));
 
         // Paid → issued; unblind → the token verifies under the public key.
@@ -221,18 +255,27 @@ mod tests {
         let req = token::blind(&pub_der, &msg).unwrap();
         let paid = IssueRequest { payment_id: "pay-1".into(), blind_msg: to_hex(&req.blind_msg) };
 
-        // Boot 1: file-backed issued set. First issuance for pay-1 succeeds.
+        // Boot 1: file-backed issued set. First issuance for pay-1 succeeds. The pending set is
+        // volatile here (its durability is independent); seed it with the minted reference.
         let boot1 = TokenState::with_issued(
             issuer.clone(),
             watcher.clone(),
             Arc::new(DurableSet::open(&path).unwrap()),
+            Arc::new(DurableSet::in_memory()),
         );
+        boot1.pending.insert("pay-1").unwrap();
         assert!(issue_logic(&boot1, &paid).is_ok(), "first issuance for the payment succeeds");
         drop(boot1); // simulate a Portal restart
 
         // Boot 2: same issuer/payment, issued set reloaded from the SAME file. The paid id is
         // already spent — re-issuing must be refused (regression guard for double-issue).
-        let boot2 = TokenState::with_issued(issuer, watcher, Arc::new(DurableSet::open(&path).unwrap()));
+        let boot2 = TokenState::with_issued(
+            issuer,
+            watcher,
+            Arc::new(DurableSet::open(&path).unwrap()),
+            Arc::new(DurableSet::in_memory()),
+        );
+        boot2.pending.insert("pay-1").unwrap();
         assert!(
             matches!(issue_logic(&boot2, &paid), Err(IssueError::AlreadyIssued)),
             "a payment that already minted a token must not mint a second one after a restart"

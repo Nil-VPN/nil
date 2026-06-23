@@ -45,6 +45,15 @@ impl PaymentWatcher for MockWatcher {
 }
 
 /// Monero's "no payment id" sentinel (short payment ids are zero when absent).
+///
+/// NOTE — short (8-byte) payment ids are DEPRECATED upstream and matched here only for
+/// backward compatibility. The modern, recommended way to attribute an incoming payment is a
+/// per-payment *subaddress*: the wallet derives a unique subaddress per checkout, and an
+/// incoming transfer's `subaddr_index` (returned by `get_transfers`) identifies the checkout
+/// without any payment id at all. That is strictly better for privacy and reliability (no
+/// integrated-address payment id to leak or fat-finger, no on-chain encrypted-payment-id
+/// quirks). [`parse_confirmed_by_subaddress`] implements that matching; the payment-id path
+/// remains for wallets/flows that still send a short id. See the architecture spec §7.
 const NULL_PAYMENT_ID: &str = "0000000000000000";
 
 /// `get_transfers` response (only the fields we need).
@@ -66,6 +75,22 @@ struct Transfer {
     /// Amount received, in atomic units (1 XMR = 1e12). Used to reject underpayment.
     #[serde(default)]
     amount: u64,
+    /// The subaddress the transfer arrived on (`{"major":m,"minor":n}`). The recommended,
+    /// payment-id-free way to attribute a payment to a checkout: one fresh subaddress per
+    /// checkout, identified by its `minor` index within the wallet account.
+    #[serde(default)]
+    #[allow(dead_code)] // read by parse_confirmed_by_subaddress (subaddress-based checkout path)
+    subaddr_index: SubaddrIndex,
+}
+
+/// Monero subaddress index (`major` = account, `minor` = address within the account).
+#[derive(Deserialize, Default, Clone, Copy)]
+#[allow(dead_code)] // fields read by parse_confirmed_by_subaddress
+struct SubaddrIndex {
+    #[serde(default)]
+    major: u32,
+    #[serde(default)]
+    minor: u32,
 }
 
 /// Pure core: from a `get_transfers` JSON-RPC response, the set of payment ids whose incoming
@@ -92,6 +117,33 @@ pub fn parse_confirmed(
                 && t.payment_id != NULL_PAYMENT_ID
         })
         .map(|t| t.payment_id)
+        .collect())
+}
+
+/// Pure core (preferred path): from a `get_transfers` response, the set of `"major/minor"`
+/// subaddress indices whose incoming transfer is sufficiently confirmed AND paid at least
+/// `min_atomic`. This is the modern, payment-id-free attribution: a checkout allocates a fresh
+/// subaddress and gates issuance on that subaddress index appearing here. Same confirmation and
+/// underpayment guards as [`parse_confirmed`]; no dependency on a (deprecated) short payment id.
+/// The returned key format (`"<major>/<minor>"`) is stable and what a subaddress-based checkout
+/// should store as its reference. Unit-tested.
+// Reachable API for a subaddress-based checkout flow; exercised by tests today.
+#[allow(dead_code)]
+pub fn parse_confirmed_by_subaddress(
+    body: &[u8],
+    min_confirmations: u64,
+    min_atomic: u64,
+) -> anyhow::Result<HashSet<String>> {
+    let resp: RpcResponse =
+        serde_json::from_slice(body).map_err(|e| anyhow::anyhow!("parse get_transfers: {e}"))?;
+    let Some(result) = resp.result else {
+        return Ok(HashSet::new());
+    };
+    Ok(result
+        .incoming
+        .into_iter()
+        .filter(|t| t.confirmations >= min_confirmations && t.amount >= min_atomic)
+        .map(|t| format!("{}/{}", t.subaddr_index.major, t.subaddr_index.minor))
         .collect())
 }
 
@@ -198,6 +250,20 @@ mod tests {
         assert!(!confirmed.contains("bbbbbbbbbbbbbbbb"), "3 < 10 confirmations → not yet");
         assert!(!confirmed.contains("cccccccccccccccc"), "amount 500 < 1000 → underpaid, rejected");
         assert!(!confirmed.contains("0000000000000000"), "null payment id is ignored");
+        assert_eq!(confirmed.len(), 1);
+    }
+
+    #[test]
+    fn parse_confirmed_by_subaddress_keys_on_minor_index_with_the_same_guards() {
+        let body = br#"{"id":"0","jsonrpc":"2.0","result":{"in":[
+            {"subaddr_index":{"major":0,"minor":7},"confirmations":12,"amount":1000},
+            {"subaddr_index":{"major":0,"minor":8},"confirmations":3,"amount":2000},
+            {"subaddr_index":{"major":0,"minor":9},"confirmations":20,"amount":500}
+        ]}}"#;
+        let confirmed = parse_confirmed_by_subaddress(body, 10, 1000).expect("parse");
+        assert!(confirmed.contains("0/7"), "12 conf, 1000 ≥ 1000 → confirmed");
+        assert!(!confirmed.contains("0/8"), "3 < 10 confirmations → not yet");
+        assert!(!confirmed.contains("0/9"), "amount 500 < 1000 → underpaid, rejected");
         assert_eq!(confirmed.len(), 1);
     }
 

@@ -8,6 +8,7 @@
 
 mod account;
 mod app;
+mod billing;
 mod monero;
 mod ratelimit;
 mod state;
@@ -114,22 +115,39 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Pending checkout-reference set: durable when NW_PENDING_PATH is set, else volatile + a
+    // warning (a restart with a volatile set forgets which references were minted, so issuance
+    // for an in-flight checkout would fail closed until a new checkout is started).
+    let pending = match std::env::var("NW_PENDING_PATH") {
+        Ok(path) => {
+            let s = DurableSet::open(&path).map_err(|e| anyhow::anyhow!("open pending store {path}: {e}"))?;
+            tracing::info!(%path, pending = s.len(), "durable checkout-reference set loaded");
+            Arc::new(s)
+        }
+        Err(_) => {
+            tracing::warn!("NW_PENDING_PATH unset — the checkout-reference set is VOLATILE (dev only; a restart drops in-flight checkouts)");
+            Arc::new(DurableSet::in_memory())
+        }
+    };
+
     // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning
     // (a restart with a volatile set could re-issue a token for an already-spent payment).
     let token_state = match std::env::var("NW_ISSUED_PATH") {
         Ok(path) => {
             let s = DurableSet::open(&path).map_err(|e| anyhow::anyhow!("open issued store {path}: {e}"))?;
             tracing::info!(%path, issued = s.len(), "durable one-token-per-payment set loaded");
-            TokenState::with_issued(issuer, watcher, Arc::new(s))
+            TokenState::with_issued(issuer, watcher, Arc::new(s), pending)
         }
         Err(_) => {
             tracing::warn!("NW_ISSUED_PATH unset — the one-token-per-payment set is VOLATILE (dev only; a restart can re-issue a paid token)");
-            TokenState::new(issuer, watcher)
+            // Volatile issued set, but keep whatever (possibly durable) pending set we built above.
+            TokenState::with_issued(issuer, watcher, Arc::new(DurableSet::in_memory()), pending)
         }
     };
 
-    let app = app::router(AppState { store })
-        .merge(token_router(token_state))
+    let app = app::router(AppState::new(store))
+        .merge(token_router(token_state.clone()))
+        .merge(billing::billing_router(token_state))
         .layer(TraceLayer::new_for_http());
 
     let addr = std::env::var("NW_PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

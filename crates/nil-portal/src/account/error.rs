@@ -15,6 +15,8 @@ pub enum ApiError {
     NotFound,
     #[error("invalid recovery code")]
     Unauthorized,
+    #[error("too many requests")]
+    TooManyRequests,
     #[error("internal error")]
     Internal,
 }
@@ -31,6 +33,7 @@ impl IntoResponse for ApiError {
             ApiError::BadPhrase(_) => StatusCode::BAD_REQUEST,
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
+            ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = ErrorBody {
