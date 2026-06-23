@@ -34,4 +34,8 @@ pub enum AttestError {
     /// The platform TCB is out of date / revoked and the policy does not allow it.
     #[error("TCB not up to date: {0}")]
     TcbNotUpToDate(String),
+    /// The verified report's guest policy is incompatible with confidentiality (e.g. DEBUG
+    /// allowed, which permits the operator to read guest memory). Fail closed.
+    #[error("attestation policy violation: {0}")]
+    PolicyViolation(String),
 }
