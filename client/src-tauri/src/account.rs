@@ -25,6 +25,11 @@ impl PortalClient {
     /// Read `PORTAL_URL` (default `http://127.0.0.1:8080`). Does not connect.
     pub fn from_env() -> Self {
         let base_url = std::env::var("PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
+        Self::with_base_url(base_url)
+    }
+
+    /// Build against an explicit Portal URL (from the GUI config). Does not connect.
+    pub fn with_base_url(base_url: String) -> Self {
         PortalClient {
             http: reqwest::Client::new(),
             base_url,

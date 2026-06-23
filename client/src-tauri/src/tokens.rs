@@ -58,6 +58,11 @@ impl Default for TokenClient {
 impl TokenClient {
     pub fn from_env() -> Self {
         let base_url = std::env::var("PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
+        Self::with_base_url(base_url)
+    }
+
+    /// Build against an explicit Portal URL (from the GUI config). Does not connect.
+    pub fn with_base_url(base_url: String) -> Self {
         TokenClient { http: reqwest::Client::new(), base_url }
     }
 

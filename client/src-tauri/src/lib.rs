@@ -1,8 +1,9 @@
 //! NIL VPN client (User plane) — Tauri commands bridging the frontend to the engine
-//! and the Business plane. Honest by construction: a VPN is not anonymity, and Phase 0
-//! uses the loopback transport (no real tunnel) — the UI says so.
+//! and the Business plane. Honest by construction: a VPN is not anonymity, and when no
+//! Coordinator is configured the loopback transport (no real tunnel) is used — the UI says so.
 
 mod account;
+mod config;
 mod engine;
 mod killswitch;
 mod leakguard;
@@ -13,22 +14,38 @@ mod tokenstore;
 use tauri::State;
 
 use account::{AnonymousAccount, Location, PortalClient, RecoverResult};
+use config::{ClientConfig, ConfigState};
 use engine::{AppEngine, ConnState};
 use tokens::TokenClient;
 use tokenstore::TokenStore;
 
-// ---- Account commands (talk to the live Portal; errors surface in the UI) ----
+// ---- Settings: operator endpoints + toggles (persisted; applied to the datapath env) ----
+
+#[tauri::command]
+fn get_config(config: State<'_, ConfigState>) -> ClientConfig {
+    config.get()
+}
+
+#[tauri::command]
+fn set_config(cfg: ClientConfig, config: State<'_, ConfigState>) -> Result<(), String> {
+    config.set(cfg).map_err(|e| e.to_string())
+}
+
+// ---- Account commands (talk to the live Portal at the configured URL) ----
 
 #[tauri::command]
 async fn create_anonymous_account(
-    portal: State<'_, PortalClient>,
+    config: State<'_, ConfigState>,
 ) -> Result<AnonymousAccount, String> {
-    portal.create_anonymous().await.map_err(|e| e.to_string())
+    PortalClient::with_base_url(config.get().portal_url)
+        .create_anonymous()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 async fn create_email_account(_email: String) -> Result<AnonymousAccount, String> {
-    // Email accounts (encrypted email at rest) are designed but not built in Phase 0.
+    // Email accounts (encrypted email at rest) are designed but not built in this preview.
     Err("Email accounts aren't available in this preview yet — create an anonymous account instead.".to_string())
 }
 
@@ -36,47 +53,31 @@ async fn create_email_account(_email: String) -> Result<AnonymousAccount, String
 async fn recover_account(
     phrase: Vec<String>,
     recovery_code: String,
-    portal: State<'_, PortalClient>,
+    config: State<'_, ConfigState>,
 ) -> Result<RecoverResult, String> {
-    portal
+    PortalClient::with_base_url(config.get().portal_url)
         .recover(phrase, recovery_code)
         .await
         .map_err(|e| e.to_string())
 }
 
-// ---- Engine commands (drive the loopback state machine) ----
+// ---- Engine commands ----
 
 #[tauri::command]
 async fn connect(
     engine: State<'_, AppEngine>,
     store: State<'_, TokenStore>,
+    config: State<'_, ConfigState>,
 ) -> Result<ConnState, String> {
-    // Arm leak protection before the tunnel comes up.
+    // Sync the datapath env to the latest configured endpoints/toggles, then arm leak protection
+    // before the tunnel comes up.
+    config.reapply_env();
     leakguard::arm().map_err(|e| e.to_string())?;
     // Consume one token (removed from disk before use, so a crash never replays a spent token).
     // None is fine for the loopback/dev path; the engine returns NoTokens if a Coordinator is
     // configured but the store is empty (fail closed — never connect unattested/unpaid).
     let token = store.take_one().map_err(|e| e.to_string())?;
     engine.connect(token).await.map_err(|e| e.to_string())
-}
-
-// ---- Token commands (buy = blind→issue→finalize against the Portal; balance = local count) ----
-
-#[tauri::command]
-async fn token_balance(store: State<'_, TokenStore>) -> Result<usize, String> {
-    store.count().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-async fn buy_tokens(
-    payment_id: String,
-    tokens: State<'_, TokenClient>,
-    store: State<'_, TokenStore>,
-) -> Result<usize, String> {
-    // One token per confirmed payment (the Portal enforces it). Top up with a new payment id.
-    let token = tokens.acquire(&payment_id).await.map_err(|e| e.to_string())?;
-    store.add(&[token]).map_err(|e| e.to_string())?;
-    store.count().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -89,30 +90,61 @@ async fn status(engine: State<'_, AppEngine>) -> Result<ConnState, String> {
     Ok(engine.state().await)
 }
 
-// ---- Stubs (mocked data / no-ops in Phase 0) ----
+// ---- Token commands (buy = blind→issue→finalize against the Portal; balance = local count) ----
+
+#[tauri::command]
+async fn token_balance(store: State<'_, TokenStore>) -> Result<usize, String> {
+    store.count().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn buy_tokens(
+    payment_id: String,
+    config: State<'_, ConfigState>,
+    store: State<'_, TokenStore>,
+) -> Result<usize, String> {
+    // One token per confirmed payment (the Portal enforces it). Top up with a new payment id.
+    let token = TokenClient::with_base_url(config.get().portal_url)
+        .acquire(&payment_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    store.add(&[token]).map_err(|e| e.to_string())?;
+    store.count().map_err(|e| e.to_string())
+}
+
+// ---- Locations / transport / security toggles ----
 
 #[tauri::command]
 async fn list_locations() -> Result<Vec<Location>, String> {
+    // Real per-hop path selection is the Coordinator's job; the client asks for "automatic".
     Ok(vec![Location {
         id: "auto".to_string(),
-        label: "Automatic (mocked — loopback)".to_string(),
+        label: "Automatic — Coordinator-selected path".to_string(),
     }])
 }
 
 #[tauri::command]
 async fn set_transport_mode(_mode: String) -> Result<(), String> {
-    // MASQUE/cascade selection arrives in Phase 1/4. Phase 0 always uses loopback.
+    // MASQUE is the default; AmneziaWG/wstunnel cascade selection is driven by the node config.
     Ok(())
 }
 
 #[tauri::command]
 async fn set_split_tunnel(enabled: bool, apps: Vec<String>) -> Result<(), String> {
+    // Documented no-op today — real per-app/per-route enforcement lands with the datapath split
+    // tunnel. The UI labels it honestly so it never claims protection it doesn't yet provide.
     splittunnel::configure(enabled, &apps).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
-async fn toggle_kill_switch(enabled: bool) -> Result<(), String> {
-    killswitch::set_enabled(enabled).map_err(|e| e.to_string())
+fn toggle_kill_switch(enabled: bool, config: State<'_, ConfigState>) -> Result<(), String> {
+    // The kill-switch is enforced by the datapath (`NW_KILLSWITCH`, armed atomically by the
+    // tunnel) — so the toggle persists into config and takes effect on the next connect. The
+    // platform hook stays for future per-OS toggles (e.g. mobile always-on).
+    killswitch::set_enabled(enabled).map_err(|e| e.to_string())?;
+    let mut cfg = config.get();
+    cfg.kill_switch = enabled;
+    config.set(cfg).map_err(|e| e.to_string())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -120,17 +152,20 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppEngine::new())
-        .manage(PortalClient::from_env())
-        .manage(TokenClient::from_env())
         .setup(|app| {
-            // The token store lives in the app's local-data dir — only the device holds tokens
-            // (they're unlinkable to the account/payment, so this is privacy-safe).
             use tauri::Manager;
             let dir = app.path().app_local_data_dir()?;
+            // The token store lives in the app's local-data dir — only the device holds tokens
+            // (they're unlinkable to the account/payment, so this is privacy-safe).
             app.manage(TokenStore::open(dir.join("tokens.json")));
+            // Persisted config (operator endpoints + toggles), applied to the datapath env now so
+            // a Coordinator/Portal set in Settings is live without any env vars.
+            app.manage(ConfigState::new(dir.join("config.json")));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_config,
+            set_config,
             create_anonymous_account,
             create_email_account,
             recover_account,
