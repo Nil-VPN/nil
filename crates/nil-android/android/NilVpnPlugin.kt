@@ -20,13 +20,18 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun startVPN(invoke: Invoke) {
         // OS consent: returns an Intent the first time; null once granted.
-        VpnService.prepare(activity)?.let { activity.startActivityForResult(it, VPN_CONSENT) }
+        VpnService.prepare(activity)?.let {
+            activity.startActivityForResult(it, VPN_CONSENT)
+            invoke.reject("VPN permission required; approve the system dialog and start again")
+            return
+        }
         val a = invoke.parseArgs(StartArgs::class.java)
         val i = Intent(activity, NilVpnService::class.java).apply {
             putExtra("nodeHost", a.nodeHost)
             putExtra("nodePort", a.nodePort)
             putExtra("serverName", a.serverName ?: a.nodeHost)
             putExtra("measurementHex", a.measurementHex ?: "")
+            putExtra("teeName", a.teeName ?: "sev-snp")
             putExtra("allowUnattested", a.allowUnattested)
         }
         activity.startForegroundService(i)
@@ -46,6 +51,7 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
         var nodePort: Int = 443
         var serverName: String? = null
         var measurementHex: String? = null
+        var teeName: String? = null
         var allowUnattested: Boolean = false
     }
 }

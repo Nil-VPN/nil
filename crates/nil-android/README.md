@@ -42,20 +42,26 @@ cargo ndk -t arm64-v8a -t x86_64 -P 21 \
    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
    <application ...>
+     <!-- VPN consent handshake (VpnService.prepare + system dialog), then starts the service. -->
+     <activity android:name="com.nilvpn.VpnConsentActivity"
+               android:theme="@android:style/Theme.Translucent.NoTitleBar"
+               android:exported="true"/>
      <service android:name="com.nilvpn.NilVpnService"
-              android:process=":vpn"
               android:permission="android.permission.BIND_VPN_SERVICE"
               android:foregroundServiceType="specialUse" android:exported="false">
        <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
+       <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="vpn"/>
      </service>
    </application>
    ```
 4. Wire the cargo-ndk jniLibs build (above) into the Gradle build; ensure `libc++_shared.so` ships.
-5. `pnpm tauri android build --apk`, then emulator smoke:
-   `adb install`, Connect → VPN consent → `establish()` → `nativeStart` → expect logcat
-   `MASQUE CONNECT-IP established` against the node. For a reachability-only smoke against a live
-   node whose pinned measurement you don't have, pass `allowUnattested=true` (NOT an attestation
-   validation — documented caveat).
+5. `pnpm tauri android build --apk`, then emulator e2e (VERIFIED on an arm64 AVD):
+   `adb install` → launch `VpnConsentActivity` (the app's Connect routes here) → consent handshake
+   → `NilVpnService` → `establish()` (tun0 up) → `nativeStart` → attested MASQUE connect to the live
+   node → real traffic egresses. Headless consent: `adb shell appops set <pkg> ACTIVATE_VPN allow`
+   makes `prepare()` return null (no dialog); otherwise auto-tap the system dialog via `uiautomator`.
+   With `allowUnattested=false` + a pinned measurement, a non-zero `nativeStart` handle proves the
+   attestation gate ran and passed (the engine returns 0 on any connect/attestation failure).
 
 Real-device behaviors (Doze, Wi-Fi↔LTE handoff, carrier MTU, boot always-on) and the Play-Store
 VpnService policy form are device/account-bound and out of scope for headless CI.

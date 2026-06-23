@@ -52,12 +52,14 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     mtu: jint,
     server_name: JString,
     measurement_hex: JString,
+    tee_name: JString,
     allow_unattested: jboolean,
     vpn_service: JObject,
 ) -> jlong {
     let host = jstr(&mut env, &node_host);
     let sni = jstr(&mut env, &server_name);
     let meas_hex = jstr(&mut env, &measurement_hex);
+    let tee_name = jstr(&mut env, &tee_name);
     let allow = allow_unattested != 0;
 
     // protect() callback: invoked at the UDP bind site (bind → protect → connect) so the tunnel's
@@ -69,23 +71,30 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
             return 0;
         }
     };
-    let socket_hook: Arc<dyn Fn(RawFd) + Send + Sync> = Arc::new(move |fd: RawFd| {
+    let socket_hook: Arc<dyn Fn(RawFd) -> bool + Send + Sync> = Arc::new(move |fd: RawFd| {
         if let Some(vm) = JVM.get() {
             if let Ok(mut env) = vm.attach_current_thread() {
-                if let Err(e) =
-                    env.call_method(&vpn_global, "protect", "(I)Z", &[JValue::Int(fd as jint)])
+                match env
+                    .call_method(&vpn_global, "protect", "(I)Z", &[JValue::Int(fd as jint)])
+                    .and_then(|v| v.z())
                 {
-                    log::error!("VpnService.protect failed: {e}");
+                    Ok(true) => return true,
+                    Ok(false) => log::error!("VpnService.protect returned false"),
+                    Err(e) => log::error!("VpnService.protect failed: {e}"),
                 }
             }
         }
+        false
     });
 
     let expected = if allow || meas_hex.is_empty() {
         None
     } else {
         match hex_to_bytes(&meas_hex) {
-            Some(b) => Some(AttestExpectation { tee: Tee::SevSnp, measurement: Measurement(b) }),
+            Some(b) => Some(AttestExpectation {
+                tee: parse_tee(&tee_name),
+                measurement: Measurement(b),
+            }),
             None => {
                 log::error!("measurement is not valid hex");
                 return 0;
@@ -107,6 +116,7 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
         kind: TransportKind::Masque,
         wg_pub: None,
         expected,
+        grant: None,
     };
     // The VpnService.Builder already set the TUN address/DNS/MTU/routes at establish(); up_with_fd
     // only uses `node`. The other fields are placeholders the NoopNet ignores.
@@ -122,7 +132,10 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
         also_except: Vec::new(),
     };
 
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt,
         Err(e) => {
             log::error!("tokio runtime: {e}");
@@ -137,13 +150,28 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
         }
     };
     log::info!("nil-android tunnel up");
-    let engine = Box::new(Engine { rt, tunnel: Mutex::new(Some(tunnel)) });
+    let engine = Box::new(Engine {
+        rt,
+        tunnel: Mutex::new(Some(tunnel)),
+    });
     Box::into_raw(engine) as jlong
+}
+
+fn parse_tee(s: &str) -> Tee {
+    if s.eq_ignore_ascii_case("tdx") {
+        Tee::Tdx
+    } else {
+        Tee::SevSnp
+    }
 }
 
 /// Tear the tunnel down and free the engine. Idempotent on a 0 handle.
 #[no_mangle]
-pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(_env: JNIEnv, _class: JClass, handle: jlong) {
+pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(
+    _env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) {
     if handle == 0 {
         return;
     }
@@ -159,10 +187,16 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(_env: JNIEnv, _class
 
 /// Tiny status JSON for the app↔service IPC.
 #[no_mangle]
-pub extern "system" fn Java_com_nilvpn_NilNative_nativeStatus(env: JNIEnv, _class: JClass, handle: jlong) -> jstring {
+pub extern "system" fn Java_com_nilvpn_NilNative_nativeStatus(
+    env: JNIEnv,
+    _class: JClass,
+    handle: jlong,
+) -> jstring {
     let state = if handle == 0 { "down" } else { "up" };
     let json = format!("{{\"state\":\"{state}\"}}");
-    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    env.new_string(json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
@@ -170,5 +204,8 @@ fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }

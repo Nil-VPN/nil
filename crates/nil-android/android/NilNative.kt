@@ -15,6 +15,7 @@ object NilNative {
         mtu: Int,
         serverName: String,
         measurementHex: String,   // "" when allowUnattested
+        teeName: String,          // "sev-snp" or "tdx"
         allowUnattested: Boolean,
         vpnService: android.net.VpnService,  // engine calls .protect(fd) on this
     ): Long
