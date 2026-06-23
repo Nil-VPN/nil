@@ -13,7 +13,9 @@ mod api;
 mod config;
 mod nullifier;
 mod pathsel;
+mod ratelimit;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -31,8 +33,19 @@ fn file_or_volatile_nullifiers(cfg: &Arc<config::CoordConfig>) -> Result<api::Co
             Ok(api::CoordState::with_nullifiers(cfg.clone(), Arc::new(set)))
         }
         None => {
+            // A volatile nullifier set re-permits a double-spend of every redeemed token after a
+            // restart — never acceptable in production. Refuse to boot unless an operator has
+            // explicitly opted into dev fallbacks; the friction is intentional (fail closed).
+            if !nil_core::net::env_flag("NW_ALLOW_DEV_FALLBACKS") {
+                anyhow::bail!(
+                    "NW_NULLIFIER_PATH unset (no durable spent-token set): a volatile set would \
+                     re-permit double-spend of every redeemed token after a restart. Set \
+                     NW_NULLIFIER_PATH (or NW_NULLIFIER_PG_URL with the `postgres` feature), or set \
+                     NW_ALLOW_DEV_FALLBACKS=1 to explicitly accept a VOLATILE dev nullifier set."
+                );
+            }
             tracing::warn!(
-                "NW_NULLIFIER_PATH unset — the spent-token nullifier set is VOLATILE (dev only); \
+                "NW_ALLOW_DEV_FALLBACKS=1: the spent-token nullifier set is VOLATILE (dev only); \
                  a restart will re-permit double-spend of every redeemed token"
             );
             Ok(api::CoordState::new(cfg.clone()))
@@ -78,6 +91,12 @@ async fn main() -> Result<()> {
     let state = file_or_volatile_nullifiers(&cfg)?;
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, api::router(state)).await?;
+    // ConnectInfo so `/v1/redeem` can rate-limit by client IP (the IP is used transiently for the
+    // limiter only — never stored, logged, or tied to an account).
+    axum::serve(
+        listener,
+        api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
