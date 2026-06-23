@@ -42,7 +42,10 @@ impl Tunnel {
         // Fresh per-connection nonce, bound into the node's attestation report (same as `up`).
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("nonce entropy: {e}"))?;
-        let grant = Grant { token: Vec::new(), nonce };
+        let grant = cfg.node.grant.clone().unwrap_or(Grant {
+            token: Vec::new(),
+            nonce,
+        });
 
         let session = transport
             .connect(cfg.node.clone(), grant)
@@ -61,6 +64,13 @@ impl Tunnel {
         let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
         tracing::info!("tunnel up (android)");
 
-        Ok(Tunnel { transport, session: Some(session), net, cancel, pumps, _tun: tun })
+        Ok(Tunnel {
+            transport,
+            session: Some(session),
+            net,
+            cancel,
+            pumps,
+            _tun: tun,
+        })
     }
 }

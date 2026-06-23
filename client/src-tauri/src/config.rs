@@ -7,6 +7,7 @@
 //! datapath drift, the proven `launch.rs` path stays byte-identical. The file holds ONLY operator
 //! endpoints + toggles; no account, token, payment, or identity ever lands here (PD-1/PD-3).
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -64,7 +65,9 @@ impl ClientConfig {
             Ok(bytes) => match serde_json::from_slice::<ClientConfig>(&bytes) {
                 Ok(cfg) => cfg,
                 Err(e) => {
-                    tracing::warn!("client config parse failed ({e}); falling back to env/defaults");
+                    tracing::warn!(
+                        "client config parse failed ({e}); falling back to env/defaults"
+                    );
                     Self::from_env()
                 }
             },
@@ -76,7 +79,10 @@ impl ClientConfig {
     fn from_env() -> Self {
         let d = Self::live_defaults();
         let env_or = |k: &str, dflt: String| {
-            std::env::var(k).ok().filter(|s| !s.is_empty()).unwrap_or(dflt)
+            std::env::var(k)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(dflt)
         };
         ClientConfig {
             portal_url: env_or("PORTAL_URL", d.portal_url),
@@ -84,7 +90,9 @@ impl ClientConfig {
             monero_address: env_or("NW_MONERO_ADDRESS", d.monero_address),
             expected_measurement: env_or("NW_EXPECTED_MEASUREMENT", d.expected_measurement),
             expected_tee: env_or("NW_EXPECTED_TEE", d.expected_tee),
-            kill_switch: std::env::var("NW_KILLSWITCH").map(|v| v != "0").unwrap_or(d.kill_switch),
+            kill_switch: std::env::var("NW_KILLSWITCH")
+                .map(|v| v != "0")
+                .unwrap_or(d.kill_switch),
             node_host: env_or("NW_NODE_HOST", d.node_host),
         }
     }
@@ -96,14 +104,7 @@ impl ClientConfig {
             std::fs::create_dir_all(dir)?;
         }
         let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &body)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-        }
-        std::fs::rename(&tmp, path)
+        write_private_atomic(path, &body)
     }
 
     /// Apply to the process environment so `nil_datapath::launch` (which reads `NW_*`) and the
@@ -119,6 +120,32 @@ impl ClientConfig {
         set_or_clear("NW_EXPECTED_TEE", &self.expected_tee);
         std::env::set_var("NW_KILLSWITCH", if self.kill_switch { "1" } else { "0" });
     }
+}
+
+fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(body)?;
+        f.flush()?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn set_or_clear(key: &str, val: &str) {
@@ -141,7 +168,10 @@ impl ConfigState {
     pub fn new(path: PathBuf) -> Self {
         let cfg = ClientConfig::load(&path);
         cfg.apply_env();
-        ConfigState { cfg: RwLock::new(cfg), path }
+        ConfigState {
+            cfg: RwLock::new(cfg),
+            path,
+        }
     }
 
     pub fn get(&self) -> ClientConfig {
@@ -174,7 +204,10 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        p.push(format!("nil-config-test-{}-{n}/config.json", std::process::id()));
+        p.push(format!(
+            "nil-config-test-{}-{n}/config.json",
+            std::process::id()
+        ));
         p
     }
 
@@ -184,7 +217,10 @@ mod tests {
         assert!(d.portal_url.contains("api.nilvpn.com"));
         assert!(d.coordinator_url.contains("ctrl.nilvpn.com"));
         assert!(d.kill_switch, "kill-switch on by default (fail-closed)");
-        assert!(d.expected_measurement.is_empty(), "Coordinator delivers the pin by default");
+        assert!(
+            d.expected_measurement.is_empty(),
+            "Coordinator delivers the pin by default"
+        );
     }
 
     #[test]
@@ -192,7 +228,10 @@ mod tests {
         let path = tmp_path();
         // Missing file → env/live defaults.
         let loaded = ClientConfig::load(&path);
-        assert_eq!(loaded.coordinator_url, ClientConfig::live_defaults().coordinator_url);
+        assert_eq!(
+            loaded.coordinator_url,
+            ClientConfig::live_defaults().coordinator_url
+        );
         // Round-trip a custom config.
         let mut cfg = ClientConfig::live_defaults();
         cfg.coordinator_url = "https://ctrl.example.test".into();
@@ -219,7 +258,10 @@ mod tests {
         // Tripwire: the persisted shape must never gain an account/token/payment field.
         let json = serde_json::to_string(&ClientConfig::live_defaults()).unwrap();
         for forbidden in ["account", "token", "payment", "recovery", "secret"] {
-            assert!(!json.contains(forbidden), "config must not carry `{forbidden}`");
+            assert!(
+                !json.contains(forbidden),
+                "config must not carry `{forbidden}`"
+            );
         }
     }
 }

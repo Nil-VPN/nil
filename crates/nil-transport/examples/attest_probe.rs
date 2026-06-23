@@ -27,10 +27,17 @@ fn from_hex(s: &str) -> Vec<u8> {
 
 fn main() {
     let host = env::var("NODE_HOST").expect("set NODE_HOST");
-    let port: u16 = env::var("NODE_PORT").unwrap_or_else(|_| "443".into()).parse().expect("port");
+    let port: u16 = env::var("NODE_PORT")
+        .unwrap_or_else(|_| "443".into())
+        .parse()
+        .expect("port");
     let meas_hex = env::var("NODE_MEASUREMENT").expect("set NODE_MEASUREMENT (48-byte hex)");
     let mut measurement = from_hex(&meas_hex);
-    assert_eq!(measurement.len(), 48, "SEV-SNP measurement must be 48 bytes");
+    assert_eq!(
+        measurement.len(),
+        48,
+        "SEV-SNP measurement must be 48 bytes"
+    );
 
     let tweak = env::var("PROBE_TWEAK").is_ok();
     if tweak {
@@ -47,20 +54,38 @@ fn main() {
         port,
         kind: TransportKind::Masque,
         wg_pub: None,
-        expected: Some(AttestExpectation { tee: Tee::SevSnp, measurement: Measurement(measurement) }),
+        expected: Some(AttestExpectation {
+            tee: Tee::SevSnp,
+            measurement: Measurement(measurement),
+        }),
+        grant: None,
     };
-    let grant = Grant { token: Vec::new(), nonce };
+    let grant = Grant {
+        token: Vec::new(),
+        nonce,
+    };
 
     // Fail-closed config (the production default): no measurement pinned would refuse, and a
     // mismatch refuses. We DO pin one, so a genuine matching report is required to pass.
-    let transport = MasqueTransport::with_config(MasqueConfig { allow_unattested: false, ..Default::default() });
+    let transport = MasqueTransport::with_config(MasqueConfig {
+        allow_unattested: false,
+        ..Default::default()
+    });
 
-    eprintln!("[probe] connecting to {host}:{port} (pin {}…, tweak={tweak})", &meas_hex[..16]);
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    eprintln!(
+        "[probe] connecting to {host}:{port} (pin {}…, tweak={tweak})",
+        &meas_hex[..16]
+    );
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
     let res = rt.block_on(async move { transport.connect(endpoint, grant).await });
 
     match res {
-        Ok(s) => println!("RESULT=ATTESTED-OK (session={s:?}) — node's real report verified against the pin"),
+        Ok(s) => println!(
+            "RESULT=ATTESTED-OK (session={s:?}) — node's real report verified against the pin"
+        ),
         Err(e) => println!("RESULT=REFUSED — {e}"),
     }
 }

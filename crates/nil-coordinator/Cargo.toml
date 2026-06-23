@@ -20,6 +20,7 @@ axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+getrandom = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }  # the swappable NullifierStore trait
 tracing = { workspace = true }

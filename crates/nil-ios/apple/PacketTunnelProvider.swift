@@ -19,6 +19,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let port = UInt16((cfg["nodePort"] as? Int) ?? 443)
         let sni = (cfg["serverName"] as? String) ?? host
         let measurement = (cfg["measurementHex"] as? String) ?? ""
+        let teeName = (cfg["teeName"] as? String) ?? "sev-snp"
         let allow = (cfg["allowUnattested"] as? Bool) ?? false
         startCompletion = completionHandler
 
@@ -34,10 +35,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in
-            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, allow_unattested: allow)
+        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in teeName.withCString { tp in
+            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, tee_name: tp, allow_unattested: allow)
             tunnel = nil_start(&c, ctx, writeCb, statusCb)
-        }}}
+        }}}}
         if tunnel == nil { completionHandler(NEVPNError(.configurationInvalid)); startCompletion = nil }
     }
 

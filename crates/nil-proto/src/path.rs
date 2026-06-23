@@ -26,6 +26,13 @@ pub struct Hop {
     /// Node WireGuard static public key (lowercase hex) for the inner PQ-WireGuard handshake.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wg_pub: Option<String>,
+    /// Short-lived opaque Coordinator grant for this hop, lowercase hex. The client never
+    /// interprets it; it forwards it to the node in CONNECT-IP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
+    /// Fresh nonce bound into both the grant and the node's attestation report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_nonce: Option<String>,
 }
 
 /// `POST /v1/redeem` response: the (ordered) hops forming the path.

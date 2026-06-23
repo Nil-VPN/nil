@@ -22,14 +22,14 @@ pub mod launch;
 #[cfg(feature = "launch")]
 mod redeem;
 
+#[cfg(target_os = "android")]
+mod android;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-#[cfg(target_os = "android")]
-mod android;
 
 /// How to bring up the tunnel.
 pub struct TunnelConfig {
@@ -67,9 +67,19 @@ pub trait NetControl: Send {
 
 /// Fallback for targets without a native datapath impl. Compiles everywhere so the workspace
 /// builds on any host; refuses to arm at runtime.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+)))]
 struct StubNet;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+)))]
 impl NetControl for StubNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
         anyhow::bail!("system datapath is implemented for Linux, macOS, and Windows only")
@@ -89,7 +99,12 @@ fn new_net_control() -> Box<dyn NetControl> {
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(windows::WinNet::default())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "android"
+)))]
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(StubNet)
 }
@@ -109,7 +124,10 @@ impl Tunnel {
     /// Desktop only — Android brings the tunnel up over a `VpnService`-provided fd (`up_with_fd`
     /// in `android.rs`), so routing/DNS/MTU/kill-switch are the OS's job, not ours.
     #[cfg(not(target_os = "android"))]
-    pub async fn up(transport: Arc<dyn Transport>, mut cfg: TunnelConfig) -> anyhow::Result<Tunnel> {
+    pub async fn up(
+        transport: Arc<dyn Transport>,
+        mut cfg: TunnelConfig,
+    ) -> anyhow::Result<Tunnel> {
         // `cfg.node` is the directly-reachable hop: a single node, or the *entry* of a
         // multi-hop path. Its IP is the kill-switch host-route exception so the tunnel's own
         // QUIC doesn't loop; inner hops are reached through the tunnel and need no exception.
@@ -129,7 +147,10 @@ impl Tunnel {
         // into its attestation report's report_data, and the appraisal checks the binding.
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("nonce entropy: {e}"))?;
-        let grant = nil_core::Grant { token: Vec::new(), nonce };
+        let grant = cfg.node.grant.clone().unwrap_or(nil_core::Grant {
+            token: Vec::new(),
+            nonce,
+        });
 
         let session = transport
             .connect(cfg.node.clone(), grant)
@@ -143,7 +164,11 @@ impl Tunnel {
         if let Some(m) = transport.tunnel_mtu(&session) {
             let m = m.min(u16::MAX as usize) as u16;
             if m < cfg.mtu {
-                tracing::info!(negotiated = m, configured = cfg.mtu, "sizing TUN to negotiated tunnel MTU");
+                tracing::info!(
+                    negotiated = m,
+                    configured = cfg.mtu,
+                    "sizing TUN to negotiated tunnel MTU"
+                );
                 cfg.mtu = m;
             }
         }
@@ -170,7 +195,14 @@ impl Tunnel {
         let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
         tracing::info!(tun = %tun_name, "tunnel up");
 
-        Ok(Tunnel { transport, session: Some(session), net, cancel, pumps, _tun: tun })
+        Ok(Tunnel {
+            transport,
+            session: Some(session),
+            net,
+            cancel,
+            pumps,
+            _tun: tun,
+        })
     }
 
     /// Tear down cleanly: stop the pump, restore networking, close the session.

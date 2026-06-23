@@ -20,7 +20,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 
 use crate::{MasqueTransport, Transport};
 
@@ -61,13 +63,23 @@ impl PathTransport {
         self.hops.len()
     }
 
-    /// A fresh per-hop [`Grant`]: a new random attestation nonce, reusing the base token. Each
-    /// hop proves freshness to the client independently (spec §5/§6).
+    /// A fresh dev/direct-node [`Grant`] when a hop did not come from a Coordinator response.
+    /// Coordinator-redeemed paths carry per-hop grants on the endpoint itself.
     fn fresh_grant(base: &Grant) -> Result<Grant> {
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce)
             .map_err(|e| Error::Transport(format!("path nonce entropy: {e}")))?;
-        Ok(Grant { token: base.token.clone(), nonce })
+        Ok(Grant {
+            token: base.token.clone(),
+            nonce,
+        })
+    }
+
+    fn grant_for(hop: &NodeEndpoint, fallback: &Grant) -> Result<Grant> {
+        match hop.grant.clone() {
+            Some(grant) => Ok(grant),
+            None => Self::fresh_grant(fallback),
+        }
     }
 }
 
@@ -84,9 +96,10 @@ impl Transport for PathTransport {
 
         // Outermost hop: a real QUIC/UDP connection (attestation appraised inside).
         let entry = self.hops[0].clone();
+        let entry_grant = Self::grant_for(&entry, &creds)?;
         let mut prev = self
             .inner
-            .connect(entry, Self::fresh_grant(&creds)?)
+            .connect(entry, entry_grant)
             .await
             .map_err(|e| Error::Transport(format!("path hop 0 (entry): {e}")))?;
 
@@ -95,7 +108,12 @@ impl Transport for PathTransport {
         for (i, hop) in self.hops.iter().enumerate().skip(1) {
             let nested = self
                 .inner
-                .connect_nested(hop.clone(), Self::fresh_grant(&creds)?, self.inner.clone(), prev)
+                .connect_nested(
+                    hop.clone(),
+                    Self::grant_for(hop, &creds)?,
+                    self.inner.clone(),
+                    prev,
+                )
                 .await;
             match nested {
                 Ok(next) => {
@@ -118,7 +136,10 @@ impl Transport for PathTransport {
             .lock()
             .map_err(|_| Error::Transport("path map poisoned".into()))?
             .insert(prev.id, intermediates);
-        tracing::info!(hops = self.hops.len(), "trust-split path established (entry→…→exit)");
+        tracing::info!(
+            hops = self.hops.len(),
+            "trust-split path established (entry→…→exit)"
+        );
         Ok(prev)
     }
 
@@ -171,6 +192,7 @@ mod tests {
             kind: TransportKind::Masque,
             wg_pub: None,
             expected: None,
+            grant: None,
         }
     }
 
@@ -190,17 +212,32 @@ mod tests {
     #[tokio::test]
     async fn empty_path_refuses_to_connect() {
         let t = PathTransport::new(Arc::new(MasqueTransport::new()), vec![]);
-        let creds = Grant { token: Vec::new(), nonce: [0u8; 32] };
-        let err = t.connect(ep("ignored"), creds).await.expect_err("empty path must fail");
+        let creds = Grant {
+            token: Vec::new(),
+            nonce: [0u8; 32],
+        };
+        let err = t
+            .connect(ep("ignored"), creds)
+            .await
+            .expect_err("empty path must fail");
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
     }
 
     #[test]
     fn fresh_grants_have_independent_nonces() {
-        let base = Grant { token: vec![1, 2, 3], nonce: [0u8; 32] };
+        let base = Grant {
+            token: vec![1, 2, 3],
+            nonce: [0u8; 32],
+        };
         let a = PathTransport::fresh_grant(&base).expect("grant a");
         let b = PathTransport::fresh_grant(&base).expect("grant b");
-        assert_ne!(a.nonce, b.nonce, "each hop must get a fresh attestation nonce");
-        assert_eq!(a.token, base.token, "the payment token carries through unchanged");
+        assert_ne!(
+            a.nonce, b.nonce,
+            "each hop must get a fresh attestation nonce"
+        );
+        assert_eq!(
+            a.token, base.token,
+            "the payment token carries through unchanged"
+        );
     }
 }

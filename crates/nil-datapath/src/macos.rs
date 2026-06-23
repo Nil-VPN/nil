@@ -4,9 +4,9 @@
 //! pin the node route and arm the kill-switch *before* flipping the default route, and
 //! disarm the kill-switch *last* on teardown — so there is never a leak window.
 //!
-//! The kill-switch replaces the whole pf ruleset (snapshotting the original) rather than
-//! using an anchor; that is fine in the clean VM. A production host (where pf may be shared
-//! with Tailscale/Docker) should instead use a dedicated `nil.killswitch` anchor.
+//! The kill-switch loads only a dedicated pf anchor (`com.apple/nilvpn`) under macOS's default
+//! `com.apple/*` anchor. It does not replace the host's root pf ruleset, so it coexists with
+//! other local firewall users and can be removed independently on teardown.
 
 use std::io::Write;
 use std::net::IpAddr;
@@ -20,7 +20,6 @@ pub struct MacNet {
     node_ip: Option<IpAddr>,
     tun_name: Option<String>,
     kill_switch: bool,
-    pf_backup: Option<String>,
     pf_was_enabled: bool,
     dns_service: Option<String>,
     dns_backup: Option<Vec<String>>,
@@ -38,7 +37,10 @@ impl NetControl for MacNet {
 
         // 2. Pin the node via the original gateway so the tunnel's QUIC bypasses the TUN
         //    (best-effort: an on-link node is already covered by the connected route).
-        if let Err(e) = sh("route", &["-n", "add", "-host", &p.node_ip.to_string(), &gw]) {
+        if let Err(e) = sh(
+            "route",
+            &["-n", "add", "-host", &p.node_ip.to_string(), &gw],
+        ) {
             tracing::warn!("pin node route (continuing; may be on-link): {e}");
         }
         // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
@@ -57,8 +59,21 @@ impl NetControl for MacNet {
 
         // 4. Route all traffic through the TUN via two /1 routes (leaves the real default
         //    in the table, so teardown just removes our additions).
-        sh("route", &["-n", "add", "-net", "0.0.0.0/1", "-interface", &p.tun_name])?;
-        sh("route", &["-n", "add", "-net", "128.0.0.0/1", "-interface", &p.tun_name])?;
+        sh(
+            "route",
+            &["-n", "add", "-net", "0.0.0.0/1", "-interface", &p.tun_name],
+        )?;
+        sh(
+            "route",
+            &[
+                "-n",
+                "add",
+                "-net",
+                "128.0.0.0/1",
+                "-interface",
+                &p.tun_name,
+            ],
+        )?;
 
         // 5. Point DNS at the tunnel resolver(s).
         if !p.dns.is_empty() {
@@ -100,9 +115,7 @@ impl NetControl for MacNet {
         }
         // Disarm the kill-switch LAST (connectivity only returns once routes/DNS are sane).
         if self.kill_switch {
-            if let Some(backup) = &self.pf_backup {
-                let _ = sh("pfctl", &["-f", backup]);
-            }
+            let _ = sh("pfctl", &["-a", PF_ANCHOR, "-F", "all"]);
             if !self.pf_was_enabled {
                 let _ = sh("pfctl", &["-d"]);
             }
@@ -114,11 +127,14 @@ impl NetControl for MacNet {
 
 impl MacNet {
     fn arm_pf(&mut self, node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<()> {
-        // Snapshot the current ruleset + enabled state.
-        let backup = std::env::temp_dir().join(format!("nil-pf-backup-{}.conf", std::process::id()));
-        let cur = Command::new("pfctl").args(["-sr"]).output()?;
-        std::fs::write(&backup, &cur.stdout)?;
-        self.pf_backup = Some(backup.to_string_lossy().into_owned());
+        // macOS's default pf.conf evaluates `com.apple/*`; use a private child anchor under it
+        // so we do not replace or snapshot the host ruleset. If an operator removed that root
+        // anchor, fail closed instead of loading inert rules.
+        let root = Command::new("pfctl").args(["-sr"]).output()?;
+        let root_rules = String::from_utf8_lossy(&root.stdout);
+        if !root_rules.contains("anchor \"com.apple/*\"") {
+            anyhow::bail!("macOS pf root ruleset does not evaluate com.apple/* anchors");
+        }
         let info = Command::new("pfctl").args(["-s", "info"]).output()?;
         self.pf_was_enabled = String::from_utf8_lossy(&info.stdout).contains("Status: Enabled");
 
@@ -138,7 +154,7 @@ impl MacNet {
             rules.push_str(&format!("pass quick from any to {ip}\n"));
         }
         let mut child = Command::new("pfctl")
-            .args(["-f", "-"])
+            .args(["-a", PF_ANCHOR, "-f", "-"])
             .stdin(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn pfctl: {e}"))?;
@@ -156,17 +172,25 @@ impl MacNet {
     }
 }
 
+const PF_ANCHOR: &str = "com.apple/nilvpn";
+
 fn capture_default() -> anyhow::Result<(String, String)> {
-    let out = Command::new("route").args(["-n", "get", "default"]).output()?;
+    let out = Command::new("route")
+        .args(["-n", "get", "default"])
+        .output()?;
     let s = String::from_utf8_lossy(&out.stdout);
     let gw = field_after(&s, "gateway:").ok_or_else(|| anyhow::anyhow!("no default gateway"))?;
-    let ifc = field_after(&s, "interface:").ok_or_else(|| anyhow::anyhow!("no default interface"))?;
+    let ifc =
+        field_after(&s, "interface:").ok_or_else(|| anyhow::anyhow!("no default interface"))?;
     Ok((gw, ifc))
 }
 
 /// Map a BSD interface name (e.g. `en0`) to its `networksetup` service name (e.g. `Wi-Fi`).
 fn primary_service(ifc: &str) -> Option<String> {
-    let out = Command::new("networksetup").args(["-listnetworkserviceorder"]).output().ok()?;
+    let out = Command::new("networksetup")
+        .args(["-listnetworkserviceorder"])
+        .output()
+        .ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     let mut current: Option<String> = None;
     for line in s.lines() {
@@ -186,7 +210,10 @@ fn primary_service(ifc: &str) -> Option<String> {
 }
 
 fn get_dns(service: &str) -> Vec<String> {
-    let out = match Command::new("networksetup").args(["-getdnsservers", service]).output() {
+    let out = match Command::new("networksetup")
+        .args(["-getdnsservers", service])
+        .output()
+    {
         Ok(o) => o,
         Err(_) => return Vec::new(),
     };

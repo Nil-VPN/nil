@@ -6,8 +6,11 @@
 //! never stops the app from launching (fail-soft).
 
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const DEFAULT_PORTAL_URL: &str = "http://127.0.0.1:8080";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct PortalClient {
@@ -24,19 +27,25 @@ impl Default for PortalClient {
 impl PortalClient {
     /// Read `PORTAL_URL` (default `http://127.0.0.1:8080`). Does not connect.
     pub fn from_env() -> Self {
-        let base_url = std::env::var("PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
+        let base_url =
+            std::env::var("PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
         Self::with_base_url(base_url)
     }
 
     /// Build against an explicit Portal URL (from the GUI config). Does not connect.
     pub fn with_base_url(base_url: String) -> Self {
         PortalClient {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("reqwest client"),
             base_url,
         }
     }
 
     pub async fn create_anonymous(&self) -> Result<AnonymousAccount, PortalError> {
+        self.ensure_safe_base_url()?;
         self.http
             .post(format!("{}/v1/account", self.base_url))
             .json(&serde_json::json!({ "type": "anonymous" }))
@@ -53,6 +62,7 @@ impl PortalClient {
         recovery_phrase: Vec<String>,
         recovery_code: String,
     ) -> Result<RecoverResult, PortalError> {
+        self.ensure_safe_base_url()?;
         self.http
             .post(format!("{}/v1/account/recover", self.base_url))
             .json(&serde_json::json!({
@@ -65,6 +75,13 @@ impl PortalClient {
             .json::<RecoverResult>()
             .await
             .map_err(Into::into)
+    }
+
+    fn ensure_safe_base_url(&self) -> Result<(), PortalError> {
+        if nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
+            return Ok(());
+        }
+        nil_core::net::require_tls_or_loopback(&self.base_url).map_err(PortalError::UnsafeUrl)
     }
 }
 
@@ -91,6 +108,8 @@ pub struct Location {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PortalError {
+    #[error("{0}")]
+    UnsafeUrl(String),
     #[error("couldn't reach the account service — is nil-portal running? ({0})")]
     Unreachable(String),
     #[error("the account service returned an error ({0})")]
@@ -104,5 +123,27 @@ impl From<reqwest::Error> for PortalError {
         } else {
             PortalError::Unreachable(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_plaintext_remote_portal_url_before_request() {
+        let client = PortalClient::with_base_url("http://portal.example.com".to_string());
+        assert!(matches!(
+            client.ensure_safe_base_url(),
+            Err(PortalError::UnsafeUrl(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_https_and_loopback_portal_urls() {
+        let https = PortalClient::with_base_url("https://portal.example.com".to_string());
+        let local = PortalClient::with_base_url("http://127.0.0.1:8080".to_string());
+        assert!(https.ensure_safe_base_url().is_ok());
+        assert!(local.ensure_safe_base_url().is_ok());
     }
 }

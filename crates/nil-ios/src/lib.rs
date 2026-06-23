@@ -30,6 +30,7 @@ pub struct NilConfig {
     pub node_port: u16,
     pub server_name: *const c_char,     // nullable
     pub measurement_hex: *const c_char, // nullable / empty
+    pub tee_name: *const c_char,        // nullable / empty => sev-snp
     pub allow_unattested: bool,
 }
 
@@ -55,7 +56,11 @@ impl Callbacks {
         (self.status)(self.ctx, state, std::ptr::null());
     }
     fn write(&self, pkt: &[u8]) {
-        let af = if matches!(pkt.first().map(|b| b >> 4), Some(6)) { 30 } else { 2 };
+        let af = if matches!(pkt.first().map(|b| b >> 4), Some(6)) {
+            30
+        } else {
+            2
+        };
         (self.write)(self.ctx, pkt.as_ptr(), pkt.len(), af);
     }
 }
@@ -64,7 +69,11 @@ unsafe fn cstr(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    CStr::from_ptr(p).to_str().ok().map(|s| s.to_owned()).filter(|s| !s.is_empty())
+    CStr::from_ptr(p)
+        .to_str()
+        .ok()
+        .map(|s| s.to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 /// Start the tunnel. Returns null on a config error; otherwise an owned handle (free via
@@ -80,9 +89,16 @@ pub unsafe extern "C" fn nil_start(
     write_cb: NilWriteCb,
     status_cb: NilStatusCb,
 ) -> *mut NilTunnel {
-    let Some(cfg) = cfg.as_ref() else { return std::ptr::null_mut() };
-    let Some(host) = cstr(cfg.node_host) else { return std::ptr::null_mut() };
+    let Some(cfg) = cfg.as_ref() else {
+        return std::ptr::null_mut();
+    };
+    let Some(host) = cstr(cfg.node_host) else {
+        return std::ptr::null_mut();
+    };
     let sni = cstr(cfg.server_name);
+    let tee = cstr(cfg.tee_name)
+        .map(|s| parse_tee(&s))
+        .unwrap_or(Tee::SevSnp);
     let allow = cfg.allow_unattested;
     let port = cfg.node_port;
     let expected = if allow {
@@ -90,7 +106,10 @@ pub unsafe extern "C" fn nil_start(
     } else {
         match cstr(cfg.measurement_hex) {
             Some(h) => match hex(&h) {
-                Some(b) => Some(AttestExpectation { tee: Tee::SevSnp, measurement: Measurement(b) }),
+                Some(b) => Some(AttestExpectation {
+                    tee,
+                    measurement: Measurement(b),
+                }),
                 None => return std::ptr::null_mut(),
             },
             None => None,
@@ -100,26 +119,53 @@ pub unsafe extern "C" fn nil_start(
     let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let cancel = CancellationToken::new();
     let mtu = Arc::new(AtomicU16::new(0));
-    let cbs = Callbacks { ctx, write: write_cb, status: status_cb };
+    let cbs = Callbacks {
+        ctx,
+        write: write_cb,
+        status: status_cb,
+    };
     let (mtu_t, cancel_t) = (mtu.clone(), cancel.clone());
 
     let thread = std::thread::spawn(move || {
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
             cbs.status(2);
             return;
         };
         rt.block_on(async move {
             cbs.status(0); // connecting
-            let mcfg = MasqueConfig { server_name: sni, allow_unattested: allow, ..Default::default() };
+            let mcfg = MasqueConfig {
+                server_name: sni,
+                allow_unattested: allow,
+                ..Default::default()
+            };
             let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::with_config(mcfg));
-            let node = NodeEndpoint { host, port, kind: TransportKind::Masque, wg_pub: None, expected };
+            let node = NodeEndpoint {
+                host,
+                port,
+                kind: TransportKind::Masque,
+                wg_pub: None,
+                expected,
+                grant: None,
+            };
 
             let mut nonce = [0u8; 32];
             if getrandom::getrandom(&mut nonce).is_err() {
                 cbs.status(2);
                 return;
             }
-            let session = match transport.connect(node, Grant { token: Vec::new(), nonce }).await {
+            let session = match transport
+                .connect(
+                    node,
+                    Grant {
+                        token: Vec::new(),
+                        nonce,
+                    },
+                )
+                .await
+            {
                 Ok(s) => s,
                 Err(_) => {
                     cbs.status(2);
@@ -152,7 +198,12 @@ pub unsafe extern "C" fn nil_start(
         });
     });
 
-    Box::into_raw(Box::new(NilTunnel { ingest: ingest_tx, cancel, mtu, thread: Some(thread) }))
+    Box::into_raw(Box::new(NilTunnel {
+        ingest: ingest_tx,
+        cancel,
+        mtu,
+        thread: Some(thread),
+    }))
 }
 
 /// Feed packets read from `packetFlow` into the tunnel. Arrays are parallel and `count` long.
@@ -184,7 +235,9 @@ pub unsafe extern "C" fn nil_ingest_packets(
 /// `t` must be a live handle from [`nil_start`].
 #[no_mangle]
 pub unsafe extern "C" fn nil_negotiated_mtu(t: *const NilTunnel) -> u16 {
-    t.as_ref().map(|t| t.mtu.load(Ordering::Relaxed)).unwrap_or(0)
+    t.as_ref()
+        .map(|t| t.mtu.load(Ordering::Relaxed))
+        .unwrap_or(0)
 }
 
 /// Stop the tunnel, join the engine thread, and free the handle.
@@ -208,5 +261,16 @@ fn hex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn parse_tee(s: &str) -> Tee {
+    if s.eq_ignore_ascii_case("tdx") {
+        Tee::Tdx
+    } else {
+        Tee::SevSnp
+    }
 }

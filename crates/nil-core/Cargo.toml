@@ -8,4 +8,5 @@ description = "NIL VPN shared domain types and errors (no I/O)."
 
 [dependencies]
 serde = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }

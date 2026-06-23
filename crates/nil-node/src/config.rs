@@ -43,6 +43,11 @@ pub struct NodeConfig {
     pub attest: Option<crate::attest::NodeAttest>,
     /// This node's position in a trust-split path (`NW_NODE_ROLE`: entry|middle|exit).
     pub role: NodeRole,
+    /// Shared Coordinator→node grant MAC key (`NW_GRANT_KEY`, hex). Production nodes require it
+    /// so CONNECT-IP is not an open relay.
+    pub grant_key: Option<Vec<u8>>,
+    /// Explicit local/dev bypass for nodes that intentionally accept grantless clients.
+    pub allow_ungranted: bool,
 }
 
 impl NodeConfig {
@@ -53,6 +58,8 @@ impl NodeConfig {
             .map_err(|e| anyhow::anyhow!("NW_NODE_BIND: {e}"))?;
         let egress = std::env::var("NW_NODE_EGRESS").unwrap_or_else(|_| "eth0".to_string());
         // Phase 1 fixed addressing (no ADDRESS_ASSIGN capsule yet — see ADR/plan).
+        let grant_key = load_grant_key()?;
+        let allow_ungranted = nil_core::net::env_flag("NW_ALLOW_UNGRANTED");
         Ok(Self {
             bind,
             tun_name: std::env::var("NW_NODE_TUN").unwrap_or_else(|_| "nil0".to_string()),
@@ -71,6 +78,24 @@ impl NodeConfig {
             role: NodeRole::from_env_str(
                 &std::env::var("NW_NODE_ROLE").unwrap_or_else(|_| "exit".to_string()),
             ),
+            grant_key,
+            allow_ungranted,
         })
     }
+}
+
+fn load_grant_key() -> anyhow::Result<Option<Vec<u8>>> {
+    let raw = if let Ok(path) = std::env::var("NW_GRANT_KEY_FILE") {
+        Some(
+            std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("read NW_GRANT_KEY_FILE {path}: {e}"))?,
+        )
+    } else {
+        std::env::var("NW_GRANT_KEY").ok()
+    };
+    let Some(raw) = raw else { return Ok(None) };
+    let key = nil_core::grant::from_hex(raw.trim())
+        .ok_or_else(|| anyhow::anyhow!("NW_GRANT_KEY must be hex"))?;
+    nil_core::grant::validate_key(&key).map_err(|e| anyhow::anyhow!("NW_GRANT_KEY: {e}"))?;
+    Ok(Some(key))
 }

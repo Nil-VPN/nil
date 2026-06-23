@@ -32,6 +32,10 @@ pub const ATTEST_NONCE_HEADER: &str = "nil-attest-nonce";
 /// `nil-attest` before the tunnel is accepted.
 pub const ATTEST_REPORT_HEADER: &str = "nil-attest-report";
 
+/// HTTP/3 request header carrying the opaque Coordinator-issued tunnel grant. Production nodes
+/// verify this before accepting CONNECT-IP; local/dev nodes may explicitly allow it to be absent.
+pub const TUNNEL_GRANT_HEADER: &str = "nil-tunnel-grant";
+
 /// Largest QUIC varint, `2^62 - 1` (RFC 9000 §16).
 pub const MAX_VARINT: u64 = (1u64 << 62) - 1;
 
@@ -104,10 +108,12 @@ pub fn encode_into(ip: &[u8], dst: &mut [u8]) -> Result<usize> {
 /// A non-zero context id is unsupported in Phase 1; the caller should drop+count, not panic
 /// (RFC 9484 permits a receiver to discard datagrams with unknown context ids).
 pub fn decode(payload: &[u8]) -> Result<&[u8]> {
-    let (ctx, rest) =
-        decode_varint(payload).ok_or_else(|| Error::InvalidPacket("truncated context-id".into()))?;
+    let (ctx, rest) = decode_varint(payload)
+        .ok_or_else(|| Error::InvalidPacket("truncated context-id".into()))?;
     if ctx != CONTEXT_ID_IP_PACKET {
-        return Err(Error::InvalidPacket(format!("unsupported context id {ctx}")));
+        return Err(Error::InvalidPacket(format!(
+            "unsupported context id {ctx}"
+        )));
     }
     Ok(rest)
 }
@@ -251,7 +257,16 @@ mod tests {
 
     #[test]
     fn varint_boundaries_round_trip() {
-        for v in [0u64, 0x3f, 0x40, 0x3fff, 0x4000, 0x3fff_ffff, 0x4000_0000, MAX_VARINT] {
+        for v in [
+            0u64,
+            0x3f,
+            0x40,
+            0x3fff,
+            0x4000,
+            0x3fff_ffff,
+            0x4000_0000,
+            MAX_VARINT,
+        ] {
             let mut out = Vec::new();
             encode_varint(v, &mut out);
             assert_eq!(out.len(), varint_len(v));

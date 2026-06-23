@@ -18,6 +18,7 @@ typedef struct NilConfig {
   uint16_t node_port;
   const char *server_name;
   const char *measurement_hex;
+  const char *tee_name;
   bool allow_unattested;
 } NilConfig;
 

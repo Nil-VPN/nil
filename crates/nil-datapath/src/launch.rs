@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_transport::cascade::{Cascade, CascadeTransport, DnsLivenessProbe};
 use nil_transport::{
-    connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport,
-    WstunnelTransport,
+    connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport,
+    Transport, WstunnelTransport,
 };
 
 use crate::TunnelConfig;
@@ -93,7 +93,9 @@ pub fn is_configured() -> bool {
 /// The pinned attestation expectation (`NW_EXPECTED_MEASUREMENT` hex + `NW_EXPECTED_TEE`).
 /// Unset ⇒ `None` ⇒ the connection is unattested (a warning is logged by the transport).
 pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
-    let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") else { return Ok(None) };
+    let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") else {
+        return Ok(None);
+    };
     let bytes = connectip::from_hex(hex.trim().as_bytes())
         .ok_or_else(|| anyhow::anyhow!("NW_EXPECTED_MEASUREMENT is not valid hex"))?;
     let tee = match env_or("NW_EXPECTED_TEE", "sev-snp").as_str() {
@@ -101,12 +103,17 @@ pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
         "sev-snp" => Tee::SevSnp,
         other => anyhow::bail!("NW_EXPECTED_TEE must be sev-snp or tdx, got {other}"),
     };
-    Ok(Some(AttestExpectation { tee, measurement: Measurement(bytes) }))
+    Ok(Some(AttestExpectation {
+        tee,
+        measurement: Measurement(bytes),
+    }))
 }
 
 /// The node's WireGuard static public key (hex) from `NW_NODE_WG_PUB`, if set.
 fn wg_pub_from_env() -> Result<Option<[u8; 32]>> {
-    let Ok(h) = std::env::var("NW_NODE_WG_PUB") else { return Ok(None) };
+    let Ok(h) = std::env::var("NW_NODE_WG_PUB") else {
+        return Ok(None);
+    };
     let bytes = connectip::from_hex(h.trim().as_bytes())
         .ok_or_else(|| anyhow::anyhow!("NW_NODE_WG_PUB is not valid hex"))?;
     let arr: [u8; 32] = bytes
@@ -120,19 +127,29 @@ fn wg_pub_from_env() -> Result<Option<[u8; 32]>> {
 /// hop is pinned to the same `expected` measurement here; production gets a per-operator pin per
 /// hop from the Coordinator.
 fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<NodeEndpoint>>> {
-    let Ok(spec) = std::env::var("NW_PATH") else { return Ok(None) };
+    let Ok(spec) = std::env::var("NW_PATH") else {
+        return Ok(None);
+    };
     let mut hops = Vec::new();
-    for (i, item) in spec.split(',').map(str::trim).filter(|s| !s.is_empty()).enumerate() {
+    for (i, item) in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .enumerate()
+    {
         let (host, port) = item
             .rsplit_once(':')
             .ok_or_else(|| anyhow::anyhow!("NW_PATH hop {i} must be host:port, got {item:?}"))?;
-        let port: u16 = port.parse().with_context(|| format!("NW_PATH hop {i} port {port:?}"))?;
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("NW_PATH hop {i} port {port:?}"))?;
         hops.push(NodeEndpoint {
             host: host.to_string(),
             port,
             kind: TransportKind::Masque,
             wg_pub: None,
             expected: expected.clone(),
+            grant: None,
         });
     }
     if hops.is_empty() {
@@ -159,14 +176,24 @@ struct TunnelParams {
 
 fn params_from_env() -> Result<TunnelParams> {
     let host = env_or("NW_NODE_HOST", "node");
-    let port: u16 = env_or("NW_NODE_PORT", "443").parse().context("NW_NODE_PORT")?;
+    let port: u16 = env_or("NW_NODE_PORT", "443")
+        .parse()
+        .context("NW_NODE_PORT")?;
     let tun_name = env_or("NW_TUN", "nil0");
-    let client_ip: Ipv4Addr = env_or("NW_CLIENT_IP", "10.74.0.2").parse().context("NW_CLIENT_IP")?;
-    let peer_ip: Ipv4Addr = env_or("NW_PEER_IP", "10.74.0.1").parse().context("NW_PEER_IP")?;
+    let client_ip: Ipv4Addr = env_or("NW_CLIENT_IP", "10.74.0.2")
+        .parse()
+        .context("NW_CLIENT_IP")?;
+    let peer_ip: Ipv4Addr = env_or("NW_PEER_IP", "10.74.0.1")
+        .parse()
+        .context("NW_PEER_IP")?;
     let dns: Vec<IpAddr> = env_or("NW_DNS", "1.1.1.1")
         .split(',')
         .filter(|s| !s.is_empty())
-        .map(|s| s.trim().parse::<IpAddr>().map_err(|e| anyhow::anyhow!("NW_DNS {s}: {e}")))
+        .map(|s| {
+            s.trim()
+                .parse::<IpAddr>()
+                .map_err(|e| anyhow::anyhow!("NW_DNS {s}: {e}"))
+        })
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
     // Fail-closed by default: a MASQUE hop with no pinned measurement refuses to connect unless
@@ -176,73 +203,107 @@ fn params_from_env() -> Result<TunnelParams> {
     let allow_unattested = nil_core::net::env_flag("NW_ALLOW_UNATTESTED");
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
-    Ok(TunnelParams { host, port, tun_name, client_ip, peer_ip, dns, kill_switch, allow_unattested, expected, wg_pub })
+    Ok(TunnelParams {
+        host,
+        port,
+        tun_name,
+        client_ip,
+        peer_ip,
+        dns,
+        kill_switch,
+        allow_unattested,
+        expected,
+        wg_pub,
+    })
 }
 
 /// Build the transport + a [`TunnelConfig`] from resolved params + a resolved path. `path` is
 /// `Some` for a trust-split / Coordinator-redeemed path (its first hop is the kill-switch
 /// exception), `None` for a single configured node (which may be wrapped in the obfuscation
 /// cascade). The transport assembly is identical regardless of how the path was obtained.
-fn assemble(p: TunnelParams, path: Option<Vec<NodeEndpoint>>) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
-    let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) =
-        if let Some(hops) = path {
-            if p.wg_pub.is_some() {
-                tracing::warn!("a path is configured — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
-            }
-            let entry = hops[0].clone();
-            tracing::info!(hops = hops.len(), "trust-split path");
-            // The inner hops' QUIC is stamped with the client tunnel address so the relaying
-            // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
+fn assemble(
+    p: TunnelParams,
+    path: Option<Vec<NodeEndpoint>>,
+) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) = if let Some(
+        hops,
+    ) = path
+    {
+        if p.wg_pub.is_some() {
+            tracing::warn!("a path is configured — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
+        }
+        let entry = hops[0].clone();
+        tracing::info!(hops = hops.len(), "trust-split path");
+        // The inner hops' QUIC is stamped with the client tunnel address so the relaying
+        // nodes' NAT (scoped to their tunnel CIDR) rewrites it and replies route back.
+        let inner = MasqueTransport::with_config(MasqueConfig {
+            nested_client_ip: Some(p.client_ip),
+            allow_unattested: p.allow_unattested,
+            ..Default::default()
+        });
+        (
+            Arc::new(PathTransport::new(Arc::new(inner), hops)),
+            entry,
+            1280,
+        )
+    } else {
+        let node = NodeEndpoint {
+            host: p.host.clone(),
+            port: p.port,
+            kind: TransportKind::Masque,
+            wg_pub: p.wg_pub,
+            expected: p.expected.clone(),
+            grant: None,
+        };
+        // Primary rung: PQ-WireGuard-over-MASQUE if a node WG key is pinned, else plain MASQUE.
+        let (primary, base_mtu): (Arc<dyn Transport>, u16) = if p.wg_pub.is_some() {
             let inner = MasqueTransport::with_config(MasqueConfig {
-                nested_client_ip: Some(p.client_ip),
                 allow_unattested: p.allow_unattested,
                 ..Default::default()
             });
-            (Arc::new(PathTransport::new(Arc::new(inner), hops)), entry, 1280)
+            (Arc::new(PqWgTransport::new(Arc::new(inner))), 1232)
         } else {
-            let node = NodeEndpoint {
-                host: p.host.clone(),
-                port: p.port,
-                kind: TransportKind::Masque,
-                wg_pub: p.wg_pub,
-                expected: p.expected.clone(),
-            };
-            // Primary rung: PQ-WireGuard-over-MASQUE if a node WG key is pinned, else plain MASQUE.
-            let (primary, base_mtu): (Arc<dyn Transport>, u16) = if p.wg_pub.is_some() {
-                let inner = MasqueTransport::with_config(MasqueConfig { allow_unattested: p.allow_unattested, ..Default::default() });
-                (Arc::new(PqWgTransport::new(Arc::new(inner))), 1232)
-            } else {
-                (Arc::new(MasqueTransport::with_config(MasqueConfig { allow_unattested: p.allow_unattested, ..Default::default() })), 1280)
-            };
-            // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
-            // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
-            // committing. Each fallback rung is independently optional (a deployment may run
-            // either, both, or neither).
-            let mut rungs: Vec<Arc<dyn Transport>> = vec![primary];
-            if let Some(awg) = amneziawg_fallback_from_env()? {
-                rungs.push(Arc::new(awg));
-            }
-            if let Some(wst) = wstunnel_fallback_from_env()? {
-                rungs.push(Arc::new(wst));
-            }
-            if rungs.len() > 1 {
-                tracing::info!(
-                    rungs = rungs.len(),
-                    "obfuscation cascade enabled (MASQUE primary → {} fallback rung(s))",
-                    rungs.len() - 1
-                );
-                let cascade = Cascade::new(rungs)
-                    .with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
-                (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
-            } else {
-                if std::env::var("NW_CASCADE").is_ok() {
-                    anyhow::bail!(
+            (
+                Arc::new(MasqueTransport::with_config(MasqueConfig {
+                    allow_unattested: p.allow_unattested,
+                    ..Default::default()
+                })),
+                1280,
+            )
+        };
+        // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
+        // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
+        // committing. Each fallback rung is independently optional (a deployment may run
+        // either, both, or neither).
+        let mut rungs: Vec<Arc<dyn Transport>> = vec![primary];
+        if let Some(awg) = amneziawg_fallback_from_env()? {
+            rungs.push(Arc::new(awg));
+        }
+        if let Some(wst) = wstunnel_fallback_from_env()? {
+            rungs.push(Arc::new(wst));
+        }
+        if rungs.len() > 1 {
+            tracing::info!(
+                rungs = rungs.len(),
+                "obfuscation cascade enabled (MASQUE primary → {} fallback rung(s))",
+                rungs.len() - 1
+            );
+            let cascade =
+                Cascade::new(rungs).with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
+            (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
+        } else {
+            if std::env::var("NW_CASCADE").is_ok() {
+                anyhow::bail!(
                         "NW_CASCADE set but no fallback rung configured — set NW_NODE_AMNEZIA_WG_PUB and/or NW_NODE_WSTUNNEL_WG_PUB"
                     );
-                }
-                (rungs.into_iter().next().expect("primary rung"), node, base_mtu)
             }
-        };
+            (
+                rungs.into_iter().next().expect("primary rung"),
+                node,
+                base_mtu,
+            )
+        }
+    };
 
     // When the cascade is on, each fallback node's traffic must also bypass the tunnel (else the
     // fallback rung's own packets to its node would loop through the TUN, and — since the
