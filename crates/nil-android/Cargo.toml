@@ -1,0 +1,23 @@
+[package]
+name = "nil-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "NIL VPN Android JNI engine (libnil_android.so) — runs the MASQUE datapath in the VpnService :vpn process."
+
+[lib]
+crate-type = ["cdylib"]
+
+# Android-only. On every other target this crate is EMPTY (see the `#![cfg]` at the top of
+# src/lib.rs), so `cargo build --workspace` on a desktop host stays green and never pulls the
+# android-only deps below.
+[target.'cfg(target_os = "android")'.dependencies]
+nil-core = { workspace = true }
+nil-transport = { workspace = true, features = ["masque"] }   # MasqueTransport + socket_hook
+nil-datapath = { workspace = true }                            # Tunnel::up_with_fd (NO launch → no reqwest in :vpn)
+tokio = { workspace = true }
+anyhow = { workspace = true }
+log = "0.4"
+jni = "0.21"
+android_logger = "0.14"

@@ -12,7 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use nil_core::{Grant, IpPacket, NodeEndpoint, Session};
+use nil_core::{IpPacket, NodeEndpoint, Session};
 use nil_transport::Transport;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -129,7 +129,7 @@ impl Tunnel {
         // into its attestation report's report_data, and the appraisal checks the binding.
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("nonce entropy: {e}"))?;
-        let grant = Grant { token: Vec::new(), nonce };
+        let grant = nil_core::Grant { token: Vec::new(), nonce };
 
         let session = transport
             .connect(cfg.node.clone(), grant)

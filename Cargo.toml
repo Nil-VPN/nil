@@ -17,6 +17,7 @@ members = [
     "crates/nil-datapath",
     "crates/nil-cli",
     "crates/nil-provision",
+    "crates/nil-android",
     "client/src-tauri",
 ]
 

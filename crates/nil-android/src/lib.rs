@@ -1,0 +1,174 @@
+//! NIL VPN Android JNI engine. Built as `libnil_android.so` and loaded by the Kotlin `:vpn`
+//! service process (`NilVpnService` / `NilNative`). It owns the MASQUE datapath: it builds the
+//! transport with a `socket_hook` that calls `VpnService.protect(fd)` (so the tunnel's own QUIC
+//! to the node bypasses the TUN), then runs [`nil_datapath::Tunnel::up_with_fd`] over the
+//! VpnService-provided TUN fd. Identity never reaches this process — only a node endpoint and an
+//! optional pinned measurement; the unlinkable Privacy Pass token is redeemed in the app process.
+#![cfg(target_os = "android")]
+
+use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use jni::objects::{JClass, JObject, JString, JValue};
+use jni::sys::{jboolean, jint, jlong, jstring};
+use jni::{JNIEnv, JavaVM};
+
+use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_datapath::{Tunnel, TunnelConfig};
+use nil_transport::{MasqueConfig, MasqueTransport, Transport};
+
+/// Cached JavaVM so the `protect()` callback can attach the QUIC I/O thread and call into Kotlin.
+static JVM: OnceLock<JavaVM> = OnceLock::new();
+
+/// A live engine: the tokio runtime + the tunnel it brought up.
+struct Engine {
+    rt: tokio::runtime::Runtime,
+    tunnel: Mutex<Option<Tunnel>>,
+}
+
+#[no_mangle]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut std::ffi::c_void) -> jint {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::Info)
+            .with_tag("nil-android"),
+    );
+    let _ = JVM.set(vm);
+    jni::sys::JNI_VERSION_1_6 as jint
+}
+
+fn jstr(env: &mut JNIEnv, s: &JString) -> String {
+    env.get_string(s).map(|v| v.into()).unwrap_or_default()
+}
+
+/// Start the tunnel over the VpnService TUN fd. Returns an opaque handle (0 on failure).
+#[no_mangle]
+pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
+    mut env: JNIEnv,
+    _class: JClass,
+    tun_fd: jint,
+    node_host: JString,
+    node_port: jint,
+    mtu: jint,
+    server_name: JString,
+    measurement_hex: JString,
+    allow_unattested: jboolean,
+    vpn_service: JObject,
+) -> jlong {
+    let host = jstr(&mut env, &node_host);
+    let sni = jstr(&mut env, &server_name);
+    let meas_hex = jstr(&mut env, &measurement_hex);
+    let allow = allow_unattested != 0;
+
+    // protect() callback: invoked at the UDP bind site (bind → protect → connect) so the tunnel's
+    // own QUIC to the node bypasses the VpnService TUN (no loop).
+    let vpn_global = match env.new_global_ref(vpn_service) {
+        Ok(g) => g,
+        Err(e) => {
+            log::error!("new_global_ref(vpnService): {e}");
+            return 0;
+        }
+    };
+    let socket_hook: Arc<dyn Fn(RawFd) + Send + Sync> = Arc::new(move |fd: RawFd| {
+        if let Some(vm) = JVM.get() {
+            if let Ok(mut env) = vm.attach_current_thread() {
+                if let Err(e) =
+                    env.call_method(&vpn_global, "protect", "(I)Z", &[JValue::Int(fd as jint)])
+                {
+                    log::error!("VpnService.protect failed: {e}");
+                }
+            }
+        }
+    });
+
+    let expected = if allow || meas_hex.is_empty() {
+        None
+    } else {
+        match hex_to_bytes(&meas_hex) {
+            Some(b) => Some(AttestExpectation { tee: Tee::SevSnp, measurement: Measurement(b) }),
+            None => {
+                log::error!("measurement is not valid hex");
+                return 0;
+            }
+        }
+    };
+
+    let cfg = MasqueConfig {
+        server_name: if sni.is_empty() { None } else { Some(sni) },
+        allow_unattested: allow,
+        socket_hook: Some(socket_hook),
+        ..Default::default()
+    };
+    let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::with_config(cfg));
+
+    let node = NodeEndpoint {
+        host,
+        port: node_port as u16,
+        kind: TransportKind::Masque,
+        wg_pub: None,
+        expected,
+    };
+    // The VpnService.Builder already set the TUN address/DNS/MTU/routes at establish(); up_with_fd
+    // only uses `node`. The other fields are placeholders the NoopNet ignores.
+    let tcfg = TunnelConfig {
+        node,
+        tun_name: "nil0".to_string(),
+        client_ip: std::net::Ipv4Addr::new(10, 74, 0, 2),
+        peer_ip: std::net::Ipv4Addr::new(10, 74, 0, 1),
+        prefix: 24,
+        mtu: mtu as u16,
+        dns: Vec::new(),
+        kill_switch: false,
+        also_except: Vec::new(),
+    };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            log::error!("tokio runtime: {e}");
+            return 0;
+        }
+    };
+    let tunnel = match rt.block_on(Tunnel::up_with_fd(transport, tcfg, tun_fd as RawFd)) {
+        Ok(t) => t,
+        Err(e) => {
+            log::error!("tunnel up_with_fd: {e}");
+            return 0;
+        }
+    };
+    log::info!("nil-android tunnel up");
+    let engine = Box::new(Engine { rt, tunnel: Mutex::new(Some(tunnel)) });
+    Box::into_raw(engine) as jlong
+}
+
+/// Tear the tunnel down and free the engine. Idempotent on a 0 handle.
+#[no_mangle]
+pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(_env: JNIEnv, _class: JClass, handle: jlong) {
+    if handle == 0 {
+        return;
+    }
+    // SAFETY: `handle` is the Box<Engine> pointer returned by nativeStart; Kotlin calls this once.
+    let engine = unsafe { Box::from_raw(handle as *mut Engine) };
+    if let Ok(mut guard) = engine.tunnel.lock() {
+        if let Some(tunnel) = guard.take() {
+            let _ = engine.rt.block_on(tunnel.down());
+        }
+    }
+    log::info!("nil-android tunnel down");
+}
+
+/// Tiny status JSON for the app↔service IPC.
+#[no_mangle]
+pub extern "system" fn Java_com_nilvpn_NilNative_nativeStatus(env: JNIEnv, _class: JClass, handle: jlong) -> jstring {
+    let state = if handle == 0 { "down" } else { "up" };
+    let json = format!("{{\"state\":\"{state}\"}}");
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    let s = s.trim();
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
