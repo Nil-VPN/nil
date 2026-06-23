@@ -56,6 +56,38 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The desktop client's React frontend: type-check (tsc), bundle (vite), and the vitest unit
+  # tests (fail-closed token gate, buy/settings flows). The Rust side is covered by `check`.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+      - name: Install
+        run: pnpm --dir client install --frozen-lockfile
+      - name: Build (tsc + vite)
+        run: pnpm --dir client build
+      - name: Test (vitest)
+        run: pnpm --dir client test
+
+  # Compile-check the Windows datapath (netsh/WFP routing + kill-switch in nil-datapath/windows.rs)
+  # on a real MSVC toolchain — it can't build on the macOS/Linux dev hosts. nil-datapath's base
+  # (no `launch`) pulls no quiche, so this needs no BoringSSL/nasm. Runtime kill-switch behaviour
+  # still requires a Windows VM (tracked separately).
+  windows-check:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clippy (windows datapath)
+        run: cargo clippy -p nil-datapath --all-targets -- -D warnings
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
