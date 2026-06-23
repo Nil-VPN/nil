@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         path_hops = cfg.path_hops,
         redeem = cfg.verifier.is_some(),
         durable_nullifiers = cfg.nullifier_path.is_some(),
-        "nil-coordinator listening (redeem + path + measurements)"
+        "nil-coordinator listening (redeem + measurements)"
     );
 
     // The spent-token nullifier set MUST be durable: a restart with a volatile set would

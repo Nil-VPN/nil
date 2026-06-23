@@ -26,3 +26,8 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Clustered nullifier set (PgNullifierStore), behind the `postgres` feature.
 tokio-postgres = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Router-level tests (oneshot a Request through the axum Router) — mirrors nil-portal.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

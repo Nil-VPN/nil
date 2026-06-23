@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nil_core::durable::DurableSet;
-use nil_proto::path::{MeasurementsResponse, PathRequest, PathResponse, PinnedMeasurement};
+use nil_proto::path::{MeasurementsResponse, PathResponse, PinnedMeasurement};
 use nil_proto::token::RedeemRequest;
 
 use crate::config::{from_hex, CoordConfig};
@@ -44,7 +44,6 @@ impl CoordState {
 pub fn router(state: CoordState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/path", post(request_path))
         .route("/v1/redeem", post(redeem))
         .route("/v1/measurements", get(measurements))
         .with_state(state)
@@ -106,23 +105,6 @@ async fn redeem(
         Err(RedeemError::Unavailable) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(RedeemError::NoPath) => Err(StatusCode::SERVICE_UNAVAILABLE),
     }
-}
-
-/// `/v1/path` — Phase-2 compatibility: an entitlement-gated path without a token (stub-accepts
-/// a non-empty entitlement). Real entitlement is the token redeemed at `/v1/redeem`.
-async fn request_path(
-    State(state): State<CoordState>,
-    Json(req): Json<PathRequest>,
-) -> Result<Json<PathResponse>, StatusCode> {
-    if req.entitlement.trim().is_empty() {
-        return Err(StatusCode::PAYMENT_REQUIRED);
-    }
-    let hops = state
-        .cfg
-        .registry
-        .select_path(state.cfg.path_hops)
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    Ok(Json(PathResponse { hops }))
 }
 
 async fn measurements(State(state): State<CoordState>) -> Json<MeasurementsResponse> {
@@ -219,6 +201,51 @@ mod tests {
         let (state, mut req) = state_and_token();
         req.token = hex(&vec![0u8; 256]); // not the issuer's signature
         assert!(matches!(redeem_logic(&state, &req).await, Err(RedeemError::BadToken)));
+    }
+
+    #[tokio::test]
+    async fn v1_path_payment_bypass_is_removed() {
+        // Regression guard: the old `/v1/path` stub granted a path to ANY non-empty entitlement
+        // string — a token-free payment bypass. It must no longer be routed; the ONLY way to a
+        // path is a redeemed token at `/v1/redeem`.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt; // oneshot
+
+        let (state, _req) = state_and_token();
+        let app = router(state);
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/path")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"entitlement":"i-did-not-pay"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "/v1/path must be gone — no token-free path bypass"
+        );
+
+        // ...while the real, token-gated endpoint is still routed (a bad token → 401, never 404).
+        let resp2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/redeem")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"msg":"ab","token":"cd"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp2.status(), StatusCode::NOT_FOUND, "/v1/redeem must still be routed");
     }
 
     #[tokio::test]

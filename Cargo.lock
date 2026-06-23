@@ -3280,6 +3280,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "http-body-util",
  "nil-core",
  "nil-crypto",
  "nil-proto",
@@ -3287,6 +3288,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-postgres",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
