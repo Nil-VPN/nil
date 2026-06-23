@@ -26,9 +26,12 @@ class NilVpnService : VpnService() {
         val nodePort = intent.getIntExtra("nodePort", 443)
         val serverName = intent.getStringExtra("serverName") ?: nodeHost
         val measurement = intent.getStringExtra("measurementHex") ?: ""
+        val grant = intent.getStringExtra("grantHex") ?: ""
+        val grantNonce = intent.getStringExtra("grantNonceHex") ?: ""
         val allowUnattested = intent.getBooleanExtra("allowUnattested", false)
         val teeName = intent.getStringExtra("teeName") ?: "sev-snp"
-        Log.i(TAG, "extras node=$nodeHost:$nodePort server=$serverName measLen=${measurement.length} tee=$teeName allowUnattested=$allowUnattested")
+        // No grant/nonce VALUES in logs (they're a bearer credential + freshness nonce) — only lengths.
+        Log.i(TAG, "extras node=$nodeHost:$nodePort server=$serverName measLen=${measurement.length} tee=$teeName grantLen=${grant.length} allowUnattested=$allowUnattested")
 
         try {
             startForeground(NOTIF_ID, notification())
@@ -66,7 +69,7 @@ class NilVpnService : VpnService() {
         val fd = tun.detachFd()
         Log.i(TAG, "detachFd=$fd — calling nativeStart")
         handle = try {
-            NilNative.nativeStart(fd, nodeHost, nodePort, MTU, serverName, measurement, teeName, allowUnattested, this)
+            NilNative.nativeStart(fd, nodeHost, nodePort, MTU, serverName, measurement, teeName, grant, grantNonce, allowUnattested, this)
         } catch (e: Throwable) {
             Log.e(TAG, "nativeStart threw", e); 0L
         }

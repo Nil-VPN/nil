@@ -56,6 +56,63 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # The security-critical suites live behind off-by-default Cargo features, so the plain
+  # `cargo test --workspace` in `check` never compiles — let alone runs — them. This job turns
+  # each one on explicitly so the proofs that matter most actually execute on every push/PR:
+  #   * attestation accept/reject  — nil-attest `synthetic` (the appraise_synthetic + SEV-SNP/TDX
+  #     KAT suites: ACCEPT on a matching measurement, REJECT on measurement/nonce/TEE mismatch),
+  #   * wstunnel round-trip        — nil-transport `wstunnel` (WireGuard over WebSocket-over-TLS,
+  #     full glue path in-process), which transitively pulls `pqwg`/`masque`,
+  #   * double-spend nullifier     — nil-coordinator `postgres` (single-use insert + the NoTls
+  #     non-loopback refusal guard) and nil-portal `postgres` (one-token-per-payment PgStore),
+  #   * synthetic RA-TLS datapath  — nil-node / nil-datapath / nil-cli `synthetic-attest`.
+  # Features are applied per-crate (not `--workspace --features X`): each feature is defined on a
+  # different member, so a workspace-wide flag would error on the crates that don't declare it.
+  feature-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-feat-${{ hashFiles('**/Cargo.lock') }}
+
+      # quiche/BoringSSL (pulled by masque → wstunnel/synthetic-attest) needs cmake + clang;
+      # the rest are the standard build toolchain. No Tauri/webkit here — no client crate builds.
+      - name: Install build deps (BoringSSL/quiche)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libssl-dev cmake clang pkg-config build-essential
+
+      # Attestation accept/reject + measurement-binding KATs (the Docker harness's appraisal path).
+      - name: Attestation suite (nil-attest synthetic)
+        run: cargo test -p nil-attest --features synthetic --locked
+
+      # WireGuard-over-WebSocket-over-TLS round-trip (transitively enables pqwg + masque).
+      - name: wstunnel round-trip (nil-transport wstunnel)
+        run: cargo test -p nil-transport --features wstunnel --locked
+
+      # Clustered double-spend nullifier: single-use insert + NoTls non-loopback refusal guard.
+      - name: Coordinator nullifier (nil-coordinator postgres)
+        run: cargo test -p nil-coordinator --features postgres --locked
+
+      # One-token-per-payment durable store compiles and its tests run under the Postgres backend.
+      - name: Portal store (nil-portal postgres)
+        run: cargo test -p nil-portal --features postgres --locked
+
+      # Synthetic RA-TLS datapath wiring (node report + client/datapath appraisal acceptance).
+      - name: Synthetic-attest datapath (node + datapath + cli)
+        run: |
+          cargo test -p nil-node --features synthetic-attest --locked
+          cargo test -p nil-datapath --features synthetic-attest --locked
+          cargo test -p nil-cli --features synthetic-attest --locked
+
   # The desktop client's React frontend: type-check (tsc), bundle (vite), and the vitest unit
   # tests (fail-closed token gate, buy/settings flows). The Rust side is covered by `check`.
   frontend:

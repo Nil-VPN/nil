@@ -13,7 +13,7 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
-use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_datapath::{Tunnel, TunnelConfig};
 use nil_transport::{MasqueConfig, MasqueTransport, Transport};
 
@@ -53,6 +53,8 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     server_name: JString,
     measurement_hex: JString,
     tee_name: JString,
+    grant_hex: JString,
+    grant_nonce_hex: JString,
     allow_unattested: jboolean,
     vpn_service: JObject,
 ) -> jlong {
@@ -60,6 +62,8 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     let sni = jstr(&mut env, &server_name);
     let meas_hex = jstr(&mut env, &measurement_hex);
     let tee_name = jstr(&mut env, &tee_name);
+    let grant_hex = jstr(&mut env, &grant_hex);
+    let grant_nonce_hex = jstr(&mut env, &grant_nonce_hex);
     let allow = allow_unattested != 0;
 
     // protect() callback: invoked at the UDP bind site (bind → protect → connect) so the tunnel's
@@ -110,13 +114,46 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     };
     let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::with_config(cfg));
 
+    // The Coordinator-issued grant for this hop, redeemed in the app process and threaded through
+    // here (token + per-connection nonce, both hex). Both present → a real grant the node verifies
+    // before accepting CONNECT-IP; both empty → no grant (a dev node that allows ungranted tunnels).
+    // A present-but-malformed grant fails closed (returns 0) rather than connecting ungranted.
+    let grant = match (grant_hex.trim().is_empty(), grant_nonce_hex.trim().is_empty()) {
+        (true, true) => None,
+        (false, false) => {
+            let token = match hex_to_bytes(&grant_hex) {
+                Some(b) => b,
+                None => {
+                    log::error!("grant is not valid hex");
+                    return 0;
+                }
+            };
+            let nonce = match hex_to_bytes(&grant_nonce_hex) {
+                Some(b) if b.len() == 32 => {
+                    let mut n = [0u8; 32];
+                    n.copy_from_slice(&b);
+                    n
+                }
+                _ => {
+                    log::error!("grant nonce must be 32 bytes of hex");
+                    return 0;
+                }
+            };
+            Some(Grant { token, nonce })
+        }
+        _ => {
+            log::error!("grant and grant nonce must be provided together");
+            return 0;
+        }
+    };
+
     let node = NodeEndpoint {
         host,
         port: node_port as u16,
         kind: TransportKind::Masque,
         wg_pub: None,
         expected,
-        grant: None,
+        grant,
     };
     // The VpnService.Builder already set the TUN address/DNS/MTU/routes at establish(); up_with_fd
     // only uses `node`. The other fields are placeholders the NoopNet ignores.

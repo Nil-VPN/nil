@@ -145,16 +145,28 @@ fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow
     }
     sh("iptables", &["-P", "OUTPUT", "DROP"])?;
 
-    // Block all IPv6 egress (best-effort: if ip6tables is unavailable we warn loudly rather than
-    // fail the whole tunnel, since the v4 protection is already up and a v6-less host can't leak).
-    let v6 = |args: &[&str]| {
+    // Block all IPv6 egress. The tunnel is IPv4-only, so any v6 packet that escaped would sail
+    // around the v4 kill-switch — the classic dual-stack VPN leak. This must FAIL CLOSED: if we
+    // cannot install the v6 default-DROP we abort the whole bring-up (the caller tears down what
+    // we armed), rather than running with a v6 leak. The single tolerated case is a host with no
+    // IPv6 stack at all, where the DROP policy itself is the load-bearing step: we try lo/tun
+    // ACCEPTs best-effort but REQUIRE the `-P OUTPUT DROP` to succeed.
+    let v6_accept = |args: &[&str]| {
         if let Err(e) = sh("ip6tables", args) {
-            tracing::warn!("ip6tables {args:?} failed ({e}); IPv6 leak protection may be incomplete");
+            // An ACCEPT rule failing is non-fatal as long as the DROP policy below lands: at worst
+            // the host's own loopback/tun v6 is blocked, which never leaks.
+            tracing::debug!("ip6tables {args:?} failed ({e})");
         }
     };
-    v6(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]);
-    v6(&["-A", "OUTPUT", "-o", tun, "-j", "ACCEPT"]);
-    v6(&["-P", "OUTPUT", "DROP"]);
+    v6_accept(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"]);
+    v6_accept(&["-A", "OUTPUT", "-o", tun, "-j", "ACCEPT"]);
+    // The load-bearing step: default-deny all IPv6 egress. Fail closed if it does not apply.
+    sh("ip6tables", &["-P", "OUTPUT", "DROP"]).map_err(|e| {
+        anyhow::anyhow!(
+            "failed to install IPv6 default-DROP kill-switch ({e}); refusing to run with a \
+             potential IPv6 leak. Ensure ip6tables is available (or disable IPv6 on the host)."
+        )
+    })?;
     Ok(())
 }
 

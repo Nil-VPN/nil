@@ -5,9 +5,11 @@
 //! paths. It never imports the Portal (issuer) and never sees traffic.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -17,6 +19,19 @@ use nil_proto::token::RedeemRequest;
 
 use crate::config::{from_hex, CoordConfig};
 use crate::nullifier::NullifierStore;
+use crate::ratelimit::RateLimiter;
+
+/// Hard cap on a `/v1/redeem` request body. A redeem body is two short hex strings (a token
+/// message + an RSA blind-signature token); a few KiB is generous. The cap bounds the work an
+/// unauthenticated caller can force before the (relatively expensive) RSA-verify + fsync runs.
+const REDEEM_BODY_LIMIT: usize = 16 * 1024;
+
+/// Per-IP redeem attempts allowed per [`REDEEM_RATE_WINDOW`]. RSA-verify plus an fsync under one
+/// mutex is a cheap DoS, so cap how fast a single source can drive it. A legitimate client redeems
+/// once per session, so this is comfortably above normal use.
+const REDEEM_RATE_MAX: u32 = 30;
+/// Fixed window for the per-IP redeem rate limit.
+const REDEEM_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Shared state: the immutable config + the durable spent-token nullifier set.
 #[derive(Clone)]
@@ -27,6 +42,9 @@ pub struct CoordState {
     /// would re-permit a double-spend of every already-redeemed token. Behind the
     /// [`NullifierStore`] trait so the backend is swappable.
     pub nullifiers: Arc<dyn NullifierStore>,
+    /// Per-IP abuse limiter for `/v1/redeem`. PII-free: a transient per-IP counter that resets each
+    /// window and is never logged or persisted (mirrors the issuer's limiter in `nil-portal`).
+    pub limiter: Arc<RateLimiter>,
 }
 
 impl CoordState {
@@ -35,19 +53,29 @@ impl CoordState {
         Self {
             cfg,
             nullifiers: Arc::new(DurableSet::in_memory()),
+            limiter: Arc::new(RateLimiter::new(REDEEM_RATE_MAX, REDEEM_RATE_WINDOW)),
         }
     }
 
     /// Production state with a caller-provided (durable) nullifier set.
     pub fn with_nullifiers(cfg: Arc<CoordConfig>, nullifiers: Arc<dyn NullifierStore>) -> Self {
-        Self { cfg, nullifiers }
+        Self {
+            cfg,
+            nullifiers,
+            limiter: Arc::new(RateLimiter::new(REDEEM_RATE_MAX, REDEEM_RATE_WINDOW)),
+        }
     }
 }
 
 pub fn router(state: CoordState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        .route("/v1/redeem", post(redeem))
+        .route(
+            "/v1/redeem",
+            // Bound the redeem body so an unauthenticated caller can't force buffering of a large
+            // payload before the (relatively expensive) RSA-verify + fsync runs.
+            post(redeem).layer(DefaultBodyLimit::max(REDEEM_BODY_LIMIT)),
+        )
         .route("/v1/measurements", get(measurements))
         .with_state(state)
 }
@@ -90,7 +118,12 @@ pub async fn redeem_logic(
     // the token itself — there is no account or identity in the nullifier set. We persist BEFORE
     // selecting a path, and fail closed if the record can't be made durable (a path granted on
     // an unpersisted nullifier would be double-spendable after a restart).
-    match state.nullifiers.insert_once(&req.msg).await {
+    //
+    // Key on the LOWERCASE HEX OF THE DECODED BYTES, never the raw request string: the same token
+    // submitted as "ab.." and "AB.." decodes to identical bytes, so it must hit the same nullifier.
+    // Keying on the raw string would let an attacker re-spend one token by flipping hex case.
+    let nullifier_key = to_hex(&msg);
+    match state.nullifiers.insert_once(&nullifier_key).await {
         Ok(true) => {}                                         // newly spent — proceed
         Ok(false) => return Err(RedeemError::AlreadyRedeemed), // replay
         Err(e) => {
@@ -134,10 +167,22 @@ fn core_tee(tee: Tee) -> nil_core::Tee {
     }
 }
 
+/// Lowercase-hex encode (matches [`from_hex`]'s accepted lowercase form, so a decode→encode
+/// round-trip is the canonical key form). Used for the nullifier key only — no identity.
+fn to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
 async fn redeem(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<CoordState>,
     Json(req): Json<RedeemRequest>,
 ) -> Result<Json<PathResponse>, StatusCode> {
+    // Abuse control: cap redeem attempts per client IP before any RSA-verify/fsync work. The IP is
+    // used transiently for the counter only — never stored, logged, or tied to an account.
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
     match redeem_logic(&state, &req).await {
         Ok(path) => Ok(Json(path)),
         Err(RedeemError::NotConfigured) => Err(StatusCode::NOT_IMPLEMENTED),
@@ -282,6 +327,36 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn same_token_in_different_hex_case_is_rejected_on_replay() {
+        // Regression guard: the nullifier must key on the DECODED token bytes, not the raw request
+        // string. The same token submitted as lowercase then UPPERCASE hex decodes to identical
+        // bytes, so the second redemption must be rejected as a double-spend — keying on the raw
+        // string would let case-flipping re-spend one token.
+        let (state, req) = state_and_token();
+
+        // First redemption (lowercase, as minted) succeeds.
+        assert!(
+            redeem_logic(&state, &req).await.is_ok(),
+            "first redemption succeeds"
+        );
+
+        // Same token, uppercased hex. It still verifies (the verifier decodes hex too) and must hit
+        // the SAME nullifier → AlreadyRedeemed, not a fresh path.
+        let upper = RedeemRequest {
+            msg: req.msg.to_uppercase(),
+            token: req.token.to_uppercase(),
+        };
+        assert_ne!(upper.msg, req.msg, "the test actually flips hex case");
+        assert!(
+            matches!(
+                redeem_logic(&state, &upper).await,
+                Err(RedeemError::AlreadyRedeemed)
+            ),
+            "case-flipped replay of a spent token must be rejected"
+        );
     }
 
     #[tokio::test]

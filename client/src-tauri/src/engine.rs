@@ -4,10 +4,15 @@
 //! (`NW_NODE_HOST` or `NW_PATH`, the same vars `nil-cli` reads), `connect` brings up the real
 //! attested MASQUE datapath through `nil-datapath::Tunnel` — TUN device, default-route swap,
 //! fail-closed kill-switch, and the packet pump — exactly as the headless CLI does (they share
-//! `nil_datapath::launch`, so they can't drift). With nothing configured, or on **mobile**
-//! (where the datapath is a `NEPacketTunnelProvider`/`VpnService`, built separately), it falls
-//! back to the in-memory loopback echo transport so the UI/state machine still exercise the
-//! `Transport` seam end to end without touching real networking.
+//! `nil_datapath::launch`, so they can't drift). With nothing configured it falls back to the
+//! in-memory loopback echo transport so the UI/state machine still exercise the `Transport` seam
+//! end to end without touching real networking.
+//!
+//! On **mobile** the real datapath is a separate-process `NEPacketTunnelProvider`/`VpnService`
+//! (built separately): the frontend routes Connect to the native plugin (`mobile_connect` in
+//! `lib.rs` → the `nil-vpn` plugin), NOT to this engine, so the mobile Connect path is the real
+//! attested tunnel. This engine's loopback fallback is reached only on desktop with nothing
+//! configured (and in tests).
 //!
 //! All tunnel logic stays behind the `Transport` trait — the engine never knows which transport
 //! is active.

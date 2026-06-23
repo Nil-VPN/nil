@@ -32,6 +32,9 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
             putExtra("serverName", a.serverName ?: a.nodeHost)
             putExtra("measurementHex", a.measurementHex ?: "")
             putExtra("teeName", a.teeName ?: "sev-snp")
+            // Coordinator grant for this hop (redeemed in the app process); "" if the path carries none.
+            putExtra("grantHex", a.grantHex ?: "")
+            putExtra("grantNonceHex", a.grantNonceHex ?: "")
             putExtra("allowUnattested", a.allowUnattested)
         }
         activity.startForegroundService(i)
@@ -52,6 +55,8 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
         var serverName: String? = null
         var measurementHex: String? = null
         var teeName: String? = null
+        var grantHex: String? = null
+        var grantNonceHex: String? = null
         var allowUnattested: Boolean = false
     }
 }

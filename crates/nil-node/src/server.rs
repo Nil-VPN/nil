@@ -31,6 +31,9 @@ struct Client {
     ci_stream: Option<u64>,
     flow_id: u64,
     tunnel_up: bool,
+    /// Inner IPv4 this client was assigned from the pool (RFC 9484 ADDRESS_ASSIGN subset), once the
+    /// CONNECT-IP tunnel came up. Released back to the pool on disconnect.
+    assigned_ip: Option<std::net::Ipv4Addr>,
     /// Per-client PQ-WireGuard responder state (`Some` only when `NW_NODE_PQWG` is set).
     pqwg: Option<ClientPqWg>,
 }
@@ -58,6 +61,14 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
         None
     };
 
+    // Per-process key for stateless QUIC Retry (source-address validation). Ephemeral: not
+    // persisted, regenerated each start (PD-2). See `crate::retry`.
+    let retry_key = crate::retry::RetryKey::generate()?;
+
+    // Inner-tunnel address pool (RFC 9484 ADDRESS_ASSIGN subset): hands each concurrent client a
+    // unique inner IPv4 so two clients never collide on one tunnel address. In-memory only.
+    let mut pool = crate::pool::AddressPool::default_v4();
+
     let mut clients: HashMap<Vec<u8>, Client> = HashMap::new();
     let mut client_routes: HashMap<IpAddr, Vec<u8>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
@@ -80,8 +91,14 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             r = socket.recv_from(&mut buf) => {
                 match r {
                     Ok((len, from)) => {
-                        if let Err(e) = handle_packet(&mut clients, &mut buf[..len], from, local, &mut config, pqwg_enabled) {
-                            tracing::debug!("handle_packet: {e}");
+                        match handle_packet(&mut clients, &mut buf[..len], from, local, &mut config, pqwg_enabled, &retry_key) {
+                            Ok(Some(reply)) => {
+                                // A stateless Retry / version-negotiation packet: send it and keep
+                                // NO connection state (the client re-Initials with the token).
+                                let _ = socket.send_to(&reply, from).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::debug!("handle_packet: {e}"),
                         }
                     }
                     Err(e) => tracing::warn!("udp recv: {e}"),
@@ -122,7 +139,16 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
         // (PQ-WireGuard-decapsulating them first when that layer is active).
         let mut to_tun: Vec<Vec<u8>> = Vec::new();
         for (client_id, client) in clients.iter_mut() {
-            drive_h3(client, &h3_config, &cert.spki, cfg, node_wg.as_ref());
+            drive_h3(
+                client,
+                client_id,
+                &h3_config,
+                &cert.spki,
+                cfg,
+                node_wg.as_ref(),
+                &mut pool,
+                &mut client_routes,
+            );
             if client.h3.is_none() {
                 continue;
             }
@@ -176,12 +202,24 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
         for client in clients.values_mut() {
             flush(&mut client.conn, &socket, &mut out).await;
         }
-        clients.retain(|_, c| !c.conn.is_closed());
+        // Reap closed connections, releasing each one's pool address back so it can be reassigned
+        // (no persisted state outlives the live session — PD-2).
+        clients.retain(|client_id, c| {
+            if c.conn.is_closed() {
+                pool.release(client_id);
+                false
+            } else {
+                true
+            }
+        });
         client_routes.retain(|_, id| clients.contains_key(id));
     }
     Ok(())
 }
 
+/// Process one inbound UDP datagram. Returns `Some(reply)` when the node must answer with a
+/// stateless packet (QUIC version negotiation or a Retry for source-address validation) and keep
+/// NO connection state; `None` when the packet was fed to an existing/new connection (or dropped).
 fn handle_packet(
     clients: &mut HashMap<Vec<u8>, Client>,
     pkt: &mut [u8],
@@ -189,28 +227,67 @@ fn handle_packet(
     local: SocketAddr,
     config: &mut quiche::Config,
     pqwg_enabled: bool,
-) -> anyhow::Result<()> {
-    let (key, ty) = {
-        let hdr = quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN)?;
-        (hdr.dcid.to_vec(), hdr.ty)
-    };
+    retry_key: &crate::retry::RetryKey,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let hdr = quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN)?;
+    let key = hdr.dcid.to_vec();
 
     let info = quiche::RecvInfo { from, to: local };
     if let Some(client) = clients.get_mut(&key) {
         let _ = client.conn.recv(pkt, info);
-        return Ok(());
+        return Ok(None);
     }
 
-    if ty != quiche::Type::Initial {
-        return Ok(()); // unknown connection, not an Initial — ignore
+    if hdr.ty != quiche::Type::Initial {
+        return Ok(None); // unknown connection, not an Initial — ignore
     }
 
+    // Version negotiation: an Initial advertising a version we don't speak gets a VN packet (also
+    // makes the listener look like an ordinary QUIC server — Pillar 1). Stateless.
+    if !quiche::version_is_supported(hdr.version) {
+        let mut out = vec![0u8; MAX_UDP_PAYLOAD];
+        let len = quiche::negotiate_version(&hdr.scid, &hdr.dcid, &mut out)?;
+        out.truncate(len);
+        return Ok(Some(out));
+    }
+
+    // Source-address validation (RFC 9000 §8.1). Until the client proves it can receive at its
+    // claimed address, the node commits no connection state and emits only a small Retry — closing
+    // the spoofed-source amplification/DoS vector.
+    let token = hdr.token.as_deref().unwrap_or_default();
+    let odcid: Vec<u8> = if token.is_empty() {
+        // No token yet → challenge with a Retry carrying a token bound to (source addr, this DCID).
+        let mut new_scid = [0u8; quiche::MAX_CONN_ID_LEN];
+        getrandom::getrandom(&mut new_scid).map_err(|_| anyhow::anyhow!("scid entropy"))?;
+        let new_scid = quiche::ConnectionId::from_ref(&new_scid);
+        let new_token = retry_key.mint(&from, &hdr.dcid);
+        let mut out = vec![0u8; MAX_UDP_PAYLOAD];
+        let len = quiche::retry(&hdr.scid, &hdr.dcid, &new_scid, &new_token, hdr.version, &mut out)?;
+        out.truncate(len);
+        // No source address logged (PD-3): the data plane retains no source IP.
+        tracing::debug!("QUIC Retry issued (source-address validation)");
+        return Ok(Some(out));
+    } else {
+        // Client echoed a token: validate it for THIS source address. A forged/replayed/cross-
+        // address token recovers no odcid → drop (no state committed).
+        match retry_key.validate(&from, token) {
+            Some(odcid) => odcid,
+            None => {
+                tracing::debug!("dropping Initial with an invalid Retry token");
+                return Ok(None);
+            }
+        }
+    };
+
+    // The DCID the client used AFTER our Retry becomes the connection's SCID; `odcid` (recovered
+    // from the validated token) is required by quiche to complete the handshake transcript.
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     getrandom::getrandom(&mut scid).map_err(|_| anyhow::anyhow!("scid entropy"))?;
     let scid_cid = quiche::ConnectionId::from_ref(&scid);
-    let conn = quiche::accept(&scid_cid, None, local, from, config)?;
+    let odcid_cid = quiche::ConnectionId::from_ref(&odcid);
+    let conn = quiche::accept(&scid_cid, Some(&odcid_cid), local, from, config)?;
     // No source address logged: nil-node is the data plane (SOUL §3 / PD-3 — no source-IP retention).
-    tracing::info!("new QUIC connection accepted");
+    tracing::info!("new QUIC connection accepted (source-validated)");
 
     let mut client = Client {
         conn,
@@ -218,6 +295,7 @@ fn handle_packet(
         ci_stream: None,
         flow_id: 0,
         tunnel_up: false,
+        assigned_ip: None,
         pqwg: if pqwg_enabled {
             Some(ClientPqWg::default())
         } else {
@@ -226,15 +304,19 @@ fn handle_packet(
     };
     let _ = client.conn.recv(pkt, info);
     clients.insert(scid.to_vec(), client);
-    Ok(())
+    Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_h3(
     client: &mut Client,
+    client_id: &[u8],
     h3_config: &quiche::h3::Config,
     node_spki: &[u8],
     cfg: &NodeConfig,
     node_secret: Option<&StaticSecret>,
+    pool: &mut crate::pool::AddressPool,
+    routes: &mut HashMap<IpAddr, Vec<u8>>,
 ) {
     if client.h3.is_none() && client.conn.is_established() {
         match quiche::h3::Connection::with_transport(&mut client.conn, h3_config) {
@@ -265,6 +347,22 @@ fn drive_h3(
                         quiche::h3::Header::new(b":status", b"200"),
                         quiche::h3::Header::new(b"capsule-protocol", b"?1"),
                     ];
+                    // ADDRESS_ASSIGN (RFC 9484 subset): allocate a UNIQUE inner IPv4 for this
+                    // client from the pool and signal it back so concurrent clients never collide
+                    // on one tunnel address. Idempotent per connection. If the pool is exhausted we
+                    // omit the header — the client then keeps its configured address (single-client
+                    // fallback); only one such client can be routed at a time, but we never hand two
+                    // clients the same live address. `assigned_str` outlives `resp`'s use below.
+                    let assigned = pool.assign(client_id);
+                    let assigned_str = assigned.map(|ip| ip.to_string());
+                    if let Some(s) = assigned_str.as_deref() {
+                        resp.push(quiche::h3::Header::new(
+                            connectip::ASSIGNED_IP_HEADER.as_bytes(),
+                            s.as_bytes(),
+                        ));
+                    } else {
+                        tracing::warn!("address pool exhausted; client keeps its configured address");
+                    }
                     // RA-TLS: bind a report to our TLS key + the client's nonce and return it
                     // so the client can appraise us before sending traffic (spec §5).
                     if let Some(nonce_hex) =
@@ -292,7 +390,19 @@ fn drive_h3(
                         client.ci_stream = Some(stream_id);
                         client.flow_id = stream_id / 4;
                         client.tunnel_up = true;
+                        // Record + pre-register the assigned address so replies route to this
+                        // client even before its first outbound packet, and so the route is bound
+                        // to this connection authoritatively (not just learned-on-first-packet).
+                        if let Some(ip) = assigned {
+                            client.assigned_ip = Some(ip);
+                            routes.insert(IpAddr::V4(ip), client_id.to_vec());
+                        }
                         tracing::info!(stream_id, flow_id = stream_id / 4, "CONNECT-IP tunnel up");
+                    } else if let Some(ip) = assigned {
+                        // The 200 didn't go out — don't keep the address reserved for a tunnel that
+                        // never came up.
+                        let _ = ip;
+                        pool.release(client_id);
                     }
                 } else {
                     let resp = [quiche::h3::Header::new(b":status", b"501")];

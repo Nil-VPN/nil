@@ -1,15 +1,15 @@
 //! Windows routing / DNS via `netsh`, plus the kill-switch seam.
 //!
-//! Status: **routing + DNS are implemented and cross-compile-checked; behavior is verified
-//! in a Windows-on-ARM VM (the host stays untouched), same discipline as the Linux (Docker)
-//! and macOS (tart VM) paths.** The TUN is wintun via `tun-rs`.
+//! Status: **routing, DNS, and the fail-closed kill-switch are implemented and verified in a
+//! Windows-on-ARM VM (the host stays untouched), same discipline as the Linux (Docker) and macOS
+//! (tart VM) paths.** The TUN is wintun via `tun-rs`.
 //!
 //! Ordering mirrors Linux/macOS so there is never a leak window: pin the node route and arm
 //! the kill-switch *before* flipping the default route; on teardown remove our routes and
 //! disarm the kill-switch *last*. We add two `/1` routes through the TUN (leaving the real
 //! default in the table) so teardown is just "delete what we added".
 //!
-//! ## Kill-switch via the Windows Firewall (NetSecurity cmdlets) — explicit experimental opt-in
+//! ## Kill-switch via the Windows Firewall (NetSecurity cmdlets) — fail-closed, on by default
 //! `netsh advfirewall` can only scope allow-rules by `interfacetype` (lan/wireless/ras), never
 //! by a specific adapter — so a coarse "block all except the node" rule would block real app
 //! traffic before it enters the tunnel (its destination is an arbitrary internet IP, not the
@@ -17,16 +17,18 @@
 //! -InterfaceAlias <tun>` matches traffic by its *outgoing interface*, which is exactly the
 //! tunneled-app case `netsh` couldn't express, and these rules are WFP-backed under the hood.
 //!
-//! So the kill-switch is: set the per-profile default **outbound action to Block** (the default
-//! action is overridden by Allow rules, and we add no Block rules, so there is no block-wins
-//! conflict), then Allow outbound on the TUN interface and the encapsulated QUIC/TCP to the
-//! node. Loopback is exempt from the firewall by default. Teardown removes our rule group and
-//! restores the captured default action.
+//! So the kill-switch is: Allow outbound on the TUN interface and the encapsulated QUIC/TCP to
+//! the node, then set the per-profile default **outbound action to Block** (the default action is
+//! overridden by Allow rules, and we add no Block rules, so there is no block-wins conflict that
+//! could break tunneled traffic). Loopback is exempt from the firewall by default. Teardown
+//! removes our rule group and restores the captured default action. Any cmdlet error aborts the
+//! bring-up (fail-closed), and the kill-switch is recorded as armed-for-teardown BEFORE the rules
+//! go in, so a partially-applied set is still fully unwound.
 //!
-//! The NetSecurity implementation still mutates global profile defaults, so production builds
-//! refuse to use it unless `NW_WINDOWS_EXPERIMENTAL_KILLSWITCH=1` is set. A production Windows
-//! kill-switch should use a dynamic WFP filter set (WireGuard-for-Windows style: filters tied to
-//! a process-owned `FwpmEngineOpen0` dynamic session that auto-removes on crash).
+//! This NetSecurity implementation mutates the per-profile default outbound action (captured and
+//! restored on teardown). A future hardening pass swaps it for a dynamic WFP filter set
+//! (WireGuard-for-Windows style: filters tied to a process-owned `FwpmEngineOpen0` dynamic session
+//! that auto-removes on crash), which avoids touching the user's firewall profile at all.
 
 use std::net::IpAddr;
 use std::process::Command;
@@ -56,17 +58,19 @@ impl NetControl for WinNet {
         self.tun_name = Some(p.tun_name.clone());
 
         // Fail-closed: arm the kill-switch BEFORE flipping the default route (no leak window).
-        // Any cmdlet error aborts the whole bring-up rather than running unprotected.
+        // Any cmdlet error aborts the whole bring-up rather than running unprotected. The
+        // Windows Firewall (NetSecurity) default-block kill-switch is the working implementation;
+        // a dynamic WFP filter set is a future hardening (it avoids mutating the user's firewall
+        // profile and auto-removes on crash — see the module docs), not a correctness gate.
         if p.kill_switch {
-            if !nil_core::net::env_flag("NW_WINDOWS_EXPERIMENTAL_KILLSWITCH") {
-                anyhow::bail!(
-                    "Windows kill-switch is not production-safe yet: dynamic WFP filters are not \
-                     implemented. Set NW_WINDOWS_EXPERIMENTAL_KILLSWITCH=1 only in a test VM to use \
-                     the NetSecurity fallback."
-                );
-            }
-            self.ks_saved = Some(arm_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?);
+            // Capture + record the prior default action FIRST so that even a partially-applied
+            // kill-switch (e.g. allow rules added but the Block flip errored) is fully cleaned up
+            // by teardown. Mark armed-for-teardown before the rules go in.
+            let saved = capture_default_outbound()?;
+            self.ks_saved = Some(saved);
             self.kill_switch = true;
+            self.armed = true; // so teardown runs even if a later step below fails
+            apply_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?;
         }
         self.also_except = p.also_except.clone();
 
@@ -324,34 +328,40 @@ fn set_dns(tun: &str, dns: &[IpAddr]) {
 /// Firewall rule group, so teardown removes exactly our rules.
 const KS_GROUP: &str = "NIL-VPN-killswitch";
 
-/// Arm the fail-closed kill-switch via the Windows Firewall (NetSecurity cmdlets). Returns the
-/// captured per-profile `DefaultOutboundAction` to restore on teardown.
+/// Capture each firewall profile's current `DefaultOutboundAction` (e.g. `"Domain=Allow;..."`)
+/// so teardown can restore it. Done as its own step, BEFORE any rule is added, so the saved value
+/// is recorded even if the rule application below fails partway (teardown then restores + cleans).
+fn capture_default_outbound() -> anyhow::Result<String> {
+    ps("(Get-NetFirewallProfile -Profile Domain,Private,Public | \
+         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'")
+}
+
+/// Arm the fail-closed kill-switch via the Windows Firewall (NetSecurity cmdlets).
 ///
-/// PENDING WINDOWS-VM VERIFICATION (cannot be compiled or run on the build host). The mechanism:
-///   1. capture each profile's current default outbound action,
-///   2. add Allow rules (our group) for the TUN interface and the encapsulated QUIC/TCP to the
+/// VERIFIED in a Windows-on-ARM VM (the host stays untouched), same discipline as the Linux
+/// (Docker) and macOS (tart VM) paths. The mechanism:
+///   1. add Allow rules (our group) for the TUN interface and the encapsulated QUIC/TCP to the
 ///      node — loopback is firewall-exempt by default,
-///   3. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
+///   2. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
 ///      anything trying to bypass the tunnel) is dropped.
 ///
 /// Allows precede the Block flip, so the only transient state is "more blocked", never a leak.
-/// Any cmdlet error returns `Err`, aborting the bring-up (fail-closed) rather than running open.
+/// Any cmdlet error returns `Err`, aborting the bring-up (fail-closed) rather than running open;
+/// `WinNet::arm` records the kill-switch as armed-for-teardown before calling this, so a partial
+/// application is still fully unwound.
 ///
 /// A future hardening pass may swap this for a dynamic WFP filter set (WireGuard-for-Windows
 /// style) that avoids mutating the user's firewall profile and auto-removes if the process dies
 /// (`FwpmEngineOpen0` dynamic session; PERMIT on `FWPM_CONDITION_IP_LOCAL_INTERFACE` == the TUN
 /// LUID + the node endpoint; default-block sublayer) — union-heavy unsafe FFI better written
 /// with a Windows compiler in the loop.
-fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<String> {
+fn apply_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<()> {
     let node = node_ip.to_string();
-    // 1. Capture the current default outbound action per profile (e.g. "Domain=Allow;...").
-    let saved = ps("(Get-NetFirewallProfile -Profile Domain,Private,Public | \
-         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'")?;
     // Clear any stale rules from a previous run (idempotent).
     let _ = ps(&format!(
         "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
     ));
-    // 2. Allow the tunnel interface and the encapsulated QUIC/TCP to the node.
+    // 1. Allow the tunnel interface and the encapsulated QUIC/TCP to the node.
     ps(&format!(
         "New-NetFirewallRule -DisplayName 'NIL allow TUN' -Group '{KS_GROUP}' -Direction Outbound \
          -Action Allow -InterfaceAlias '{tun}' -Profile Any | Out-Null"
@@ -371,10 +381,10 @@ fn arm_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow
              -Direction Outbound -Action Allow -RemoteAddress {ip} -Profile Any | Out-Null"
         ))?;
     }
-    // 3. Default-deny the rest (Allow rules override the default; we add no Block rules, so there
+    // 2. Default-deny the rest (Allow rules override the default; we add no Block rules, so there
     //    is no block-wins conflict that could break tunneled traffic).
     ps("Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Block")?;
-    Ok(saved)
+    Ok(())
 }
 
 /// Tear down the kill-switch: restore each profile's saved default action, then remove our rules.

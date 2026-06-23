@@ -49,6 +49,13 @@ impl Default for ObfsParams {
     fn default() -> Self {
         Self {
             // Distinct from each other and from WG's 01/02/03/04 00 00 00 type words.
+            //
+            // NB: these fixed defaults are a FLEET-WIDE static DPI signature — every deployment
+            // using them presents the same five magic words on the wire, so a censor that
+            // fingerprints one node's obfuscation blocks them all. Production callers should use
+            // [`ObfsParams::derive`] to mint per-deployment magics from the node's WG public key
+            // (a value both ends already share), so each node's wire bytes differ. These defaults
+            // remain only for tests and as a last-resort fallback.
             headers: [
                 [0x9e, 0x21, 0xc4, 0x07],
                 [0x3b, 0xd5, 0x88, 0x1a],
@@ -61,6 +68,43 @@ impl Default for ObfsParams {
             junk_max: 192,
             tail_min: 8,
             tail_max: 64,
+        }
+    }
+}
+
+impl ObfsParams {
+    /// Domain-separation label so the obfs-magic KDF can never collide with another use of the
+    /// node key as a hash input.
+    const DERIVE_LABEL: &'static [u8] = b"nil-amneziawg-obfs-v1";
+
+    /// Derive per-deployment obfuscation parameters from a seed both ends already share — the
+    /// node's 32-byte WireGuard static public key. The client has it (it must, to do the
+    /// handshake); the node has its own. Deriving the five magic headers from it means each
+    /// deployment presents DIFFERENT magic words on the wire, so fingerprinting one node's
+    /// obfuscation does NOT yield a fleet-wide DPI signature (the hardcoded [`Default`] does).
+    ///
+    /// Deterministic: `SHA-256(label || seed)` expanded across the five 4-byte headers, with
+    /// per-header counter domain separation. Junk/tail SIZING is left at the safe defaults (it is
+    /// randomized per-packet anyway, so it carries no static tell); only the static magic words —
+    /// the actual fingerprint — are deployment-specific. The magics avoid colliding with WG's
+    /// `01/02/03/04 00 00 00` type words by construction (a 4-byte SHA-256 slice equalling exactly
+    /// one of those is ~2^-30 and, even if it did, would only weaken obfuscation for that one
+    /// deployment, never break correctness — both ends derive the same value).
+    pub fn derive(node_wg_pub: &[u8; 32]) -> Self {
+        use sha2::{Digest, Sha256};
+        // One 4-byte magic per (counter), counters 0..=4 → headers[0..4] + preface_header.
+        let magic = |counter: u8| -> [u8; 4] {
+            let mut h = Sha256::new();
+            h.update(Self::DERIVE_LABEL);
+            h.update([counter]);
+            h.update(node_wg_pub);
+            let d = h.finalize();
+            [d[0], d[1], d[2], d[3]]
+        };
+        Self {
+            headers: [magic(0), magic(1), magic(2), magic(3)],
+            preface_header: magic(4),
+            ..Self::default()
         }
     }
 }
@@ -211,7 +255,10 @@ pub struct AmneziaWgTransport {
 
 impl AmneziaWgTransport {
     pub fn new(node_wg_pub: [u8; 32], host: Option<String>, port: Option<u16>) -> Self {
-        Self::with_config(AmneziaWgConfig { node_wg_pub, host, port, obfs: ObfsParams::default() })
+        // Derive the obfuscation magics from the node's WG key so each deployment differs on the
+        // wire (no fleet-wide static DPI signature). The node responder derives identically.
+        let obfs = ObfsParams::derive(&node_wg_pub);
+        Self::with_config(AmneziaWgConfig { node_wg_pub, host, port, obfs })
     }
 
     pub fn with_config(cfg: AmneziaWgConfig) -> Self {
@@ -422,6 +469,44 @@ mod tests {
             }
             let back = p.deobfuscate(&wire).expect("our packet deobfuscates");
             assert_eq!(back, wg, "type-{t} WG packet survives the round-trip exactly");
+        }
+    }
+
+    #[test]
+    fn derive_is_deterministic_per_key_and_differs_across_deployments() {
+        let key_a = [0x11u8; 32];
+        let mut key_b = [0x11u8; 32];
+        key_b[31] = 0x12; // one byte different
+        let a1 = ObfsParams::derive(&key_a);
+        let a2 = ObfsParams::derive(&key_a);
+        let b = ObfsParams::derive(&key_b);
+        // Same key → identical magics (both ends MUST derive the same params).
+        assert_eq!(a1.headers, a2.headers);
+        assert_eq!(a1.preface_header, a2.preface_header);
+        // Different key → different magics (no fleet-wide static signature).
+        assert_ne!(a1.headers, b.headers);
+        // Derived magics differ from the hardcoded default (so a censor's default-fingerprint misses).
+        assert_ne!(a1.headers, ObfsParams::default().headers);
+        // The four type headers + preface are mutually distinct.
+        let mut all = a1.headers.to_vec();
+        all.push(a1.preface_header);
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "derived magics must be mutually distinct");
+            }
+        }
+    }
+
+    #[test]
+    fn derived_params_round_trip_a_full_handshake() {
+        // The derived magics must still codec correctly: a WG handshake + data packet survives.
+        let node_kp = WgKeypair::generate().unwrap();
+        let obfs = ObfsParams::derive(node_kp.public.as_bytes());
+        for (t, len) in [(1u8, 148usize), (2, 92), (3, 64), (4, 80)] {
+            let wg = wg_packet(t, len - 4);
+            let wire = obfs.obfuscate(&wg);
+            assert_eq!(&wire[0..4], &obfs.headers[(t - 1) as usize]);
+            assert_eq!(obfs.deobfuscate(&wire).expect("round-trips"), wg);
         }
     }
 

@@ -61,7 +61,11 @@ impl Tunnel {
 
         let net: Box<dyn NetControl> = Box::new(NoopNet);
         let cancel = CancellationToken::new();
-        let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
+        // Tripped by whichever pump exits first (hang/dead-tunnel/TUN error). Distinct from
+        // `cancel` (which we trip on a clean `down`), so the engine can tell "the tunnel died
+        // under us" from "we tore it down". Mirrors the desktop `up()` path.
+        let pump_dead = CancellationToken::new();
+        let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel, &pump_dead);
         tracing::info!("tunnel up (android)");
 
         Ok(Tunnel {
@@ -69,6 +73,7 @@ impl Tunnel {
             session: Some(session),
             net,
             cancel,
+            pump_dead,
             pumps,
             _tun: tun,
         })

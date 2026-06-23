@@ -27,22 +27,36 @@ scope (that is a mixnet's job). We say so plainly, in the product and in the cod
 | `nil-core` | — | shared domain types, errors (no I/O) |
 | `nil-proto` | — | wire formats / API DTOs (serde) |
 | `nil-crypto` | — | account derivation; PQ PSK + RA-TLS helpers (later phases) |
-| `nil-transport` | data | the `Transport` trait + pluggable impls (loopback today) |
+| `nil-transport` | data | the `Transport` trait + pluggable impls (MASQUE/QUIC default; AmneziaWG + wstunnel cascade; loopback for dev) |
 | `nil-attest` | control/user | SEV-SNP/TDX report parse + appraisal (Phase 2) |
 | `nil-portal` | business | Axum REST: accounts, billing, Privacy Pass issuer |
 | `nil-coordinator` | control | node registry, path selection, token *verifier* |
 | `nil-node` | data | MASQUE datapath, RA-TLS, entry/middle/exit roles |
 | `client/` | user | Tauri v2 desktop+mobile app (reuses the shared crates) |
 
-## Status: Phase 0 (buildable skeleton)
-Everything compiles; `nil-transport` ships the trait + a loopback echo impl; `nil-portal`
-implements the no-email anonymous account flow; Coordinator/Node start; the Tauri client
-launches with a first-run screen and a mocked connect/disconnect state machine over
-loopback. No real tunnel yet — that is Phase 1 (MASQUE via `quiche`).
+## Status: single-hop attested MASQUE (closed alpha)
+The default transport is a **real attested MASQUE/QUIC tunnel**: the client redeems an
+unlinkable Privacy Pass token at the Coordinator, verifies each node's TEE attestation
+report against the pinned measurement, and only then lets packets flow (no proof →
+kill-switch holds → no traffic). This datapath is wired end to end and exercised on
+Linux, macOS, and Android; the desktop and Android in-app Connect drive it directly, and
+an AmneziaWG → wstunnel obfuscation cascade backs up the primary MASQUE rung.
+
+**Honest about what's still alpha:**
+- **Single-hop**, not yet trust-split — one node sees both your IP and your destination.
+  Multi-hop across legally independent operators is the next milestone.
+- **iOS** has the native `PacketTunnelProvider` engine in-tree but is not yet verified on
+  a real device; some platform paths (e.g. the packaged iOS datapath) remain unproven.
+- **Attestation caveat (TEE.Fail, Oct 2025):** an attacker with physical memory access to
+  a node could forge a report. Vendor/jurisdiction diversity across hops is the mitigation;
+  the single-hop alpha does not yet have it.
+- With no Coordinator configured, the client falls back to an in-memory loopback transport
+  (no real tunnel) so the engine/state machine can be exercised in dev — the UI says so,
+  so it never reads as protection it isn't providing.
 
 ## Build & verify
 ```bash
-cargo build --workspace && cargo test --workspace   # green = skeleton intact
+cargo build --workspace && cargo test --workspace   # green = workspace builds + tests pass
 cargo deny check                                     # supply-chain gate
 
 # anonymous signup smoke test (Business plane)

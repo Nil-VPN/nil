@@ -3,6 +3,9 @@
 //! single legal regime — sits on more than one hop. Entry sees the client IP but not the
 //! destination; exit sees the destination but not the client IP; the middle sees neither.
 
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
+
 use nil_proto::path::{Hop, Tee};
 use serde::Deserialize;
 
@@ -52,10 +55,17 @@ impl RegistryNode {
     }
 }
 
+/// Hosts currently considered dead (health). Shared so a health checker can mark a node down
+/// without rebuilding the registry; path selection skips these. Identity-free — just hostnames.
+type DeadHosts = Arc<Mutex<HashSet<String>>>;
+
 /// The set of nodes the Coordinator can route through.
 #[derive(Debug, Clone, Default)]
 pub struct NodeRegistry {
     pub nodes: Vec<RegistryNode>,
+    /// Hosts a health check has marked down. Excluded from selection until marked back up.
+    /// Empty by default (every node assumed live) so existing call sites are unaffected.
+    dead: DeadHosts,
 }
 
 impl NodeRegistry {
@@ -68,8 +78,20 @@ impl NodeRegistry {
         match std::env::var("NW_NODE_REGISTRY") {
             Ok(path) => Self::from_file(&path),
             Err(_) => {
+                // The dev registry pins ONE shared placeholder measurement for every node, which
+                // makes attestation meaningless (any node passes any hop's pin). Refuse to fall
+                // back to it unless an operator has explicitly opted into dev fallbacks.
+                if !nil_core::net::env_flag("NW_ALLOW_DEV_FALLBACKS") {
+                    anyhow::bail!(
+                        "NW_NODE_REGISTRY unset: the built-in DEV registry pins one shared \
+                         placeholder measurement for every node, defeating attestation. Set \
+                         NW_NODE_REGISTRY to a JSON registry that pins a per-operator measurement \
+                         per node, or set NW_ALLOW_DEV_FALLBACKS=1 to explicitly accept the DEV \
+                         registry."
+                    );
+                }
                 tracing::warn!(
-                    "NW_NODE_REGISTRY unset — using the built-in DEV registry (one shared \
+                    "NW_ALLOW_DEV_FALLBACKS=1: using the built-in DEV registry (one shared \
                      placeholder measurement); production must pin a per-operator measurement per node"
                 );
                 Ok(Self::dev_default())
@@ -102,7 +124,10 @@ impl NodeRegistry {
                 wg_pub: d.wg_pub,
             })
             .collect();
-        Ok(Self { nodes })
+        Ok(Self {
+            nodes,
+            dead: DeadHosts::default(),
+        })
     }
 
     /// A small built-in dev registry: three operators in three jurisdictions, enough for a
@@ -125,29 +150,105 @@ impl NodeRegistry {
                 mk("exit.ch.example", "op-cirrus", "CH"),
                 mk("alt.se.example", "op-dune", "SE"),
             ],
+            dead: DeadHosts::default(),
         }
     }
 
+    /// Mark `host` down (health). It is excluded from path selection until [`mark_up`] is called.
+    /// Idempotent; identity-free (a hostname, not a user). The health seam a checker drives; the
+    /// selector consumes it via [`live_nodes`]. Exercised by the unit tests.
+    #[allow(dead_code)] // health-checker seam: wired by tests now, by a probe task in deployment.
+    pub fn mark_down(&self, host: &str) {
+        if let Ok(mut dead) = self.dead.lock() {
+            dead.insert(host.to_string());
+        }
+    }
+
+    /// Mark `host` back up (health), re-admitting it to selection.
+    #[allow(dead_code)] // health-checker seam (see `mark_down`).
+    pub fn mark_up(&self, host: &str) {
+        if let Ok(mut dead) = self.dead.lock() {
+            dead.remove(host);
+        }
+    }
+
+    fn live_nodes(&self) -> Vec<&RegistryNode> {
+        let dead = self.dead.lock().ok();
+        self.nodes
+            .iter()
+            .filter(|n| dead.as_ref().map(|d| !d.contains(&n.host)).unwrap_or(true))
+            .collect()
+    }
+
     /// Select an ordered `hops`-long path whose operators are ALL distinct AND whose
-    /// jurisdictions are ALL distinct. Greedy over registry order (deterministic; a production
-    /// selector would randomize across eligible sets for load-balancing). Returns `None` if no
-    /// such diverse path exists.
+    /// jurisdictions are ALL distinct, drawn only from currently-live nodes.
+    ///
+    /// Two correctness properties over the old greedy-by-registry-order selector:
+    ///  - **Complete:** it backtracks, so it returns a diverse path whenever one exists. The greedy
+    ///    version could commit to an early node that blocked diversity and then falsely `None` (503)
+    ///    a request a valid diverse path could have served.
+    ///  - **Randomized:** candidates are shuffled, so it does not return the identical entry/middle/
+    ///    exit every time — load is spread and the path is not trivially predictable.
+    ///
+    /// Returns `None` only if no operator/jurisdiction-diverse `hops`-long path of live nodes
+    /// exists. `hops == 0` yields an empty path.
     pub fn select_path(&self, hops: usize) -> Option<Vec<Hop>> {
-        let mut chosen: Vec<&RegistryNode> = Vec::new();
-        for node in &self.nodes {
-            if chosen.len() == hops {
-                break;
-            }
-            let operator_clash = chosen.iter().any(|c| c.operator == node.operator);
-            let jurisdiction_clash = chosen.iter().any(|c| c.jurisdiction == node.jurisdiction);
-            if !operator_clash && !jurisdiction_clash {
-                chosen.push(node);
-            }
+        let mut candidates = self.live_nodes();
+        shuffle(&mut candidates);
+
+        let mut chosen: Vec<&RegistryNode> = Vec::with_capacity(hops);
+        if Self::extend_path(&candidates, hops, &mut chosen) {
+            Some(chosen.iter().map(|n| n.to_hop()).collect())
+        } else {
+            None
         }
-        if chosen.len() < hops {
-            return None;
+    }
+
+    /// Depth-first search with backtracking: try each remaining candidate that keeps operators and
+    /// jurisdictions all-distinct; recurse; undo on a dead end. Candidate order is already shuffled,
+    /// so the first complete path found is a random valid one.
+    fn extend_path<'a>(
+        candidates: &[&'a RegistryNode],
+        hops: usize,
+        chosen: &mut Vec<&'a RegistryNode>,
+    ) -> bool {
+        if chosen.len() == hops {
+            return true;
         }
-        Some(chosen.iter().map(|n| n.to_hop()).collect())
+        for node in candidates {
+            let clash = chosen
+                .iter()
+                .any(|c| c.operator == node.operator || c.jurisdiction == node.jurisdiction);
+            if clash || chosen.iter().any(|c| c.host == node.host) {
+                continue;
+            }
+            chosen.push(node);
+            if Self::extend_path(candidates, hops, chosen) {
+                return true;
+            }
+            chosen.pop();
+        }
+        false
+    }
+}
+
+/// In-place Fisher–Yates shuffle seeded from the OS CSPRNG. Used to randomize path selection so the
+/// Coordinator does not hand out the identical entry/middle/exit every redemption. Best-effort: if
+/// the OS RNG is unavailable the slice is left in its (already arbitrary) order — selection
+/// correctness does not depend on the shuffle.
+fn shuffle<T>(items: &mut [T]) {
+    if items.len() < 2 {
+        return;
+    }
+    let mut buf = vec![0u8; items.len() * 8];
+    if getrandom::getrandom(&mut buf).is_err() {
+        return;
+    }
+    for i in (1..items.len()).rev() {
+        let mut r = [0u8; 8];
+        r.copy_from_slice(&buf[i * 8..i * 8 + 8]);
+        let j = (u64::from_le_bytes(r) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
     }
 }
 
@@ -254,11 +355,137 @@ mod tests {
                     wg_pub: None,
                 },
             ],
+            dead: Default::default(),
         };
         assert!(
             reg.select_path(2).is_none(),
             "same-operator hops must be refused"
         );
         assert!(reg.select_path(1).is_some(), "a single hop is always fine");
+    }
+
+    /// Build a node with a distinct operator/jurisdiction (test helper).
+    fn node(host: &str, op: &str, jur: &str) -> RegistryNode {
+        RegistryNode {
+            host: host.into(),
+            port: 443,
+            tee: Tee::SevSnp,
+            measurement: "aa".into(),
+            operator: op.into(),
+            jurisdiction: jur.into(),
+            wg_pub: None,
+        }
+    }
+
+    #[test]
+    fn backtracks_instead_of_falsely_refusing_a_valid_diverse_path() {
+        // Registry order is a trap for a greedy selector: a 2-hop path needs distinct operators AND
+        // jurisdictions. Greedy picks node[0] (op-a/US) then node[1] (op-a/DE) → operator clash →
+        // dead end → false 503. node[2] (op-b/CH) completes a valid path with node[0]. Backtracking
+        // must find it.
+        let reg = NodeRegistry {
+            nodes: vec![
+                node("a", "op-a", "US"),
+                node("b", "op-a", "DE"),
+                node("c", "op-b", "CH"),
+            ],
+            dead: Default::default(),
+        };
+        let path = reg
+            .select_path(2)
+            .expect("a valid diverse 2-hop path exists and must be found");
+        assert_eq!(path.len(), 2);
+        let ops: HashSet<&str> = path
+            .iter()
+            .map(|h| {
+                reg.nodes
+                    .iter()
+                    .find(|n| n.host == h.host)
+                    .unwrap()
+                    .operator
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(ops.len(), 2, "operators stay distinct");
+    }
+
+    #[test]
+    fn skips_nodes_marked_down_by_health() {
+        // Three operators/jurisdictions → a 3-hop path exists. Mark one host down: now only two
+        // live nodes remain, so a 3-hop diverse path is impossible and selection must refuse.
+        let reg = NodeRegistry {
+            nodes: vec![
+                node("a", "op-a", "US"),
+                node("b", "op-b", "DE"),
+                node("c", "op-c", "CH"),
+            ],
+            dead: Default::default(),
+        };
+        assert!(reg.select_path(3).is_some(), "all live → 3-hop path exists");
+        reg.mark_down("c");
+        assert!(
+            reg.select_path(3).is_none(),
+            "a down node must be excluded, leaving too few for a 3-hop diverse path"
+        );
+        // A 2-hop path still works from the two remaining live nodes, and never includes the dead one.
+        let path = reg.select_path(2).expect("2-hop path from live nodes");
+        assert!(
+            path.iter().all(|h| h.host != "c"),
+            "the down node must never appear in a path"
+        );
+        // Recovery: marking it back up restores the 3-hop path.
+        reg.mark_up("c");
+        assert!(reg.select_path(3).is_some(), "marked back up → path returns");
+    }
+
+    #[test]
+    fn randomizes_across_valid_diverse_paths() {
+        // Many distinct operators/jurisdictions and a short path → many valid orderings. Over many
+        // draws we should observe more than one distinct first hop (the old greedy selector always
+        // returned the identical path).
+        let reg = NodeRegistry {
+            nodes: (0..8)
+                .map(|i| {
+                    let h = format!("h{i}");
+                    node_owned(h, format!("op-{i}"), format!("jur-{i}"))
+                })
+                .collect(),
+            dead: Default::default(),
+        };
+        let mut first_hops = HashSet::new();
+        for _ in 0..50 {
+            let path = reg.select_path(3).expect("a diverse path exists");
+            assert_eq!(path.len(), 3);
+            // Diversity invariant holds on every draw.
+            let ops: HashSet<&str> = path
+                .iter()
+                .map(|h| {
+                    reg.nodes
+                        .iter()
+                        .find(|n| n.host == h.host)
+                        .unwrap()
+                        .operator
+                        .as_str()
+                })
+                .collect();
+            assert_eq!(ops.len(), 3, "operators distinct on every draw");
+            first_hops.insert(path[0].host.clone());
+        }
+        assert!(
+            first_hops.len() > 1,
+            "selection should not be deterministic across draws (saw only {first_hops:?})"
+        );
+    }
+
+    fn node_owned(host: String, op: String, jur: String) -> RegistryNode {
+        RegistryNode {
+            host,
+            port: 443,
+            tee: Tee::SevSnp,
+            measurement: "aa".into(),
+            operator: op,
+            jurisdiction: jur,
+            wg_pub: None,
+        }
     }
 }

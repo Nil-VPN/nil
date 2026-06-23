@@ -73,10 +73,13 @@ struct Responder {
 }
 
 impl Responder {
-    fn new(node_secret: StaticSecret) -> Self {
+    /// `node_pub` is the node's own WireGuard static public key — the seed both ends derive the
+    /// obfuscation magics from (the client pins the same key as `NW_NODE_WG_PUB`), so each
+    /// deployment presents distinct magic words on the wire (no fleet-wide DPI signature).
+    fn new(node_secret: StaticSecret, node_pub: &[u8; 32]) -> Self {
         Self {
             node_secret,
-            obfs: ObfsParams::default(),
+            obfs: ObfsParams::derive(node_pub),
             clients: HashMap::new(),
             routes: HashMap::new(),
             next_seq: 0,
@@ -212,7 +215,7 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
         wg_pub = %connectip::to_hex(kp.public.as_bytes()),
         "AmneziaWG responder listening (multi-client) — pin this as the client's NW_NODE_WG_PUB"
     );
-    let mut responder = Responder::new(kp.secret);
+    let mut responder = Responder::new(kp.secret, kp.public.as_bytes());
     let mut buf = vec![0u8; 65535];
     let mut tun_buf = vec![0u8; 65535];
 
@@ -287,7 +290,7 @@ mod tests {
 
     /// Bring a client to "established" against the responder and return its core + the IP it uses.
     fn establish(responder: &mut Responder, node_pub: PublicKey, addr: SocketAddr, index: u32) -> PqWgCore {
-        let obfs = ObfsParams::default();
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
         let kp = WgKeypair::generate().unwrap();
         let mut core = PqWgCore::without_psk(kp.secret, node_pub, index);
 
@@ -312,7 +315,7 @@ mod tests {
     fn two_clients_route_replies_independently() {
         let node_kp = WgKeypair::generate().unwrap();
         let node_pub = node_kp.public;
-        let mut responder = Responder::new(node_kp.secret);
+        let mut responder = Responder::new(node_kp.secret, node_pub.as_bytes());
 
         let addr_a: SocketAddr = "203.0.113.1:51820".parse().unwrap();
         let addr_b: SocketAddr = "203.0.113.2:51820".parse().unwrap();
@@ -320,7 +323,7 @@ mod tests {
         let mut core_b = establish(&mut responder, node_pub, addr_b, 102);
         assert_eq!(responder.clients.len(), 2, "both clients tracked concurrently");
 
-        let obfs = ObfsParams::default();
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
         let ip_a = [10, 74, 0, 2];
         let ip_b = [10, 74, 0, 3];
 
@@ -362,7 +365,7 @@ mod tests {
     #[test]
     fn unknown_inner_ip_reply_is_dropped_not_misrouted() {
         let node_kp = WgKeypair::generate().unwrap();
-        let mut responder = Responder::new(node_kp.secret);
+        let mut responder = Responder::new(node_kp.secret, node_kp.public.as_bytes());
         // No clients/routes yet: a TUN reply for an unknown inner IP yields no action (never
         // misrouted to some arbitrary client).
         let actions = responder.handle_tun(&ipv4([1, 1, 1, 1], [10, 74, 0, 9]));
@@ -372,7 +375,7 @@ mod tests {
     #[test]
     fn admit_dedups_and_caps_evicting_oldest_non_established() {
         let node_kp = WgKeypair::generate().unwrap();
-        let mut r = Responder::new(node_kp.secret);
+        let mut r = Responder::new(node_kp.secret, node_kp.public.as_bytes());
         let addr = |i: usize| -> SocketAddr { format!("127.0.0.1:{}", 1000 + i).parse().unwrap() };
 
         // A duplicate preface (same addr + same pubkey) must not create a second entry.
@@ -398,10 +401,10 @@ mod tests {
     fn established_session_survives_a_same_addr_different_key_preface() {
         let node_kp = WgKeypair::generate().unwrap();
         let node_pub = node_kp.public;
-        let mut r = Responder::new(node_kp.secret);
+        let mut r = Responder::new(node_kp.secret, node_pub.as_bytes());
         let addr: SocketAddr = "203.0.113.7:51820".parse().unwrap();
         let mut core = establish(&mut r, node_pub, addr, 201);
-        let obfs = ObfsParams::default();
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
 
         // A data packet flips the client to "established" (handshake alone does not).
         let data = core.encapsulate(&ipv4([10, 74, 0, 2], [1, 1, 1, 1])).unwrap();
@@ -425,10 +428,10 @@ mod tests {
     fn stale_route_with_mismatched_seq_is_dropped_and_purged() {
         let node_kp = WgKeypair::generate().unwrap();
         let node_pub = node_kp.public;
-        let mut r = Responder::new(node_kp.secret);
+        let mut r = Responder::new(node_kp.secret, node_pub.as_bytes());
         let addr: SocketAddr = "203.0.113.8:51820".parse().unwrap();
         let mut core = establish(&mut r, node_pub, addr, 202);
-        let obfs = ObfsParams::default();
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
         let ip = [10, 74, 0, 2];
 
         // A real route is learned when the client sends from its inner IP.

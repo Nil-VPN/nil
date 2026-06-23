@@ -21,8 +21,54 @@ export const createEmailAccount = (email: string) =>
 export const recoverAccount = (phrase: string[], recoveryCode: string) =>
   invoke<RecoverResult>("recover_account", { phrase, recoveryCode });
 
-export const connect = () => invoke<ConnState>("connect");
-export const disconnect = () => invoke<ConnState>("disconnect");
+// Host platform — lets us route Connect to the native datapath on mobile (the OS VpnService /
+// PacketTunnel) instead of the in-process loopback engine. Cached after the first call.
+let platformCache: Promise<string> | null = null;
+export const platform = () => {
+  if (!platformCache) platformCache = invoke<string>("platform");
+  return platformCache;
+};
+const isMobile = async () => {
+  const p = await platform().catch(() => "other");
+  return p === "android" || p === "ios";
+};
+
+/** Start args the native VPN plugin needs — node endpoint + pinned measurement + opaque grant.
+ *  The index signature lets it pass straight to `invoke` as the plugin command payload. */
+interface NativeStartArgs extends Record<string, unknown> {
+  nodeHost: string;
+  nodePort: number;
+  serverName: string;
+  measurementHex: string;
+  teeName: string;
+  grantHex: string;
+  grantNonceHex: string;
+}
+
+// Desktop: the in-process engine brings up the real attested MASQUE tunnel (or loopback when no
+// Coordinator is set). Mobile: redeem the token in the app process, then hand the resulting
+// attested endpoint + grant to the native plugin, which starts the OS VpnService/PacketTunnel.
+// Either way the Connect button calls one function and gets back a connection state.
+export const connect = async (): Promise<ConnState> => {
+  if (await isMobile()) {
+    // `mobile_connect` removes one token from disk, redeems it at the Coordinator, and returns the
+    // attested start args (fails closed on no token / no Coordinator / bad path).
+    const args = await invoke<NativeStartArgs>("mobile_connect");
+    await invoke<void>("plugin:nil-vpn|startVPN", args);
+    // The OS service runs out-of-process; report connected once it has been started.
+    return "connected";
+  }
+  return invoke<ConnState>("connect");
+};
+
+export const disconnect = async (): Promise<ConnState> => {
+  if (await isMobile()) {
+    await invoke<void>("plugin:nil-vpn|stopVPN");
+    return "disconnected";
+  }
+  return invoke<ConnState>("disconnect");
+};
+
 export const status = () => invoke<ConnState>("status");
 
 export const listLocations = () => invoke<Location[]>("list_locations");

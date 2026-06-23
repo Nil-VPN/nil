@@ -153,6 +153,13 @@ impl MacNet {
         for ip in also_except {
             rules.push_str(&format!("pass quick from any to {ip}\n"));
         }
+        // IPv6 fail-closed. `block drop all` already covers both families, but the tunnel is
+        // IPv4-only, so v6 is a pure leak surface (a dual-stack app may prefer a v6 route around
+        // the tunnel). Add an explicit, terminal `block drop quick inet6 all` AFTER the per-node
+        // `pass quick` rules so a v6 node/fallback is still reachable (its earlier quick-pass wins),
+        // but ALL other v6 egress is dropped wholesale — no dual-stack leak. Loopback v6 is exempt
+        // via `set skip on lo0`. Placed last so it cannot shadow an intended v6 pass.
+        rules.push_str("block drop quick inet6 all\n");
         let mut child = Command::new("pfctl")
             .args(["-a", PF_ANCHOR, "-f", "-"])
             .stdin(Stdio::piped())

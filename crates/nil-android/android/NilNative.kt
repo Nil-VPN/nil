@@ -16,6 +16,8 @@ object NilNative {
         serverName: String,
         measurementHex: String,   // "" when allowUnattested
         teeName: String,          // "sev-snp" or "tdx"
+        grantHex: String,         // Coordinator grant for this hop ("" if none); node verifies it
+        grantNonceHex: String,    // per-connection nonce bound into the grant + attestation report
         allowUnattested: Boolean,
         vpnService: android.net.VpnService,  // engine calls .protect(fd) on this
     ): Long

@@ -30,13 +30,42 @@ pub fn verify(report_bytes: &[u8], vcek_der: &[u8]) -> Result<Evidence, AttestEr
         .verify()
         .map_err(|e| AttestError::ChainVerification(format!("SEV-SNP chain/report: {e}")))?;
 
+    // Appraise the now-cryptographically-trusted report's claims (policy + TCB).
+    appraise_report(&report)
+}
+
+/// Appraise an already chain-verified report's claims: reject an unsafe guest policy, classify
+/// the TCB, and normalize to [`Evidence`]. Split out from [`verify`] so the policy/TCB logic
+/// can be unit-tested on a constructed report without forging an AMD signature chain.
+fn appraise_report(report: &AttestationReport) -> Result<Evidence, AttestError> {
+    // Guest policy gate (fail closed). A DEBUG-enabled guest lets the host/operator read and
+    // tamper with guest memory through the PSP debug interface — that defeats the entire
+    // confidential-computing guarantee, so a verified-but-debuggable report must be rejected
+    // BEFORE any measurement/binding check would otherwise admit it.
+    if report.policy.debug_allowed() {
+        return Err(AttestError::PolicyViolation(
+            "SEV-SNP guest policy permits DEBUG (memory introspection)".into(),
+        ));
+    }
+
+    // TCB status (parity with the TDX path, which propagates a signed verdict). SEV-SNP carries
+    // no signed status string, but the report does carry the running `current_tcb` and the
+    // platform's `committed_tcb` — the minimum the firmware promised never to drop below. A
+    // `current_tcb` that has rolled back beneath `committed_tcb` is a down-revved platform
+    // running a patch level it already superseded (e.g. to re-expose a fixed vulnerability),
+    // so we surface it as OutOfDate. `appraise` then rejects it unless policy opts in, exactly
+    // as it does for an out-of-date TDX quote.
+    let tcb_status = if report.current_tcb < report.committed_tcb {
+        TcbStatus::OutOfDate("SEV-SNP current_tcb below committed_tcb".into())
+    } else {
+        TcbStatus::UpToDate
+    };
+
     Ok(Evidence {
         tee: Tee::SevSnp,
         measurement: report.measurement.to_vec(),
         report_data: report.report_data,
-        // SEV-SNP carries no signed TCB-status verdict; the reported TCB is in the (verified)
-        // report and a future policy can gate on it. For now a verified report is UpToDate.
-        tcb_status: TcbStatus::UpToDate,
+        tcb_status,
     })
 }
 
@@ -58,4 +87,52 @@ fn verifying_chain(vek: &Certificate, report: &AttestationReport) -> Result<Chai
         }
     }
     Err(AttestError::ChainVerification(last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sev::firmware::host::TcbVersion;
+
+    /// A baseline report whose chain check is irrelevant (we call `appraise_report` directly):
+    /// safe guest policy, current TCB at or above committed. Mutate it per test.
+    fn baseline_report() -> AttestationReport {
+        let mut report = AttestationReport::default();
+        // Default GuestPolicy has DEBUG clear; be explicit so the baseline can't silently drift.
+        report.policy.set_debug_allowed(false);
+        let tcb = TcbVersion::new(None, 5, 0, 10, 20);
+        report.committed_tcb = tcb;
+        report.current_tcb = tcb;
+        report
+    }
+
+    #[test]
+    fn safe_policy_uptodate_tcb_is_accepted() {
+        let report = baseline_report();
+        let ev = appraise_report(&report).expect("safe, up-to-date report must appraise");
+        assert_eq!(ev.tee, Tee::SevSnp);
+        assert_eq!(ev.tcb_status, TcbStatus::UpToDate);
+    }
+
+    #[test]
+    fn debug_enabled_policy_is_rejected() {
+        let mut report = baseline_report();
+        // Operator-debuggable guest: can read VM memory. Must fail closed.
+        report.policy.set_debug_allowed(true);
+        match appraise_report(&report) {
+            Err(AttestError::PolicyViolation(_)) => {}
+            other => panic!("DEBUG-enabled guest policy must be a PolicyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn down_revved_tcb_is_out_of_date() {
+        let mut report = baseline_report();
+        // current_tcb rolled back below committed_tcb: a superseded (vulnerable) patch level.
+        report.committed_tcb = TcbVersion::new(None, 5, 0, 10, 20);
+        report.current_tcb = TcbVersion::new(None, 5, 0, 10, 19);
+        let ev = appraise_report(&report).expect("a down-revved report still appraises (classified)");
+        // Parity with TDX: surfaced as OutOfDate so `appraise` rejects it under default policy.
+        assert!(matches!(ev.tcb_status, TcbStatus::OutOfDate(_)), "down-revved TCB must be OutOfDate");
+    }
 }

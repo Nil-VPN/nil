@@ -1,6 +1,8 @@
 //! HTTP handlers for the account endpoints (architecture spec §7.5, §8, §13.3).
 
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::Json;
 
@@ -20,9 +22,16 @@ use crate::state::AppState;
 /// code, then stores ONLY `H(secret)` + the recovery-code hash + entitlement. The
 /// phrase and code are returned to the user and never persisted.
 pub async fn create_account(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<CreateAccountResponse>), ApiError> {
+    // Abuse control: cap account creations per client IP to stop storage-exhaustion flooding.
+    // The IP is used transiently for the counter only — never stored, logged, or tied to an
+    // account (PD-3: no identity in the data we keep).
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(ApiError::TooManyRequests);
+    }
     match req {
         CreateAccountRequest::Anonymous => {
             let derived = account::create_account_os();

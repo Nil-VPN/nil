@@ -17,9 +17,11 @@ pub fn router(state: AppState) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
     use std::sync::Arc;
 
     use axum::body::Body;
+    use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request, StatusCode};
     use axum::response::Response;
     use http_body_util::BodyExt;
@@ -30,6 +32,12 @@ mod tests {
 
     fn store() -> Arc<dyn Store> {
         Arc::new(InMemoryStore::new())
+    }
+
+    /// Build the account router with a mocked peer address so `ConnectInfo<SocketAddr>` resolves
+    /// in tests (the create handler rate-limits by client IP).
+    fn app(store: Arc<dyn Store>) -> Router {
+        router(AppState::new(store)).layer(MockConnectInfo("1.2.3.4:5000".parse::<SocketAddr>().unwrap()))
     }
 
     fn post_json(uri: &str, json: &str) -> Request<Body> {
@@ -53,7 +61,7 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_create_returns_seven_word_contract() {
-        let resp = router(AppState { store: store() })
+        let resp = app(store())
             .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
             .await
             .expect("oneshot");
@@ -73,7 +81,7 @@ mod tests {
     async fn create_then_recover_roundtrips() {
         let store = store();
         let created = body_json(
-            router(AppState { store: store.clone() })
+            app(store.clone())
                 .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
                 .await
                 .expect("create"),
@@ -86,7 +94,7 @@ mod tests {
         })
         .to_string();
 
-        let resp = router(AppState { store: store.clone() })
+        let resp = app(store.clone())
             .oneshot(post_json("/v1/account/recover", &recover_body))
             .await
             .expect("recover");
@@ -101,7 +109,7 @@ mod tests {
     async fn recover_with_wrong_code_is_unauthorized() {
         let store = store();
         let created = body_json(
-            router(AppState { store: store.clone() })
+            app(store.clone())
                 .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
                 .await
                 .expect("create"),
@@ -114,7 +122,7 @@ mod tests {
         })
         .to_string();
 
-        let resp = router(AppState { store })
+        let resp = app(store)
             .oneshot(post_json("/v1/account/recover", &recover_body))
             .await
             .expect("recover");
@@ -129,7 +137,7 @@ mod tests {
             "recovery_code": "ABCDEFGH",
         })
         .to_string();
-        let resp = router(AppState { store: store() })
+        let resp = app(store())
             .oneshot(post_json("/v1/account/recover", &body))
             .await
             .expect("recover");
@@ -143,7 +151,7 @@ mod tests {
             "recovery_code": "ABCDEFGH",
         })
         .to_string();
-        let resp = router(AppState { store: store() })
+        let resp = app(store())
             .oneshot(post_json("/v1/account/recover", &body))
             .await
             .expect("recover");
@@ -152,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn email_type_is_not_implemented() {
-        let resp = router(AppState { store: store() })
+        let resp = app(store())
             .oneshot(post_json("/v1/account", r#"{"type":"email","email":"a@b.c"}"#))
             .await
             .expect("oneshot");
@@ -160,8 +168,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_account_is_rate_limited_per_ip() {
+        // A single IP that floods account creation must eventually be capped (429) so it can't
+        // exhaust storage. Drive the same router (shared limiter) past the per-window cap.
+        let app = app(store());
+        let mut saw_429 = false;
+        for _ in 0..40 {
+            let resp = app
+                .clone()
+                .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
+                .await
+                .expect("oneshot");
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                saw_429 = true;
+                break;
+            }
+        }
+        assert!(saw_429, "a per-IP flood must be capped with 429");
+    }
+
+    #[tokio::test]
     async fn get_account_is_not_implemented() {
-        let resp = router(AppState { store: store() })
+        let resp = app(store())
             .oneshot(
                 Request::builder()
                     .method("GET")
