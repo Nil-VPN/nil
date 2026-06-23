@@ -1,12 +1,16 @@
 import type { ConnState } from "./lib/types";
 
-/** Persistent honesty note — a VPN is not anonymity, and Phase 0 has no real tunnel. */
+/** Persistent honesty note — a VPN is not anonymity (SOUL / PD-8). State the real scope: the
+ *  default transport is an attested MASQUE tunnel, but the alpha is single-hop (not yet
+ *  trust-split). Never overstate ("100% anonymous", "untraceable"). */
 export function HonestyBanner() {
   return (
     <p className="honesty">
       A VPN hides your traffic from your local network and ISP — it is <strong>not</strong>{" "}
-      anonymity. This Phase&nbsp;0 preview uses an in-memory loopback transport, so no real
-      tunnel is established yet.
+      anonymity. With a Coordinator configured, NIL brings up a real attested MASQUE tunnel
+      (the client verifies the node's hardware report before any packet flows). This is a
+      single-hop alpha — not yet trust-split across operators — and some platforms are still
+      unverified on real devices.
     </p>
   );
 }

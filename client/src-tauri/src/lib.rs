@@ -1,6 +1,9 @@
 //! NIL VPN client (User plane) — Tauri commands bridging the frontend to the engine
-//! and the Business plane. Honest by construction: a VPN is not anonymity, and when no
-//! Coordinator is configured the loopback transport (no real tunnel) is used — the UI says so.
+//! and the Business plane. Honest by construction: a VPN is not anonymity. With a Coordinator
+//! configured, Connect brings up the real attested MASQUE datapath — directly via the in-process
+//! engine on desktop, or via the native `VpnService`/`PacketTunnel` plugin on mobile (the app
+//! process redeems the token and passes only a node endpoint + measurement + grant to it). With no
+//! Coordinator configured, the in-memory loopback transport (no real tunnel) is used — the UI says so.
 
 // `pub` so the headless e2e harness (src/bin/nil-client-e2e.rs) can drive the EXACT same
 // account → token → engine path the Tauri commands use (no GUI), closing the "test the engine,
@@ -10,6 +13,10 @@ pub mod config;
 pub mod engine;
 mod killswitch;
 mod leakguard;
+// The mobile connect path (redeem → attested node endpoint + grant for the native datapath). Only
+// built on Android/iOS, where the OS datapath runs in a separate process (VpnService / PacketTunnel).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub mod mobile;
 mod splittunnel;
 pub mod tokens;
 pub mod tokenstore;
@@ -88,9 +95,54 @@ async fn disconnect(engine: State<'_, AppEngine>) -> Result<ConnState, String> {
     engine.disconnect().await.map_err(|e| e.to_string())
 }
 
+/// Mobile-only: redeem one on-device token at the Coordinator and return the attested start args
+/// (node endpoint + pinned measurement + opaque grant) for the native datapath. The frontend then
+/// hands these to the `nil-vpn` plugin, which starts the OS `VpnService`/`PacketTunnel` — the real
+/// attested MASQUE tunnel, NOT the loopback mock. Identity never leaves this app process; only the
+/// node endpoint, measurement, and grant cross into the datapath process.
+///
+/// Fail-closed: the token is removed from disk BEFORE redemption (a crash never replays a spent
+/// token), and a missing token / Coordinator / bad path all error so the native tunnel never comes
+/// up unattested or unpaid.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+#[tauri::command]
+async fn mobile_connect(
+    store: State<'_, TokenStore>,
+    config: State<'_, ConfigState>,
+) -> Result<mobile::StartArgs, String> {
+    let cfg = config.get();
+    let token = store
+        .take_one()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| mobile::MobileError::NoTokens.to_string())?;
+    mobile::resolve_start_args(&cfg.coordinator_url, &token)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn status(engine: State<'_, AppEngine>) -> Result<ConnState, String> {
     Ok(engine.state().await)
+}
+
+/// The host platform, so the frontend can route Connect to the native datapath on mobile
+/// (`VpnService`/`PacketTunnel`) vs. the in-process engine on desktop. One of:
+/// "android" | "ios" | "macos" | "linux" | "windows" | "other".
+#[tauri::command]
+fn platform() -> &'static str {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "ios") {
+        "ios"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "other"
+    }
 }
 
 // ---- Token commands (buy = blind→issue→finalize against the Portal; balance = local count) ----
@@ -150,10 +202,48 @@ fn toggle_kill_switch(enabled: bool, config: State<'_, ConfigState>) -> Result<(
     config.set(cfg).map_err(|e| e.to_string())
 }
 
+/// Register the native VPN datapath plugin on mobile. The Kotlin `NilVpnPlugin` (and the iOS
+/// `PacketTunnel` equivalent) lives in the app process and starts the OS `VpnService` /
+/// `NEPacketTunnelProvider` — the seam that makes the in-app Connect bring up the REAL attested
+/// MASQUE tunnel instead of the loopback mock. The plugin identifier matches the Kotlin package.
+#[cfg(target_os = "android")]
+fn init_vpn_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("nil-vpn")
+        .setup(|_app, api| {
+            // Instantiates `com.nilvpn.NilVpnPlugin` and registers it with the Tauri plugin
+            // manager, exposing its `startVPN` / `stopVPN` commands to the WebView.
+            let _handle = api.register_android_plugin("com.nilvpn", "NilVpnPlugin")?;
+            Ok(())
+        })
+        .build()
+}
+
+#[cfg(target_os = "ios")]
+fn init_vpn_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+    tauri::plugin::Builder::new("nil-vpn")
+        .setup(|_app, api| {
+            let _handle = api.register_ios_plugin(init_nil_vpn_plugin)?;
+            Ok(())
+        })
+        .build()
+}
+
+// The iOS plugin registration entry point (exported by the Swift `NilVpnPlugin`).
+#[cfg(target_os = "ios")]
+extern "C" {
+    fn init_nil_vpn_plugin();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init())
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init());
+
+    // On mobile, register the native VPN plugin so in-app Connect drives the OS datapath.
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let builder = builder.plugin(init_vpn_plugin());
+
+    builder
         .manage(AppEngine::new())
         .setup(|app| {
             use tauri::Manager;
@@ -166,22 +256,54 @@ pub fn run() {
             app.manage(ConfigState::new(dir.join("config.json")));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            get_config,
-            set_config,
-            create_anonymous_account,
-            create_email_account,
-            recover_account,
-            connect,
-            disconnect,
-            status,
-            list_locations,
-            set_transport_mode,
-            set_split_tunnel,
-            toggle_kill_switch,
-            buy_tokens,
-            token_balance,
-        ])
+        .invoke_handler(invoke_handler())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// Desktop handler set.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
+{
+    tauri::generate_handler![
+        get_config,
+        set_config,
+        create_anonymous_account,
+        create_email_account,
+        recover_account,
+        connect,
+        disconnect,
+        status,
+        platform,
+        list_locations,
+        set_transport_mode,
+        set_split_tunnel,
+        toggle_kill_switch,
+        buy_tokens,
+        token_balance,
+    ]
+}
+
+// Mobile handler set: adds `mobile_connect` (redeem → native datapath start args).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
+{
+    tauri::generate_handler![
+        get_config,
+        set_config,
+        create_anonymous_account,
+        create_email_account,
+        recover_account,
+        connect,
+        disconnect,
+        status,
+        platform,
+        list_locations,
+        set_transport_mode,
+        set_split_tunnel,
+        toggle_kill_switch,
+        buy_tokens,
+        token_balance,
+        mobile_connect,
+    ]
 }

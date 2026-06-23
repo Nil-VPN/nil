@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile-vpn",
+  "description": "Mobile-only: allow the WebView to drive the native VPN datapath plugin (start/stop the OS VpnService / PacketTunnel). The app process redeems the unlinkable token and passes only a node endpoint + measurement + grant to the plugin — no identity crosses into the datapath process.",
+  "platforms": ["android", "iOS"],
+  "windows": ["main"],
+  "permissions": [
+    "nil-vpn:default"
+  ]
+}
