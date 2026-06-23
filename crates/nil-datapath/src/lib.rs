@@ -28,6 +28,8 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "android")]
+mod android;
 
 /// How to bring up the tunnel.
 pub struct TunnelConfig {
@@ -65,9 +67,9 @@ pub trait NetControl: Send {
 
 /// Fallback for targets without a native datapath impl. Compiles everywhere so the workspace
 /// builds on any host; refuses to arm at runtime.
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
 struct StubNet;
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
 impl NetControl for StubNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
         anyhow::bail!("system datapath is implemented for Linux, macOS, and Windows only")
@@ -87,7 +89,7 @@ fn new_net_control() -> Box<dyn NetControl> {
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(windows::WinNet::default())
 }
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android")))]
 fn new_net_control() -> Box<dyn NetControl> {
     Box::new(StubNet)
 }
@@ -104,6 +106,9 @@ pub struct Tunnel {
 
 impl Tunnel {
     /// Connect the transport, bring up the TUN + routes + kill-switch, and start pumping.
+    /// Desktop only — Android brings the tunnel up over a `VpnService`-provided fd (`up_with_fd`
+    /// in `android.rs`), so routing/DNS/MTU/kill-switch are the OS's job, not ours.
+    #[cfg(not(target_os = "android"))]
     pub async fn up(transport: Arc<dyn Transport>, mut cfg: TunnelConfig) -> anyhow::Result<Tunnel> {
         // `cfg.node` is the directly-reachable hop: a single node, or the *entry* of a
         // multi-hop path. Its IP is the kill-switch host-route exception so the tunnel's own
@@ -184,6 +189,7 @@ impl Tunnel {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
     #[allow(unused_mut)]
     let mut builder = tun_rs::DeviceBuilder::new()
@@ -249,12 +255,14 @@ fn spawn_pumps(
     vec![to_wire, from_wire]
 }
 
+#[cfg(not(target_os = "android"))]
 async fn resolve_ip(node: &NodeEndpoint) -> anyhow::Result<IpAddr> {
     resolve_host(&node.host).await
 }
 
 /// Resolve a bare host (or IP literal) to an `IpAddr` (port-agnostic — used for host-route
 /// exceptions).
+#[cfg(not(target_os = "android"))]
 async fn resolve_host(host: &str) -> anyhow::Result<IpAddr> {
     let hp = format!("{host}:0");
     let mut addrs = tokio::net::lookup_host(hp.clone())

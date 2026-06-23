@@ -64,7 +64,10 @@ const DEFAULT_NESTED_CLIENT_IP: Ipv4Addr = Ipv4Addr::new(10, 74, 0, 2);
 const NESTED_CLIENT_PORT: u16 = 51820;
 
 /// Client-side MASQUE configuration.
-#[derive(Clone, Debug, Default)]
+///
+/// `Debug` is hand-written (not derived) because the android `socket_hook` is a closure, which is
+/// not `Debug`; the impl formats the data fields and omits the hook.
+#[derive(Clone, Default)]
 pub struct MasqueConfig {
     /// TLS SNI / `:authority`. Defaults to the target host at connect time.
     pub server_name: Option<String>,
@@ -77,6 +80,22 @@ pub struct MasqueConfig {
     /// tunnel refuses to come up, so a forgotten `NW_EXPECTED_MEASUREMENT` cannot silently carry
     /// traffic unattested. Set `true` (e.g. `NW_ALLOW_UNATTESTED=1`) only for local dev.
     pub allow_unattested: bool,
+    /// **Android only.** Invoked with the raw fd of the outer UDP socket right after `bind` and
+    /// before `connect`, so the app can `VpnService.protect(fd)` it — otherwise the tunnel's own
+    /// QUIC to the node would be routed back into the VpnService TUN (a loop). Absent on other
+    /// platforms (the desktop datapath pins a host route to the node instead).
+    #[cfg(target_os = "android")]
+    pub socket_hook: Option<std::sync::Arc<dyn Fn(std::os::fd::RawFd) + Send + Sync>>,
+}
+
+impl std::fmt::Debug for MasqueConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasqueConfig")
+            .field("server_name", &self.server_name)
+            .field("nested_client_ip", &self.nested_client_ip)
+            .field("allow_unattested", &self.allow_unattested)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Heavy per-session state, owned by the transport and keyed by [`SessionId`].
@@ -255,6 +274,14 @@ impl Transport for MasqueTransport {
         let local = socket
             .local_addr()
             .map_err(|e| Error::Transport(format!("local_addr: {e}")))?;
+        // Android: hand the bound socket's fd to the app so it can `VpnService.protect()` it, so
+        // the tunnel's own QUIC to the node bypasses the VpnService TUN (no loop). The bind →
+        // protect → connect ordering matters. No-op / absent on other platforms.
+        #[cfg(target_os = "android")]
+        if let Some(hook) = &self.config.socket_hook {
+            use std::os::fd::AsRawFd;
+            hook(socket.as_raw_fd());
+        }
         let authority = self.config.server_name.clone().unwrap_or_else(|| target.host.clone());
         let policy = policy_for(&target);
         self.finish_connect(
