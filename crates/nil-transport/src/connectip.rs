@@ -36,6 +36,15 @@ pub const ATTEST_REPORT_HEADER: &str = "nil-attest-report";
 /// verify this before accepting CONNECT-IP; local/dev nodes may explicitly allow it to be absent.
 pub const TUNNEL_GRANT_HEADER: &str = "nil-tunnel-grant";
 
+/// HTTP/3 **response** header carrying the inner IPv4 address the node assigned this client from
+/// its tunnel pool (dotted-quad text, e.g. `10.74.0.7`). A pragmatic subset of RFC 9484
+/// ADDRESS_ASSIGN: it lets the node hand each concurrent client a UNIQUE inner address so two
+/// clients never collide on one tunnel IP. The client applies it to its TUN; absent ⇒ the client
+/// keeps its configured address (single-client fallback). Carried as a header (not a capsule)
+/// because it is a one-shot value known at accept time and the header path already exists, so
+/// client and node cannot drift on a capsule parser.
+pub const ASSIGNED_IP_HEADER: &str = "nil-assigned-ip";
+
 /// Largest QUIC varint, `2^62 - 1` (RFC 9000 §16).
 pub const MAX_VARINT: u64 = (1u64 << 62) - 1;
 

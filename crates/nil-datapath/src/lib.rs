@@ -4,10 +4,11 @@
 //! kill-switch, and runs the bidirectional packet pump.
 //!
 //! The OS-specific routing/kill-switch/DNS lives behind [`NetControl`]: Linux (verified in
-//! Docker) and macOS (verified in a tart VM) are complete; Windows implements routing/DNS and
-//! is verified in a Windows-on-ARM VM (its WFP kill-switch lands in that same pass — see
-//! `windows.rs`). The [`Transport`] trait stays the only seam to the tunnel — this crate never
-//! knows which transport is active.
+//! Docker), macOS (verified in a tart VM), and Windows (routing/DNS + a fail-closed Windows
+//! Firewall kill-switch, verified in a Windows-on-ARM VM — see `windows.rs`) are complete. All
+//! three fail closed: IPv6 is dropped wholesale (the tunnel is IPv4-only) and a dropped pump
+//! holds the kill-switch. The [`Transport`] trait stays the only seam to the tunnel — this crate
+//! never knows which transport is active.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -115,6 +116,12 @@ pub struct Tunnel {
     session: Option<Session>,
     net: Box<dyn NetControl>,
     cancel: CancellationToken,
+    /// Tripped by a pump task when the packet pump exits for ANY reason other than a clean
+    /// teardown (tunnel hung, transport closed, TUN error). The owning engine observes this via
+    /// [`Tunnel::closed`]/[`Tunnel::is_up`] and transitions itself to Disconnected. The
+    /// kill-switch is NOT released here — it holds until [`Tunnel::down`] runs, so a dropped
+    /// tunnel fails closed (no leak window) (Pillar 2 / SOUL: dead tunnel → traffic stops).
+    pump_dead: CancellationToken,
     pumps: Vec<JoinHandle<()>>,
     _tun: Arc<tun_rs::AsyncDevice>,
 }
@@ -158,6 +165,16 @@ impl Tunnel {
             .map_err(|e| anyhow::anyhow!("transport connect: {e}"))?;
         tracing::info!("tunnel session established; bringing up TUN + routes");
 
+        // ADDRESS_ASSIGN (RFC 9484 subset): if the node assigned us a unique inner IPv4, apply it
+        // to the TUN instead of the configured constant — so two concurrent clients never collide
+        // on one inner address. Absent ⇒ keep the configured `client_ip` (single-client fallback).
+        if let Some(ip) = transport.assigned_ip(&session) {
+            if ip != cfg.client_ip {
+                tracing::info!("applying node-assigned inner address to TUN");
+                cfg.client_ip = ip;
+            }
+        }
+
         // Size the TUN to the tunnel's negotiated usable MTU. Each nested hop shrinks it (the
         // inner QUIC rides the outer tunnel), so a multi-hop onion ends up smaller than a single
         // tunnel; clamp to the configured ceiling so we never grow it past what the OS expects.
@@ -192,7 +209,11 @@ impl Tunnel {
         }
 
         let cancel = CancellationToken::new();
-        let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel);
+        // Tripped by whichever pump exits first (hang/dead-tunnel/TUN error). Distinct from
+        // `cancel` (which WE trip on a clean `down`), so the engine can tell "the tunnel died
+        // under us" from "we tore it down".
+        let pump_dead = CancellationToken::new();
+        let pumps = spawn_pumps(transport.clone(), session, tun.clone(), &cancel, &pump_dead);
         tracing::info!(tun = %tun_name, "tunnel up");
 
         Ok(Tunnel {
@@ -200,9 +221,25 @@ impl Tunnel {
             session: Some(session),
             net,
             cancel,
+            pump_dead,
             pumps,
             _tun: tun,
         })
+    }
+
+    /// Resolves when the packet pump dies on its own (tunnel hung, transport closed, or TUN
+    /// error) — i.e. NOT via a clean [`Tunnel::down`]. The kill-switch is still armed at this
+    /// point and stays armed (fail-closed); the caller should react by tearing the tunnel down
+    /// and surfacing a Disconnected state. Cheap to clone/await; safe to call repeatedly.
+    pub fn closed(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let dead = self.pump_dead.clone();
+        async move { dead.cancelled().await }
+    }
+
+    /// Whether the packet pump is still alive. `false` once a pump has exited on its own. The
+    /// engine can poll this between sends to detect a silently-dropped tunnel.
+    pub fn is_up(&self) -> bool {
+        !self.pump_dead.is_cancelled()
     }
 
     /// Tear down cleanly: stop the pump, restore networking, close the session.
@@ -241,47 +278,60 @@ fn spawn_pumps(
     session: Session,
     tun: Arc<tun_rs::AsyncDevice>,
     cancel: &CancellationToken,
+    pump_dead: &CancellationToken,
 ) -> Vec<JoinHandle<()>> {
     // TUN → tunnel: read IP packets off the OS and send them through the transport.
+    // NB: both pumps share a CLONE of the SAME `cancel` token (not a child), so when one pump
+    // dies uncleanly its `cancel.cancel()` also wakes the sibling — the whole tunnel winds down
+    // together. `down()` cancels the same token, which the pumps treat as a clean teardown.
     let to_wire = {
-        let (tun, transport, cancel) = (tun.clone(), transport.clone(), cancel.child_token());
+        let (tun, transport, cancel, dead) =
+            (tun.clone(), transport.clone(), cancel.clone(), pump_dead.clone());
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => return, // clean teardown — not a death
                     r = tun.recv(&mut buf) => match r {
                         Ok(n) => {
                             // Finalize checksums (IPv4 or IPv6) in case the kernel handed us a
                             // partial-checksum packet.
                             nil_core::checksum::fix_l4_checksums(&mut buf[..n]);
                             if transport.send(&session, IpPacket::new(buf[..n].to_vec())).await.is_err() {
-                                break; // tunnel closed → kill-switch holds
+                                break; // tunnel closed → signal death; kill-switch holds
                             }
                         }
                         Err(_) => break,
                     }
                 }
             }
+            // Reached only on an UNCLEAN exit (transport/TUN error). Trip the watchdog AND cancel
+            // the sibling pump so the whole tunnel winds down together. The kill-switch stays
+            // armed until `down()` — a dead tunnel must fail closed, never leak.
+            dead.cancel();
+            cancel.cancel();
         })
     };
     // tunnel → TUN: receive IP packets from the transport and write them to the OS.
     let from_wire = {
-        let (tun, transport, cancel) = (tun.clone(), transport.clone(), cancel.child_token());
+        let (tun, transport, cancel, dead) =
+            (tun.clone(), transport.clone(), cancel.clone(), pump_dead.clone());
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = cancel.cancelled() => break,
+                    _ = cancel.cancelled() => return, // clean teardown — not a death
                     r = transport.recv(&session) => match r {
                         Ok(pkt) => {
                             if tun.send(pkt.as_bytes()).await.is_err() {
                                 break;
                             }
                         }
-                        Err(_) => break, // tunnel closed → kill-switch holds
+                        Err(_) => break, // tunnel closed → signal death; kill-switch holds
                     }
                 }
             }
+            dead.cancel();
+            cancel.cancel();
         })
     };
     vec![to_wire, from_wire]

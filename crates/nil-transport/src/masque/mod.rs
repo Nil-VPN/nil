@@ -114,6 +114,9 @@ struct MasqueSession {
     _driver: tokio::task::JoinHandle<()>,
     /// Max writable QUIC datagram payload negotiated at handshake.
     max_dgram_payload: usize,
+    /// Inner IPv4 the node assigned via the `nil-assigned-ip` response header (RFC 9484
+    /// ADDRESS_ASSIGN subset), if any. The datapath applies it to the TUN.
+    assigned_ip: Option<Ipv4Addr>,
 }
 
 /// The default, production MASQUE/QUIC transport.
@@ -144,6 +147,12 @@ impl MasqueTransport {
             s.max_dgram_payload
                 .saturating_sub(connectip::MAX_FRAMING_OVERHEAD),
         )
+    }
+
+    /// The node-assigned inner IPv4 for a session (`nil-assigned-ip` response header), if the node
+    /// signalled one. The datapath applies it to the TUN (ADDRESS_ASSIGN subset).
+    pub fn assigned_ip(&self, session: &Session) -> Option<Ipv4Addr> {
+        self.state(session).ok().and_then(|s| s.assigned_ip)
     }
 
     fn state(&self, session: &Session) -> Result<Arc<MasqueSession>> {
@@ -289,6 +298,7 @@ impl MasqueTransport {
             shutdown,
             _driver: driver,
             max_dgram_payload: ready.max_dgram_payload,
+            assigned_ip: ready.assigned_ip,
         });
         self.sessions
             .lock()
@@ -380,6 +390,10 @@ impl Transport for MasqueTransport {
     fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
         // Inherent method (priority over this trait method) does the real work.
         MasqueTransport::tunnel_mtu(self, session)
+    }
+
+    fn assigned_ip(&self, session: &Session) -> Option<Ipv4Addr> {
+        MasqueTransport::assigned_ip(self, session)
     }
 }
 
@@ -491,6 +505,8 @@ impl TunnelChannel {
 
 struct ReadyInfo {
     max_dgram_payload: usize,
+    /// Node-assigned inner IPv4 from the CONNECT-IP response (`nil-assigned-ip`), if present.
+    assigned_ip: Option<Ipv4Addr>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,11 +673,14 @@ async fn driver_run(
                                             if let Some(tx) = ready_tx.take() {
                                                 let mdp =
                                                     conn.dgram_max_writable_len().unwrap_or(1200);
+                                                let assigned_ip = assigned_ip_of(&list);
                                                 let _ = tx.send(Ok(ReadyInfo {
                                                     max_dgram_payload: mdp,
+                                                    assigned_ip,
                                                 }));
                                                 tracing::info!(
                                                     flow_id,
+                                                    assigned = assigned_ip.is_some(),
                                                     "MASQUE CONNECT-IP established"
                                                 );
                                             }
@@ -897,6 +916,14 @@ fn status_of(list: &[quiche::h3::Header]) -> Option<u16> {
         .find(|h| h.name() == b":status")
         .and_then(|h| std::str::from_utf8(h.value()).ok())
         .and_then(|s| s.parse().ok())
+}
+
+/// Parse the node's `nil-assigned-ip` response header (dotted-quad IPv4) — the ADDRESS_ASSIGN
+/// subset. Absent or malformed ⇒ `None` (the datapath then keeps its configured address).
+fn assigned_ip_of(list: &[quiche::h3::Header]) -> Option<Ipv4Addr> {
+    header_value(list, connectip::ASSIGNED_IP_HEADER.as_bytes())
+        .and_then(|v| std::str::from_utf8(v).ok())
+        .and_then(|s| s.trim().parse::<Ipv4Addr>().ok())
 }
 
 #[cfg(test)]

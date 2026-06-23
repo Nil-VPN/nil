@@ -15,7 +15,9 @@ mod config;
 mod exit;
 #[cfg(feature = "hw-attest")]
 mod hw;
+mod pool;
 mod pqwg;
+mod retry;
 mod server;
 mod wstunnel;
 

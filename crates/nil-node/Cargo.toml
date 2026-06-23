@@ -20,6 +20,7 @@ nil-transport = { workspace = true, features = ["pqwg"] }  # connectip + PQ-Wire
 nil-attest = { workspace = true }      # shared RA-TLS binding/codec (anti-drift with the client)
 nil-crypto = { workspace = true }      # PQ hybrid PSK responder (KEM encapsulate)
 boringtun = { workspace = true }        # WireGuard static keys (x25519)
+sha2 = { workspace = true }             # HMAC for stateless QUIC Retry address-validation tokens
 quiche = { workspace = true }
 tun-rs = { workspace = true }
 rcgen = { workspace = true }
