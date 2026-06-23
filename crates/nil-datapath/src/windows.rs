@@ -333,6 +333,7 @@ const KS_GROUP: &str = "NIL-VPN-killswitch";
 ///      node — loopback is firewall-exempt by default,
 ///   3. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
 ///      anything trying to bypass the tunnel) is dropped.
+///
 /// Allows precede the Block flip, so the only transient state is "more blocked", never a leak.
 /// Any cmdlet error returns `Err`, aborting the bring-up (fail-closed) rather than running open.
 ///
