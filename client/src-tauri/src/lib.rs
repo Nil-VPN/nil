@@ -2,14 +2,17 @@
 //! and the Business plane. Honest by construction: a VPN is not anonymity, and when no
 //! Coordinator is configured the loopback transport (no real tunnel) is used — the UI says so.
 
-mod account;
-mod config;
-mod engine;
+// `pub` so the headless e2e harness (src/bin/nil-client-e2e.rs) can drive the EXACT same
+// account → token → engine path the Tauri commands use (no GUI), closing the "test the engine,
+// not just nil-cli" gap.
+pub mod account;
+pub mod config;
+pub mod engine;
 mod killswitch;
 mod leakguard;
 mod splittunnel;
-mod tokens;
-mod tokenstore;
+pub mod tokens;
+pub mod tokenstore;
 
 use tauri::State;
 
