@@ -98,3 +98,8 @@ nil-datapath = { path = "crates/nil-datapath", version = "0.1.0" }
 
 [profile.release]
 strip = true
+# One codegen unit → deterministic output ordering. The default (16) parallelizes codegen and
+# reorders symbols/sections run-to-run, breaking byte-for-byte reproducibility — the precondition
+# for a stable nil-node measurement (deploy/reproducible-build.sh). Slower, but the reproducibly
+# built binary must match the one whose measurement is pinned + appraised.
+codegen-units = 1
