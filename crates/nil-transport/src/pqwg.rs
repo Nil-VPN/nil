@@ -205,19 +205,21 @@ impl PqWgTransport {
     }
 }
 
-#[async_trait]
-impl Transport for PqWgTransport {
-    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
-        let node_wg_pub = target
-            .wg_pub
-            .ok_or_else(|| Error::Transport("PqWg: endpoint carries no node WireGuard key".into()))?;
-
-        // 1. Outer MASQUE tunnel (attestation appraised inside).
-        let inner_session = self.inner.connect(target, creds).await?;
-
-        // 2. PQ hybrid PSK exchange over the reliable control channel. The client (KEM
-        //    initiator) ships its WG static public key + both KEM public keys; the node returns
-        //    the two KEM ciphertexts; both derive the same PSK (which never crosses the wire).
+impl PqWgTransport {
+    /// Run the PQ-WireGuard handshake + spawn the data pump over an **already-established** inner
+    /// MASQUE session, registering and returning a PQ-WG session. Shared by [`Transport::connect`]
+    /// (which first dials the outer MASQUE tunnel itself) and by the trust-split [`crate::path`]
+    /// onion (which hands in an already-nested exit hop's MASQUE session — see spec §4.2 + §6).
+    ///
+    /// `node_wg_pub` is the WireGuard static public key of the node terminating `inner_session`.
+    pub async fn wrap_session(
+        &self,
+        inner_session: Session,
+        node_wg_pub: [u8; 32],
+    ) -> Result<Session> {
+        // PQ hybrid PSK exchange over the reliable control channel. The client (KEM initiator)
+        // ships its WG static public key + both KEM public keys; the node returns the two KEM
+        // ciphertexts; both derive the same PSK (which never crosses the wire).
         let (initiator, offer) = PqInitiator::generate();
         let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
         let offer_msg =
@@ -234,7 +236,7 @@ impl Transport for PqWgTransport {
         let cts = PqCiphertexts { mlkem_ct: parts[0].clone(), mceliece_ct: parts[1].clone() };
         let psk = initiator.finish(&cts).map_err(|e| Error::Transport(format!("PQ decapsulate: {e}")))?;
 
-        // 3. WireGuard Noise handshake (IKpsk2, the PSK mixed in) over the datagram channel.
+        // WireGuard Noise handshake (IKpsk2, the PSK mixed in) over the datagram channel.
         let mut core = PqWgCore::new(client_kp.secret, PublicKey::from(node_wg_pub), &psk, 1);
         let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         self.inner.send(&inner_session, IpPacket::new(init)).await?;
@@ -249,7 +251,7 @@ impl Transport for PqWgTransport {
         }
         tracing::info!("PQ-WireGuard tunnel established inside MASQUE");
 
-        // 4. Spawn the data pump (owns the Tunn).
+        // Spawn the data pump (owns the Tunn).
         let (to_tx, to_rx) = mpsc::channel(PUMP_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(PUMP_QUEUE);
         let shutdown = CancellationToken::new();
@@ -269,6 +271,20 @@ impl Transport for PqWgTransport {
             .insert(id, sess);
         // On the wire this is MASQUE/QUIC — the WireGuard layer is hidden inside the datagrams.
         Ok(Session { id, kind: TransportKind::Masque })
+    }
+}
+
+#[async_trait]
+impl Transport for PqWgTransport {
+    async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
+        let node_wg_pub = target
+            .wg_pub
+            .ok_or_else(|| Error::Transport("PqWg: endpoint carries no node WireGuard key".into()))?;
+
+        // 1. Outer MASQUE tunnel (attestation appraised inside).
+        let inner_session = self.inner.connect(target, creds).await?;
+        // 2-4. PQ exchange + WG handshake + data pump over that inner session.
+        self.wrap_session(inner_session, node_wg_pub).await
     }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {

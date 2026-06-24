@@ -804,6 +804,47 @@ async fn flush(conn: &mut quiche::Connection, chan: &PacketChannel, out: &mut [u
     }
 }
 
+/// Transport-parameter values shaped toward an ordinary HTTPS/QUIC (web-browser) profile.
+///
+/// **Honesty note (Pillar 1):** true DPI-indistinguishability from a real browser cannot be
+/// *verified* without a passive-fingerprinting lab (transport-param ordering, the QUIC bit, the
+/// exact set/values a given browser+version emits, ClientHello/ALPN ordering, etc. all matter and
+/// vary by release). This profile only removes the *obvious* tells of a hand-rolled non-browser
+/// stack — GREASE on (a real client greases), browser-plausible flow-control windows and
+/// connection-id limit, and active-migration disabled (browsers don't migrate) — so a passive
+/// observer can't trivially bucket us by anaemic/odd transport params. It is a hardening step,
+/// not a proof of indistinguishability.
+///
+/// Held as a separate, pure value so the chosen profile is unit-testable without constructing a
+/// `quiche::Config` (whose fields are private and have no public getters in quiche 0.22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuicShapeProfile {
+    /// Send GREASE values (RFC 9287 / §18.1). Real clients grease; a non-greasing endpoint is a
+    /// tell. quiche already defaults this to `true`; we set it explicitly so the intent is pinned.
+    grease: bool,
+    /// `active_connection_id_limit` — browsers advertise a small handful (commonly 2–8).
+    active_conn_id_limit: u64,
+    /// `disable_active_migration` — browser QUIC clients do not migrate connections, so they set
+    /// this. A client that leaves migration enabled stands out.
+    disable_active_migration: bool,
+    /// Per-connection flow-control window ceiling. A round, browser-plausible value rather than
+    /// the open-ended default.
+    max_connection_window: u64,
+    /// Per-stream flow-control window ceiling (browser-plausible).
+    max_stream_window: u64,
+}
+
+/// The HTTPS/QUIC profile we shape toward. Values are deliberately round and within the range
+/// common browser QUIC stacks use; they are a moving target across releases, so treat these as a
+/// reasonable approximation, not a byte-exact clone of any one browser.
+const HTTPS_QUIC_PROFILE: QuicShapeProfile = QuicShapeProfile {
+    grease: true,
+    active_conn_id_limit: 4,
+    disable_active_migration: true,
+    max_connection_window: 24 * 1024 * 1024,
+    max_stream_window: 16 * 1024 * 1024,
+};
+
 /// Build the client QUIC config. `max_udp_payload` caps both the size of UDP payloads we will
 /// receive (advertised to the peer, so it caps *its* sends too) and the size of packets we
 /// send. The outermost hop uses [`MAX_UDP_PAYLOAD`]; a nested hop uses a smaller value so its
@@ -824,12 +865,27 @@ fn build_client_config(max_udp_payload: usize) -> Result<quiche::Config> {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.enable_dgram(true, 65536, 65536);
+    // Shape the transport params toward an ordinary HTTPS/QUIC profile so a passive observer
+    // can't trivially distinguish us by hand-rolled/anaemic params (Pillar 1). See
+    // `QuicShapeProfile` for the honesty caveat — this reduces the obvious tells, it does NOT
+    // prove DPI-indistinguishability.
+    apply_quic_shape(&mut config, &HTTPS_QUIC_PROFILE);
     // The node presents a self-signed RA-TLS cert (the attestation report is embedded in an
     // X.509 extension, not chained to a public CA), so BoringSSL-level chain verification is
     // intentionally off. ALL node trust comes from `attest_peer` appraising the embedded
     // report after the handshake — see the single ready gate in `driver_run`.
     config.verify_peer(false);
     Ok(config)
+}
+
+/// Apply a [`QuicShapeProfile`] to a `quiche::Config`. Split out so the *values* are exercised by
+/// a unit test (quiche's `Config` exposes no getters, so the test asserts the profile constant).
+fn apply_quic_shape(config: &mut quiche::Config, p: &QuicShapeProfile) {
+    config.grease(p.grease);
+    config.set_active_connection_id_limit(p.active_conn_id_limit);
+    config.set_disable_active_migration(p.disable_active_migration);
+    config.set_max_connection_window(p.max_connection_window);
+    config.set_max_stream_window(p.max_stream_window);
 }
 
 /// The single attestation gate. With a pinned policy, appraise the node's attestation
@@ -935,6 +991,39 @@ mod tests {
         let t = MasqueTransport::new();
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
+    }
+
+    #[test]
+    fn https_quic_shape_profile_removes_the_obvious_tells() {
+        // The shaping profile toward an ordinary HTTPS/QUIC client: GREASE on (real clients
+        // grease), active migration disabled (browsers don't migrate), a small connection-id
+        // limit, and round browser-plausible flow-control windows. This is a config-assertion
+        // test on the chosen values (quiche's Config has no getters). It does NOT — and cannot
+        // here — prove DPI-indistinguishability; that needs a passive-fingerprinting lab.
+        let p = HTTPS_QUIC_PROFILE;
+        assert!(p.grease, "a real QUIC client sends GREASE; not greasing is a tell");
+        assert!(
+            p.disable_active_migration,
+            "browser QUIC clients disable active migration"
+        );
+        assert!(
+            (2..=8).contains(&p.active_conn_id_limit),
+            "connection-id limit must be in the browser-plausible 2..=8 range, got {}",
+            p.active_conn_id_limit
+        );
+        assert!(
+            p.max_stream_window <= p.max_connection_window,
+            "the per-stream window must not exceed the per-connection window"
+        );
+    }
+
+    #[test]
+    fn build_client_config_applies_the_shape_without_panicking() {
+        // Smoke test: the shaped config builds for both an outermost hop and a small nested
+        // payload (the apply path runs end to end). quiche exposes no getters, so we can only
+        // assert it constructs; the values are covered by `https_quic_shape_profile_*` above.
+        build_client_config(MAX_UDP_PAYLOAD).expect("outermost config builds");
+        build_client_config(MIN_QUIC_UDP_PAYLOAD).expect("nested-floor config builds");
     }
 
     #[test]

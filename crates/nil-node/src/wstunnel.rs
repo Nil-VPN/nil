@@ -16,6 +16,8 @@ const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
+use nil_crypto::psk::{responder_encapsulate, PqOffer};
+use nil_transport::pqwg::{decode_parts, encode_parts};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -123,7 +125,34 @@ async fn serve<S>(
         }
         _ => return, // timed out / no / short preface → drop the connection
     };
-    let mut core = PqWgCore::without_psk(node_secret.clone(), PublicKey::from(client_pub), 2);
+
+    // Frame 2: the client's PQ hybrid-PSK offer (ML-KEM-1024 ek + Classic McEliece pk). We
+    // encapsulate against it to derive the shared PSK and reply with the two ciphertexts; both
+    // sides then key the WireGuard IKpsk2 handshake with the PSK (PQ-by-default, like MASQUE).
+    // A malformed/short offer drops the connection (the slot frees; no PII is logged).
+    let psk = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, recv_binary(&mut ws)).await {
+        Ok(Some(offer_bytes)) => {
+            let Some(parts) = decode_parts(&offer_bytes) else { return };
+            if parts.len() != 2 {
+                return;
+            }
+            let offer = PqOffer {
+                mlkem_ek: parts[0].clone(),
+                mceliece_pk: parts[1].clone(),
+            };
+            let Ok((cts, psk)) = responder_encapsulate(&offer) else { return };
+            if ws
+                .send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            psk
+        }
+        _ => return, // timed out / no offer → drop the connection
+    };
+    let mut core = PqWgCore::new(node_secret.clone(), PublicKey::from(client_pub), &psk, 2);
     let (mut sink, mut stream) = ws.split();
 
     loop {
