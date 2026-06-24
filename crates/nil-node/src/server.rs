@@ -343,46 +343,18 @@ fn drive_h3(
                         let _ = h3.send_response(&mut client.conn, stream_id, &resp, true);
                         continue;
                     }
-                    let mut resp = vec![
-                        quiche::h3::Header::new(b":status", b"200"),
-                        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
-                    ];
                     // ADDRESS_ASSIGN (RFC 9484 subset): allocate a UNIQUE inner IPv4 for this
-                    // client from the pool and signal it back so concurrent clients never collide
-                    // on one tunnel address. Idempotent per connection. If the pool is exhausted we
-                    // omit the header — the client then keeps its configured address (single-client
-                    // fallback); only one such client can be routed at a time, but we never hand two
-                    // clients the same live address. `assigned_str` outlives `resp`'s use below.
+                    // client from the pool. Idempotent per connection. If the pool is exhausted the
+                    // response omits the header — the client then keeps its configured address
+                    // (single-client fallback); only one such client can be routed at a time, but we
+                    // never hand two clients the same live address.
                     let assigned = pool.assign(client_id);
-                    let assigned_str = assigned.map(|ip| ip.to_string());
-                    if let Some(s) = assigned_str.as_deref() {
-                        resp.push(quiche::h3::Header::new(
-                            connectip::ASSIGNED_IP_HEADER.as_bytes(),
-                            s.as_bytes(),
-                        ));
-                    } else {
+                    if assigned.is_none() {
                         tracing::warn!("address pool exhausted; client keeps its configured address");
                     }
-                    // RA-TLS: bind a report to our TLS key + the client's nonce and return it
-                    // so the client can appraise us before sending traffic (spec §5).
-                    if let Some(nonce_hex) =
-                        header_value(&list, connectip::ATTEST_NONCE_HEADER.as_bytes())
-                    {
-                        if let Some(nb) = connectip::from_hex(&nonce_hex) {
-                            if let Ok(nonce) = <[u8; 32]>::try_from(nb.as_slice()) {
-                                if let Some(report) = crate::attest::report_hex(
-                                    node_spki,
-                                    cfg.attest.as_ref(),
-                                    &nonce,
-                                ) {
-                                    resp.push(quiche::h3::Header::new(
-                                        connectip::ATTEST_REPORT_HEADER.as_bytes(),
-                                        report.as_bytes(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
+                    // Build the 200 response (capsule-protocol + optional ADDRESS_ASSIGN + optional
+                    // RA-TLS report bound to our TLS key + the client's nonce). Pure + unit-tested.
+                    let resp = build_connect_ok_response(&list, assigned, node_spki, cfg.attest.as_ref());
                     if h3
                         .send_response(&mut client.conn, stream_id, &resp, false)
                         .is_ok()
@@ -497,6 +469,46 @@ fn header_value(list: &[quiche::h3::Header], name: &[u8]) -> Option<Vec<u8>> {
         .map(|h| h.value().to_vec())
 }
 
+/// Build the `200` CONNECT-IP response header set: `:status 200` + `capsule-protocol: ?1`, plus
+/// the ADDRESS_ASSIGN header when `assigned` is `Some`, plus the RA-TLS attestation report bound to
+/// `node_spki` + the client's nonce when the request carried a well-formed nonce and a report can
+/// be produced. Pure (no quiche connection, no I/O) so the wire contract is unit-testable; the
+/// quiche header values own their bytes, so the returned `Vec` outlives the borrowed inputs.
+fn build_connect_ok_response(
+    request_headers: &[quiche::h3::Header],
+    assigned: Option<std::net::Ipv4Addr>,
+    node_spki: &[u8],
+    attest: Option<&crate::attest::NodeAttest>,
+) -> Vec<quiche::h3::Header> {
+    let mut resp = vec![
+        quiche::h3::Header::new(b":status", b"200"),
+        quiche::h3::Header::new(b"capsule-protocol", b"?1"),
+    ];
+    if let Some(ip) = assigned {
+        resp.push(quiche::h3::Header::new(
+            connectip::ASSIGNED_IP_HEADER.as_bytes(),
+            ip.to_string().as_bytes(),
+        ));
+    }
+    // RA-TLS: bind a report to our TLS key + the client's nonce so the client can appraise us
+    // before sending traffic (spec §5). Absent/malformed nonce, or no report provider → no header,
+    // and the client (which pins a measurement) then fails closed.
+    if let Some(nonce_hex) = header_value(request_headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
+    {
+        if let Some(nb) = connectip::from_hex(&nonce_hex) {
+            if let Ok(nonce) = <[u8; 32]>::try_from(nb.as_slice()) {
+                if let Some(report) = crate::attest::report_hex(node_spki, attest, &nonce) {
+                    resp.push(quiche::h3::Header::new(
+                        connectip::ATTEST_REPORT_HEADER.as_bytes(),
+                        report.as_bytes(),
+                    ));
+                }
+            }
+        }
+    }
+    resp
+}
+
 fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result<(), &'static str> {
     let nonce_hex = header_value(headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
         .ok_or("missing attestation nonce")?;
@@ -576,5 +588,163 @@ fn packet_ip(packet: &[u8], source: bool) -> Option<IpAddr> {
             Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quiche::h3::{Header, NameValue};
+    use std::net::Ipv4Addr;
+
+    /// Find a response header value by (lowercase) name.
+    fn find<'a>(resp: &'a [Header], name: &[u8]) -> Option<&'a [u8]> {
+        resp.iter().find(|h| h.name() == name).map(|h| h.value())
+    }
+
+    /// A CONNECT-IP request header list carrying `nonce` as the lowercase-hex attest-nonce header.
+    fn request_with_nonce(nonce: &[u8; 32]) -> Vec<Header> {
+        vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-ip"),
+            Header::new(
+                connectip::ATTEST_NONCE_HEADER.as_bytes(),
+                connectip::to_hex(nonce).as_bytes(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn ok_response_is_200_with_capsule_protocol() {
+        // No assignment, no attest config → just the status + capsule-protocol line.
+        let resp = build_connect_ok_response(&request_with_nonce(&[0u8; 32]), None, b"spki", None);
+        assert_eq!(find(&resp, b":status"), Some(&b"200"[..]), "CONNECT-IP accepted with 200");
+        assert_eq!(
+            find(&resp, b"capsule-protocol"),
+            Some(&b"?1"[..]),
+            "capsule-protocol negotiated"
+        );
+    }
+
+    #[test]
+    fn address_assign_header_present_only_when_assigned() {
+        // With an assignment, the ADDRESS_ASSIGN header carries the dotted-quad inner IP.
+        let ip = Ipv4Addr::new(10, 74, 0, 7);
+        let resp =
+            build_connect_ok_response(&request_with_nonce(&[0u8; 32]), Some(ip), b"spki", None);
+        assert_eq!(
+            find(&resp, connectip::ASSIGNED_IP_HEADER.as_bytes()),
+            Some(b"10.74.0.7".as_slice()),
+            "assigned inner IP echoed as ADDRESS_ASSIGN"
+        );
+
+        // Pool exhausted (None) → no ADDRESS_ASSIGN header (client keeps its configured address).
+        let resp = build_connect_ok_response(&request_with_nonce(&[0u8; 32]), None, b"spki", None);
+        assert!(
+            find(&resp, connectip::ASSIGNED_IP_HEADER.as_bytes()).is_none(),
+            "no ADDRESS_ASSIGN header when the pool is exhausted"
+        );
+    }
+
+    #[test]
+    fn no_attest_report_header_without_attest_config() {
+        // No NodeAttest configured → no report header even though the request carried a nonce.
+        let resp = build_connect_ok_response(&request_with_nonce(&[7u8; 32]), None, b"spki", None);
+        assert!(
+            find(&resp, connectip::ATTEST_REPORT_HEADER.as_bytes()).is_none(),
+            "no report header when the node has no attestation identity"
+        );
+    }
+
+    /// The attest-report header is only produced (and only appraises) when the `synthetic-attest`
+    /// report provider is built in. Accept: the report binds to (spki, nonce) and appraises against
+    /// the matching policy. Reject: the SAME report fails appraisal under a DIFFERENT nonce
+    /// (freshness) — proving the binding is real, not cosmetic.
+    #[cfg(feature = "synthetic-attest")]
+    #[test]
+    fn attest_report_header_binds_to_nonce_and_spki() {
+        use nil_attest::{appraise, AppraisalPolicy};
+        use nil_core::{Measurement, Tee};
+
+        let measurement = [0xABu8; 48];
+        let attest = crate::attest::NodeAttest {
+            tee: Tee::SevSnp,
+            measurement,
+        };
+        let spki = b"node-tls-spki-bytes";
+        let nonce = [0x42u8; 32];
+
+        let resp =
+            build_connect_ok_response(&request_with_nonce(&nonce), None, spki, Some(&attest));
+        let report_hex = find(&resp, connectip::ATTEST_REPORT_HEADER.as_bytes())
+            .expect("synthetic node returns an attestation report");
+        let evidence =
+            connectip::from_hex(report_hex).expect("report header is lowercase hex");
+
+        let policy = AppraisalPolicy::new(Tee::SevSnp, Measurement(measurement.to_vec()));
+        // Accept: correct spki + correct nonce → appraisal succeeds.
+        appraise(&evidence, spki, &policy, &nonce)
+            .expect("report bound to (spki, nonce) appraises against the pinned policy");
+        // Reject: a different nonce breaks the report_data freshness binding.
+        let mut wrong_nonce = nonce;
+        wrong_nonce[0] ^= 0xff;
+        assert!(
+            appraise(&evidence, spki, &policy, &wrong_nonce).is_err(),
+            "the report must NOT appraise under a different connection nonce (freshness)"
+        );
+        // Reject: a different pinned measurement is refused.
+        let wrong_policy =
+            AppraisalPolicy::new(Tee::SevSnp, Measurement(vec![0x00u8; 48]));
+        assert!(
+            appraise(&evidence, spki, &wrong_policy, &nonce).is_err(),
+            "the report must NOT appraise against a different pinned measurement"
+        );
+    }
+
+    #[test]
+    fn authorize_refuses_missing_nonce() {
+        // A dev node that allows ungranted clients still requires the attestation nonce header.
+        let cfg = test_cfg(true);
+        let headers = vec![
+            Header::new(b":method", b"CONNECT"),
+            Header::new(b":protocol", b"connect-ip"),
+        ];
+        assert_eq!(
+            authorize_connect(&headers, &cfg),
+            Err("missing attestation nonce")
+        );
+    }
+
+    #[test]
+    fn authorize_allows_ungranted_dev_node_with_nonce() {
+        // allow_ungranted + no grant key + a nonce header → accepted (local/dev bypass).
+        let cfg = test_cfg(true);
+        assert!(authorize_connect(&request_with_nonce(&[1u8; 32]), &cfg).is_ok());
+    }
+
+    #[test]
+    fn authorize_refuses_when_grant_verifier_unconfigured_and_not_dev() {
+        // Production posture: no grant key and NOT allow_ungranted → CONNECT-IP is refused.
+        let cfg = test_cfg(false);
+        assert_eq!(
+            authorize_connect(&request_with_nonce(&[1u8; 32]), &cfg),
+            Err("grant verifier not configured")
+        );
+    }
+
+    fn test_cfg(allow_ungranted: bool) -> NodeConfig {
+        NodeConfig {
+            bind: "127.0.0.1:0".parse().expect("valid addr"),
+            tun_name: "nil0".into(),
+            node_tun_ip: Ipv4Addr::new(10, 74, 0, 1),
+            prefix: 24,
+            tunnel_cidr: "10.74.0.0/24".into(),
+            egress: "eth0".into(),
+            mtu: 1420,
+            attest: None,
+            role: crate::config::NodeRole::Exit,
+            grant_key: None,
+            allow_ungranted,
+        }
     }
 }

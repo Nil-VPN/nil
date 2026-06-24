@@ -168,26 +168,21 @@ impl Tunnel {
         // ADDRESS_ASSIGN (RFC 9484 subset): if the node assigned us a unique inner IPv4, apply it
         // to the TUN instead of the configured constant — so two concurrent clients never collide
         // on one inner address. Absent ⇒ keep the configured `client_ip` (single-client fallback).
-        if let Some(ip) = transport.assigned_ip(&session) {
-            if ip != cfg.client_ip {
-                tracing::info!("applying node-assigned inner address to TUN");
-                cfg.client_ip = ip;
-            }
+        if let Some(ip) = apply_assigned_ip(cfg.client_ip, transport.assigned_ip(&session)) {
+            tracing::info!("applying node-assigned inner address to TUN");
+            cfg.client_ip = ip;
         }
 
         // Size the TUN to the tunnel's negotiated usable MTU. Each nested hop shrinks it (the
         // inner QUIC rides the outer tunnel), so a multi-hop onion ends up smaller than a single
         // tunnel; clamp to the configured ceiling so we never grow it past what the OS expects.
-        if let Some(m) = transport.tunnel_mtu(&session) {
-            let m = m.min(u16::MAX as usize) as u16;
-            if m < cfg.mtu {
-                tracing::info!(
-                    negotiated = m,
-                    configured = cfg.mtu,
-                    "sizing TUN to negotiated tunnel MTU"
-                );
-                cfg.mtu = m;
-            }
+        if let Some(m) = clamp_mtu(cfg.mtu, transport.tunnel_mtu(&session)) {
+            tracing::info!(
+                negotiated = m,
+                configured = cfg.mtu,
+                "sizing TUN to negotiated tunnel MTU"
+            );
+            cfg.mtu = m;
         }
 
         let tun = Arc::new(open_tun(&cfg).map_err(|e| anyhow::anyhow!("open tun: {e}"))?);
@@ -273,6 +268,26 @@ fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
     builder.build_async()
 }
 
+/// Decide whether a node-assigned inner IPv4 should replace the configured `client_ip`. Returns
+/// `Some(new_ip)` only when the node assigned an address that differs from the configured one
+/// (`None` ⇒ keep the configured address: no assignment, or it already matches). Pure — extracted
+/// from [`Tunnel::up`] so the ADDRESS_ASSIGN apply path is unit-testable without a TUN device.
+fn apply_assigned_ip(configured: Ipv4Addr, assigned: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    match assigned {
+        Some(ip) if ip != configured => Some(ip),
+        _ => None,
+    }
+}
+
+/// Clamp the configured TUN MTU down to the tunnel's negotiated usable MTU. Returns `Some(m)` only
+/// when the negotiated MTU is known AND smaller than the configured ceiling (we never grow the TUN
+/// past what the OS expects); `None` ⇒ keep the configured MTU. Pure — extracted from
+/// [`Tunnel::up`] for unit testing.
+fn clamp_mtu(configured: u16, negotiated: Option<usize>) -> Option<u16> {
+    let m = negotiated?.min(u16::MAX as usize) as u16;
+    (m < configured).then_some(m)
+}
+
 fn spawn_pumps(
     transport: Arc<dyn Transport>,
     session: Session,
@@ -354,4 +369,106 @@ async fn resolve_host(host: &str) -> anyhow::Result<IpAddr> {
         .next()
         .map(|s| s.ip())
         .ok_or_else(|| anyhow::anyhow!("no address for {host}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nil_core::Grant;
+    use nil_transport::loopback::LoopbackTransport;
+
+    #[test]
+    fn assigned_ip_replaces_only_a_distinct_node_assignment() {
+        let configured: Ipv4Addr = "10.74.0.2".parse().unwrap();
+        // No assignment ⇒ keep configured (single-client fallback).
+        assert_eq!(apply_assigned_ip(configured, None), None);
+        // Node assigned the SAME address ⇒ no change (don't churn the TUN needlessly).
+        assert_eq!(apply_assigned_ip(configured, Some(configured)), None);
+        // Node assigned a DIFFERENT address ⇒ apply it (concurrent-client collision avoidance).
+        let assigned: Ipv4Addr = "10.74.0.9".parse().unwrap();
+        assert_eq!(apply_assigned_ip(configured, Some(assigned)), Some(assigned));
+    }
+
+    #[test]
+    fn mtu_clamps_down_never_up() {
+        // Unknown negotiated MTU ⇒ keep the configured ceiling.
+        assert_eq!(clamp_mtu(1280, None), None);
+        // Negotiated smaller (nested onion shrinks it) ⇒ clamp down.
+        assert_eq!(clamp_mtu(1280, Some(1232)), Some(1232));
+        // Negotiated equal or larger ⇒ never grow past the OS-expected ceiling.
+        assert_eq!(clamp_mtu(1280, Some(1280)), None);
+        assert_eq!(clamp_mtu(1280, Some(1500)), None);
+        // A pathological > u16::MAX negotiated value saturates, then clamps as usual.
+        assert_eq!(clamp_mtu(1280, Some(usize::MAX)), None);
+    }
+
+    /// The packet pump's core: a packet read off the source is checksum-finalized, pushed through
+    /// the transport (`send`), and the echo comes back via `recv` byte-for-byte (decapsulate). This
+    /// exercises the encapsulate→decapsulate round-trip over the in-memory loopback transport
+    /// (the same `Transport` seam the real pump drives — the OS TUN endpoints are not mockable
+    /// offline, so we drive the transport directly, matching `spawn_pumps`' send/recv sequence).
+    #[tokio::test]
+    async fn pump_roundtrips_a_packet_over_loopback() {
+        let transport = LoopbackTransport::new();
+        let session = transport
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("connect");
+
+        // A minimal well-formed IPv4 header (20 bytes, no L4) so `fix_l4_checksums` is exercised
+        // on the to-wire side exactly as the real pump does before `send`.
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45; // IPv4, IHL=5
+        pkt[2] = 0x00;
+        pkt[3] = 20; // total length
+        nil_core::checksum::fix_l4_checksums(&mut pkt);
+
+        transport
+            .send(&session, IpPacket::new(pkt.clone()))
+            .await
+            .expect("send");
+        let got = transport.recv(&session).await.expect("recv");
+        assert_eq!(
+            got.as_bytes(),
+            pkt.as_slice(),
+            "loopback pump must round-trip the packet unchanged"
+        );
+
+        transport.close(session).await.expect("close");
+        // After teardown the session state is gone → a further send fails (kill-switch-hold
+        // semantics: a dead tunnel surfaces as a transport error to the pump).
+        assert!(
+            transport
+                .send(&session, IpPacket::new(vec![0x45]))
+                .await
+                .is_err(),
+            "send after close must error"
+        );
+    }
+
+    /// Two concurrent sessions never cross packets — the pump for one tunnel must not receive
+    /// another's traffic (the loopback transport keys queues by session id).
+    #[tokio::test]
+    async fn pump_sessions_do_not_cross_talk() {
+        let transport = LoopbackTransport::new();
+        let a = transport
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("connect a");
+        let b = transport
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("connect b");
+
+        transport
+            .send(&a, IpPacket::new(vec![0xAA]))
+            .await
+            .expect("send a");
+        transport
+            .send(&b, IpPacket::new(vec![0xBB]))
+            .await
+            .expect("send b");
+        assert_eq!(transport.recv(&a).await.expect("recv a").as_bytes(), &[0xAA]);
+        assert_eq!(transport.recv(&b).await.expect("recv b").as_bytes(), &[0xBB]);
+    }
 }

@@ -20,7 +20,7 @@ pqwg = ["masque", "dep:boringtun", "dep:nil-crypto", "dep:getrandom", "dep:sha2"
 # wstunnel cascade rung: WireGuard (the pqwg core) carried over WebSocket-over-TLS — a distinct
 # HTTPS-shaped wire fingerprint. The inner WireGuard provides the crypto/auth; the TLS is the
 # obfuscation envelope.
-wstunnel = ["pqwg", "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "dep:futures-util"]
+wstunnel = ["pqwg", "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "dep:futures-util", "dep:hkdf"]
 
 [dependencies]
 nil-core = { workspace = true }
@@ -33,6 +33,7 @@ tokio-util = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 boringtun = { workspace = true, optional = true }       # WireGuard Noise core (pqwg)
 sha2 = { workspace = true, optional = true }             # derive per-deployment obfs magics (pqwg)
+hkdf = { workspace = true, optional = true }             # derive the wstunnel secret request path (wstunnel)
 nil-crypto = { workspace = true, optional = true }       # PQ hybrid PSK (pqwg)
 tokio-tungstenite = { workspace = true, optional = true } # WebSocket (wstunnel)
 tokio-rustls = { workspace = true, optional = true }     # TLS envelope (wstunnel)

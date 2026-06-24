@@ -65,6 +65,16 @@ pub async fn redeem_path_from_env(coord_url: &str) -> Result<Vec<NodeEndpoint>> 
 /// and return the attested path. Fails closed if the URL is plaintext-to-non-loopback, the
 /// Coordinator rejects/stalls, or the response is empty/oversized/malformed.
 pub async fn redeem_path(coord_url: &str, msg: &str, token: &str) -> Result<Vec<NodeEndpoint>> {
+    // Footgun guard: a redeemed path pins each hop to the Coordinator's OWN per-hop measurement
+    // (see `hop_to_endpoint`), so a process-wide `NW_EXPECTED_MEASUREMENT` is silently superseded
+    // on the token path. Warn the *fact* (no measurement bytes, no host — PD-2/no-PII) so an
+    // operator doesn't believe the env pin is the gate in force while the per-hop pins are.
+    if std::env::var("NW_EXPECTED_MEASUREMENT").is_ok() {
+        tracing::warn!(
+            "NW_EXPECTED_MEASUREMENT is set but the path is redeemed from the Coordinator — the env \
+             pin is IGNORED; each hop is gated against its own Coordinator-provided measurement"
+        );
+    }
     // The token is a bearer credential — never POST it in cleartext to a non-loopback host. A
     // plaintext link also lets a MITM rewrite the per-hop measurements. Require TLS unless the
     // host is loopback, or the operator explicitly opted into an insecure control plane (a

@@ -340,12 +340,27 @@ fn assemble(
     Ok((transport, cfg))
 }
 
+/// Warn that a pinned `NW_EXPECTED_MEASUREMENT` is silently superseded when the path comes from
+/// the Coordinator: a redeemed path carries its OWN per-hop measurement (see
+/// `redeem::hop_to_endpoint`), so the env-wide single pin is ignored on the token path. Logging the
+/// *fact* (no measurement bytes, no host) closes the footgun where an operator believes the env pin
+/// is enforcing the gate while the Coordinator's per-hop pins are the ones actually in force.
+fn warn_env_pin_superseded_by_coordinator() {
+    if std::env::var("NW_EXPECTED_MEASUREMENT").is_ok() {
+        tracing::warn!(
+            "NW_EXPECTED_MEASUREMENT is set but a Coordinator path is being redeemed — the env pin \
+             is IGNORED; each hop is gated against the Coordinator's own per-hop measurement instead"
+        );
+    }
+}
+
 /// Build the transport and a [`TunnelConfig`] from the environment. Path priority: (1) redeem a
 /// Privacy Pass token at the Coordinator (`NW_COORDINATOR_URL` + `NW_TOKEN_MSG`/`NW_TOKEN[_FILE]`);
 /// (2) a static `NW_PATH` onion (dev); (3) a single `NW_NODE_HOST`. Used by `nil-cli` (headless).
 pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let p = params_from_env()?;
     let path = if let Ok(url) = std::env::var("NW_COORDINATOR_URL") {
+        warn_env_pin_superseded_by_coordinator();
         Some(crate::redeem::redeem_path_from_env(&url).await?)
     } else {
         path_from_env(&p.expected)?
@@ -363,6 +378,125 @@ pub async fn from_env_with_token(
     token: &str,
 ) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let p = params_from_env()?;
+    // Same footgun as the headless path: a present env pin is ignored once the Coordinator
+    // returns per-hop measurements (the desktop engine still reads NW_EXPECTED_MEASUREMENT via
+    // `params_from_env`, but it never reaches the redeemed hops).
+    warn_env_pin_superseded_by_coordinator();
     let path = Some(crate::redeem::redeem_path(coord_url, msg, token).await?);
     assemble(p, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn measurement(byte: u8) -> AttestExpectation {
+        AttestExpectation {
+            tee: Tee::SevSnp,
+            measurement: Measurement(vec![byte; 48]),
+        }
+    }
+
+    /// Base params with no node WG key, no cascade. `expected`/`wg_pub` are overridden per test.
+    /// These tests rely on `NW_CASCADE` being UNSET in the test process (no test sets it), so
+    /// `assemble` takes the no-cascade branch deterministically and `also_except` stays empty.
+    fn base_params() -> TunnelParams {
+        TunnelParams {
+            host: "node.example".to_string(),
+            port: 443,
+            tun_name: "nil0".to_string(),
+            client_ip: "10.74.0.2".parse().unwrap(),
+            peer_ip: "10.74.0.1".parse().unwrap(),
+            dns: vec!["1.1.1.1".parse().unwrap()],
+            kill_switch: true,
+            allow_unattested: false,
+            expected: None,
+            wg_pub: None,
+        }
+    }
+
+    #[test]
+    fn single_hop_plain_masque_carries_the_pin_and_default_mtu() {
+        let mut p = base_params();
+        p.expected = Some(measurement(0xab));
+        let (transport, cfg) = assemble(p, None).expect("assemble single-hop");
+        // The configured node pin propagates verbatim into the routing node the datapath uses.
+        assert_eq!(cfg.node.expected, Some(measurement(0xab)));
+        assert_eq!(cfg.node.host, "node.example");
+        assert_eq!(cfg.node.wg_pub, None);
+        // Plain MASQUE → 1280 ceiling; no cascade → no extra except hosts.
+        assert_eq!(cfg.mtu, 1280);
+        assert!(cfg.also_except.is_empty());
+        // On the wire it's MASQUE regardless of the inner layering (Pillar 1).
+        assert_eq!(transport.kind(), nil_core::TransportKind::Masque);
+        assert_eq!(cfg.client_ip, "10.74.0.2".parse::<Ipv4Addr>().unwrap());
+        assert!(cfg.kill_switch);
+    }
+
+    #[test]
+    fn single_hop_with_wg_pub_selects_pqwg_and_shrinks_mtu() {
+        let mut p = base_params();
+        p.expected = Some(measurement(0xcd));
+        p.wg_pub = Some([7u8; 32]);
+        let (_transport, cfg) = assemble(p, None).expect("assemble pqwg single-hop");
+        // The node WG key flows into the routing endpoint, and the PQ-WireGuard primary shrinks
+        // the usable MTU to 1232 (vs 1280 plain) — the observable signal the PqWg branch was taken.
+        assert_eq!(cfg.node.wg_pub, Some([7u8; 32]));
+        assert_eq!(cfg.node.expected, Some(measurement(0xcd)));
+        assert_eq!(cfg.mtu, 1232);
+    }
+
+    #[test]
+    fn path_uses_the_entry_hop_as_routing_node() {
+        let p = base_params();
+        let hops = vec![
+            NodeEndpoint {
+                host: "entry.example".to_string(),
+                port: 443,
+                kind: TransportKind::Masque,
+                wg_pub: None,
+                expected: Some(measurement(0x11)),
+                grant: None,
+            },
+            NodeEndpoint {
+                host: "exit.example".to_string(),
+                port: 443,
+                kind: TransportKind::Masque,
+                wg_pub: None,
+                expected: Some(measurement(0x22)),
+                grant: None,
+            },
+        ];
+        let (transport, cfg) = assemble(p, Some(hops)).expect("assemble path");
+        // The datapath's kill-switch host-route exception is the ENTRY hop (hops[0]); inner hops
+        // are reached through the tunnel and must not appear as the routing node.
+        assert_eq!(cfg.node.host, "entry.example");
+        assert_eq!(cfg.node.expected, Some(measurement(0x11)));
+        // Multi-hop nested MASQUE uses the 1280 onion ceiling and stays MASQUE on the wire.
+        assert_eq!(cfg.mtu, 1280);
+        assert_eq!(transport.kind(), nil_core::TransportKind::Masque);
+        assert!(cfg.also_except.is_empty());
+    }
+
+    #[test]
+    fn path_ignores_a_stray_node_wg_pub() {
+        // A path is configured AND a node WG key is set: the multi-hop branch must ignore the
+        // single-node WG key (it runs plain nested MASQUE) and still route via the entry hop.
+        let mut p = base_params();
+        p.wg_pub = Some([9u8; 32]);
+        let hops = vec![NodeEndpoint {
+            host: "entry.example".to_string(),
+            port: 443,
+            kind: TransportKind::Masque,
+            wg_pub: None,
+            expected: Some(measurement(0x33)),
+            grant: None,
+        }];
+        let (_t, cfg) = assemble(p, Some(hops)).expect("assemble path with stray wg_pub");
+        assert_eq!(cfg.node.host, "entry.example");
+        // The routing node is the entry hop verbatim — the stray single-node wg_pub does not leak
+        // into it (the entry hop carried `None`).
+        assert_eq!(cfg.node.wg_pub, None);
+        assert_eq!(cfg.mtu, 1280);
+    }
 }

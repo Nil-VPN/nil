@@ -3577,6 +3577,7 @@ dependencies = [
  "boringtun",
  "futures-util",
  "getrandom 0.2.17",
+ "hkdf",
  "nil-attest",
  "nil-core",
  "nil-crypto",
