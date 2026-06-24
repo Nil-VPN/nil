@@ -109,6 +109,45 @@ pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
     }))
 }
 
+/// Audit B1 — the CLIENT-SIDE, Coordinator-INDEPENDENT set of measurements the client will accept
+/// for ANY redeemed hop, as raw bytes. This is the pin the redeem cross-check
+/// ([`crate::redeem::redeem_path`]) tests each Coordinator-provided hop measurement against, so a
+/// compromised/coerced Coordinator cannot substitute a measurement pointing at a node it controls.
+///
+/// Sourced from (union of, so single-hop and multi-hop deployments share one mechanism):
+///   - `NW_EXPECTED_MEASUREMENT` (single hex value, the existing per-node pin), and
+///   - `NW_PINNED_MEASUREMENTS` (comma-separated hex, the set for a multi-operator trust-split path).
+///
+/// Empty ⇒ no client pin ⇒ the redeemed path stays Coordinator-trusted (a WARN is logged there).
+/// For the pin to be MEANINGFUL it must come from a genuinely independent source (out-of-band
+/// config, the user-verified reproducible-build measurement, or a future operator-signed registry);
+/// see the residual-trust note on [`crate::redeem::cross_check_pins`]. PII-free: this never logs the
+/// measurement bytes.
+pub fn pinned_measurements_from_env() -> Result<Vec<Vec<u8>>> {
+    let mut pins: Vec<Vec<u8>> = Vec::new();
+    if let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") {
+        let bytes = connectip::from_hex(hex.trim().as_bytes())
+            .ok_or_else(|| anyhow::anyhow!("NW_EXPECTED_MEASUREMENT is not valid hex"))?;
+        pins.push(bytes);
+    }
+    if let Ok(list) = std::env::var("NW_PINNED_MEASUREMENTS") {
+        for (i, item) in list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .enumerate()
+        {
+            let bytes = connectip::from_hex(item.as_bytes()).ok_or_else(|| {
+                anyhow::anyhow!("NW_PINNED_MEASUREMENTS entry {i} is not valid hex")
+            })?;
+            if !pins.contains(&bytes) {
+                pins.push(bytes);
+            }
+        }
+    }
+    Ok(pins)
+}
+
 /// The node's WireGuard static public key (hex) from `NW_NODE_WG_PUB`, if set.
 fn wg_pub_from_env() -> Result<Option<[u8; 32]>> {
     let Ok(h) = std::env::var("NW_NODE_WG_PUB") else {
@@ -340,28 +379,17 @@ fn assemble(
     Ok((transport, cfg))
 }
 
-/// Warn that a pinned `NW_EXPECTED_MEASUREMENT` is silently superseded when the path comes from
-/// the Coordinator: a redeemed path carries its OWN per-hop measurement (see
-/// `redeem::hop_to_endpoint`), so the env-wide single pin is ignored on the token path. Logging the
-/// *fact* (no measurement bytes, no host) closes the footgun where an operator believes the env pin
-/// is enforcing the gate while the Coordinator's per-hop pins are the ones actually in force.
-fn warn_env_pin_superseded_by_coordinator() {
-    if std::env::var("NW_EXPECTED_MEASUREMENT").is_ok() {
-        tracing::warn!(
-            "NW_EXPECTED_MEASUREMENT is set but a Coordinator path is being redeemed — the env pin \
-             is IGNORED; each hop is gated against the Coordinator's own per-hop measurement instead"
-        );
-    }
-}
-
 /// Build the transport and a [`TunnelConfig`] from the environment. Path priority: (1) redeem a
 /// Privacy Pass token at the Coordinator (`NW_COORDINATOR_URL` + `NW_TOKEN_MSG`/`NW_TOKEN[_FILE]`);
 /// (2) a static `NW_PATH` onion (dev); (3) a single `NW_NODE_HOST`. Used by `nil-cli` (headless).
 pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let p = params_from_env()?;
     let path = if let Ok(url) = std::env::var("NW_COORDINATOR_URL") {
-        warn_env_pin_superseded_by_coordinator();
-        Some(crate::redeem::redeem_path_from_env(&url).await?)
+        // Audit B1: a redeemed path no longer trusts the Coordinator's per-hop measurement on
+        // faith — it is cross-checked against the client's own pin (NW_EXPECTED_MEASUREMENT /
+        // NW_PINNED_MEASUREMENTS) inside `redeem_path`, which fails closed on a mismatch.
+        let client_pins = pinned_measurements_from_env()?;
+        Some(crate::redeem::redeem_path_from_env(&url, &client_pins).await?)
     } else {
         path_from_env(&p.expected)?
     };
@@ -378,11 +406,11 @@ pub async fn from_env_with_token(
     token: &str,
 ) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
     let p = params_from_env()?;
-    // Same footgun as the headless path: a present env pin is ignored once the Coordinator
-    // returns per-hop measurements (the desktop engine still reads NW_EXPECTED_MEASUREMENT via
-    // `params_from_env`, but it never reaches the redeemed hops).
-    warn_env_pin_superseded_by_coordinator();
-    let path = Some(crate::redeem::redeem_path(coord_url, msg, token).await?);
+    // Audit B1 cross-check (see `from_env`): the desktop engine reads its independent pin from the
+    // same env vars and the redeem path refuses any hop whose Coordinator-provided measurement is
+    // not in it.
+    let client_pins = pinned_measurements_from_env()?;
+    let path = Some(crate::redeem::redeem_path(coord_url, msg, token, &client_pins).await?);
     assemble(p, path)
 }
 

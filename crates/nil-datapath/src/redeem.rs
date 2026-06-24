@@ -56,25 +56,29 @@ fn read_token() -> Result<RedeemRequest> {
 
 /// Redeem the token in `NW_TOKEN_MSG` + `NW_TOKEN[_FILE]` at the Coordinator. Used by `nil-cli`
 /// (headless); the desktop engine holds the token in-process and calls [`redeem_path`] directly.
-pub async fn redeem_path_from_env(coord_url: &str) -> Result<Vec<NodeEndpoint>> {
+///
+/// `client_pins` is the client-side, Coordinator-INDEPENDENT set of measurements the client will
+/// accept for ANY hop (see [`crate::launch::pinned_measurements_from_env`]). Threaded through so
+/// the cross-check in [`redeem_path`] uses the operator's own pin, not whatever the Coordinator
+/// claims (audit B1, see [`cross_check_pins`]).
+pub async fn redeem_path_from_env(
+    coord_url: &str,
+    client_pins: &[Vec<u8>],
+) -> Result<Vec<NodeEndpoint>> {
     let req = read_token()?;
-    redeem_path(coord_url, &req.msg, &req.token).await
+    redeem_path(coord_url, &req.msg, &req.token, client_pins).await
 }
 
 /// Redeem an explicitly-supplied token (`msg` + `token`, both hex) at the Coordinator (`coord_url`)
 /// and return the attested path. Fails closed if the URL is plaintext-to-non-loopback, the
-/// Coordinator rejects/stalls, or the response is empty/oversized/malformed.
-pub async fn redeem_path(coord_url: &str, msg: &str, token: &str) -> Result<Vec<NodeEndpoint>> {
-    // Footgun guard: a redeemed path pins each hop to the Coordinator's OWN per-hop measurement
-    // (see `hop_to_endpoint`), so a process-wide `NW_EXPECTED_MEASUREMENT` is silently superseded
-    // on the token path. Warn the *fact* (no measurement bytes, no host — PD-2/no-PII) so an
-    // operator doesn't believe the env pin is the gate in force while the per-hop pins are.
-    if std::env::var("NW_EXPECTED_MEASUREMENT").is_ok() {
-        tracing::warn!(
-            "NW_EXPECTED_MEASUREMENT is set but the path is redeemed from the Coordinator — the env \
-             pin is IGNORED; each hop is gated against its own Coordinator-provided measurement"
-        );
-    }
+/// Coordinator rejects/stalls, the response is empty/oversized/malformed, OR a returned hop's
+/// measurement is not in `client_pins` (the substitution cross-check, see [`cross_check_pins`]).
+pub async fn redeem_path(
+    coord_url: &str,
+    msg: &str,
+    token: &str,
+    client_pins: &[Vec<u8>],
+) -> Result<Vec<NodeEndpoint>> {
     // The token is a bearer credential — never POST it in cleartext to a non-loopback host. A
     // plaintext link also lets a MITM rewrite the per-hop measurements. Require TLS unless the
     // host is loopback, or the operator explicitly opted into an insecure control plane (a
@@ -115,12 +119,15 @@ pub async fn redeem_path(coord_url: &str, msg: &str, token: &str) -> Result<Vec<
         }
         body.extend_from_slice(&chunk);
     }
-    path_from_response(&body)
+    path_from_response(&body, client_pins)
 }
 
-/// Pure: parse a `/v1/redeem` [`PathResponse`] body into attested [`NodeEndpoint`]s. Unit-tested
-/// without a network. Fails closed on an empty, single-hop (non-trust-split), or oversized path.
-fn path_from_response(body: &[u8]) -> Result<Vec<NodeEndpoint>> {
+/// Pure: parse a `/v1/redeem` [`PathResponse`] body into attested [`NodeEndpoint`]s, then
+/// cross-check each hop's Coordinator-provided measurement against the client's independent pin
+/// (see [`cross_check_pins`]). Unit-tested without a network. Fails closed on an empty,
+/// single-hop (non-trust-split — warned, still accepted for the alpha), oversized, or
+/// pin-mismatched path.
+fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEndpoint>> {
     let resp: PathResponse = serde_json::from_slice(body).context("parse PathResponse")?;
     if resp.hops.len() < MIN_HOPS {
         anyhow::bail!("coordinator returned an empty path");
@@ -138,11 +145,77 @@ fn path_from_response(body: &[u8]) -> Result<Vec<NodeEndpoint>> {
              (acceptable only for the single-hop alpha; trust-split is the next milestone)"
         );
     }
-    resp.hops
+    let endpoints: Vec<NodeEndpoint> = resp
+        .hops
         .into_iter()
         .enumerate()
         .map(|(i, h)| hop_to_endpoint(i, h))
-        .collect()
+        .collect::<Result<_>>()?;
+    cross_check_pins(&endpoints, client_pins)?;
+    Ok(endpoints)
+}
+
+/// Audit B1 — client-side measurement-transparency cross-check (fail-closed).
+///
+/// The Coordinator hands the client each hop's pinned attestation measurement in the `/v1/redeem`
+/// response, and the MASQUE gate would otherwise attest every hop against *that* value on faith.
+/// A compromised or coerced Coordinator can substitute a measurement to point the client at a
+/// rogue/backdoored node it controls. This cross-check removes that blind trust: if the client
+/// has ANY independent pin configured, every hop's Coordinator-provided measurement MUST be in the
+/// pinned set or the whole path is refused (kill-switch holds, no tunnel).
+///
+/// THREAT MODEL — what this defends against: a Coordinator (compromised, coerced, or a malicious
+/// future operator) swapping in a measurement for a node it controls. With a pin, the substituted
+/// measurement is not in the client's set, so the path is refused before any packet flows.
+///
+/// RESIDUAL TRUST — what this does NOT defend against (do not overclaim):
+///   - The client still trusts the Coordinator to SELECT which nodes / which jurisdiction the path
+///     uses (availability and routing). A pin says "only these measurements are acceptable"; it
+///     does not say "this is the node you should be using."
+///   - The pin is only as good as its INDEPENDENCE. It must come from a genuinely independent
+///     source — out-of-band operator config, the published reproducible-build measurement the user
+///     verified themselves, or (future) an operator-signed measurement registry. If the same
+///     operator who runs the Coordinator also tells the user what to pin, the independence — and so
+///     the value of this check — is weaker.
+///   - A fully independent trust anchor (operator-signed registry entries, or Sigstore/Rekor
+///     verification of the published measurement) is a further step not implemented here.
+///
+/// With NO pin configured the function keeps today's behavior: it logs a clear WARN that the path
+/// is Coordinator-trusted (no independent pin) and accepts it (back-compat). Logs are PII-free:
+/// no measurement bytes and no hop hosts ever reach a log line.
+fn cross_check_pins(endpoints: &[NodeEndpoint], client_pins: &[Vec<u8>]) -> Result<()> {
+    if client_pins.is_empty() {
+        // No independent anchor — fall back to trusting the Coordinator's per-hop pins, but say so
+        // loudly so an operator never believes an independent cross-check is in force when it isn't.
+        tracing::warn!(
+            "no client-side measurement pin (NW_EXPECTED_MEASUREMENT / NW_PINNED_MEASUREMENTS unset): \
+             the redeemed path is COORDINATOR-TRUSTED — a compromised Coordinator could substitute a \
+             hop measurement and it would be accepted. Pin from an independent source to cross-check"
+        );
+        return Ok(());
+    }
+    for (idx, ep) in endpoints.iter().enumerate() {
+        // Every redeemed hop carries a measurement (`hop_to_endpoint` always sets `expected`).
+        let measurement = ep
+            .expected
+            .as_ref()
+            .map(|e| &e.measurement.0)
+            .ok_or_else(|| anyhow::anyhow!("redeemed path hop {idx}: missing measurement to pin against"))?;
+        if !client_pins.iter().any(|pin| pin == measurement) {
+            // Substitution detected (or simply an unpinned node) — refuse the WHOLE path, fail
+            // closed. No measurement bytes, no host in the log (PD-2 / no-PII): only the hop index.
+            anyhow::bail!(
+                "redeemed path hop {idx}: Coordinator-provided measurement is not in the \
+                 client's pinned set (NW_EXPECTED_MEASUREMENT / NW_PINNED_MEASUREMENTS) — \
+                 refusing the path (possible measurement substitution by the Coordinator)"
+            );
+        }
+    }
+    tracing::info!(
+        hops = endpoints.len(),
+        "redeemed path cross-checked against the client's independent measurement pin"
+    );
+    Ok(())
 }
 
 /// Convert a wire [`Hop`] into a [`NodeEndpoint`] with its per-hop pinned attestation expectation.
@@ -205,6 +278,14 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
 mod tests {
     use super::*;
 
+    /// No client-side pin → keep today's Coordinator-trusted behavior (back-compat path).
+    const NO_PINS: &[Vec<u8>] = &[];
+
+    /// The 48-byte measurement these fixtures use, as raw bytes (matches `"ab".repeat(48)` hex).
+    fn ab_measurement() -> Vec<u8> {
+        vec![0xab; 48]
+    }
+
     #[test]
     fn parses_a_three_hop_attested_path() {
         let m = "ab".repeat(48); // 48-byte SEV-SNP-ish measurement, hex
@@ -215,7 +296,7 @@ mod tests {
                 {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}"}}
             ]}}"#
         );
-        let hops = path_from_response(body.as_bytes()).expect("parse");
+        let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
         assert_eq!(hops.len(), 3);
         assert_eq!(hops[0].host, "entry.example");
         // Every hop pins its own measurement — never unattested.
@@ -234,7 +315,7 @@ mod tests {
         let body = format!(
             r#"{{"hops":[{{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{nonce}"}}]}}"#
         );
-        let hops = path_from_response(body.as_bytes()).expect("parse");
+        let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
         let g = hops[0].grant.as_ref().expect("grant");
         assert_eq!(g.token, vec![0xcd; 90]);
         assert_eq!(g.nonce, [0x11; 32]);
@@ -243,7 +324,7 @@ mod tests {
     #[test]
     fn empty_path_fails_closed() {
         assert!(
-            path_from_response(br#"{"hops":[]}"#).is_err(),
+            path_from_response(br#"{"hops":[]}"#, NO_PINS).is_err(),
             "an empty path must be rejected"
         );
     }
@@ -256,7 +337,8 @@ mod tests {
         let body = format!(
             r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
         );
-        let hops = path_from_response(body.as_bytes()).expect("single-hop accepted for the alpha");
+        let hops =
+            path_from_response(body.as_bytes(), NO_PINS).expect("single-hop accepted for the alpha");
         assert_eq!(hops.len(), 1);
         assert!(
             hops[0].expected.is_some(),
@@ -270,6 +352,73 @@ mod tests {
             {"host":"a","port":443,"tee":"sev-snp","measurement":"aabb"},
             {"host":"b","port":443,"tee":"sev-snp","measurement":"nothex!!"}
         ]}"#;
-        assert!(path_from_response(body.as_bytes()).is_err());
+        assert!(path_from_response(body.as_bytes(), NO_PINS).is_err());
+    }
+
+    // ---- Audit B1: client-side measurement-transparency cross-check ----
+
+    #[test]
+    fn matching_pin_is_accepted() {
+        // (a) A redeemed path whose hop measurement matches the client's independent pin is accepted.
+        let m = "ab".repeat(48);
+        let body = format!(
+            r#"{{"hops":[
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}"}}
+            ]}}"#
+        );
+        let pins = vec![ab_measurement()];
+        let hops = path_from_response(body.as_bytes(), &pins).expect("matching pin accepted");
+        assert_eq!(hops.len(), 2);
+    }
+
+    #[test]
+    fn substituted_measurement_is_refused() {
+        // (b) The substitution attack: the Coordinator returns a hop whose measurement is NOT in
+        // the client's pinned set → the WHOLE path is refused (fail closed, kill-switch holds).
+        let pinned = "ab".repeat(48);
+        let rogue = "cd".repeat(48); // a measurement the operator never pinned (rogue node)
+        let body = format!(
+            r#"{{"hops":[
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{pinned}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{rogue}"}}
+            ]}}"#
+        );
+        let pins = vec![ab_measurement()]; // only the genuine measurement is pinned
+        assert!(
+            path_from_response(body.as_bytes(), &pins).is_err(),
+            "a substituted (unpinned) hop measurement must be refused"
+        );
+    }
+
+    #[test]
+    fn no_pin_path_is_accepted_for_back_compat() {
+        // (c) With no client pin configured, the path stays Coordinator-trusted (a WARN is logged
+        // by `cross_check_pins`) and is accepted — preserving today's behavior.
+        let m = "ef".repeat(48);
+        let body = format!(
+            r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+        );
+        let hops =
+            path_from_response(body.as_bytes(), NO_PINS).expect("no-pin path accepted (back-compat)");
+        assert_eq!(hops.len(), 1);
+    }
+
+    #[test]
+    fn multi_value_pin_accepts_any_listed_measurement() {
+        // A multi-hop path where each hop matches a DIFFERENT entry in the pinned set (the
+        // per-operator / per-jurisdiction case): all hops are accepted because every measurement
+        // is somewhere in the set.
+        let entry_m = "ab".repeat(48);
+        let exit_m = "cd".repeat(48);
+        let body = format!(
+            r#"{{"hops":[
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{entry_m}"}},
+                {{"host":"exit.example","port":443,"tee":"tdx","measurement":"{exit_m}"}}
+            ]}}"#
+        );
+        let pins = vec![vec![0xab; 48], vec![0xcd; 48]];
+        let hops = path_from_response(body.as_bytes(), &pins).expect("both pinned → accepted");
+        assert_eq!(hops.len(), 2);
     }
 }
