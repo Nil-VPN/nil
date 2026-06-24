@@ -5,6 +5,14 @@
 //! Identity-free by construction: the key is the opaque Privacy Pass token *message* — there is
 //! no account, payment, or identity in the set (Pillar 4 / PD-3). It records only "this token was
 //! already redeemed".
+//!
+//! **Unbounded by design (fail-closed).** The set never evicts an entry: a spent token is spent
+//! forever. This is deliberate — Privacy Pass tokens (RFC 9578) carry no expiry, so dropping a
+//! nullifier would re-permit redemption of that exact token (a double-spend). Age-based GC is
+//! therefore unsafe until tokens gain expiry metadata; bounding the set is a *separate, deferred*
+//! change that depends on that token-expiry work, not something the eviction-free store may do on
+//! its own. The size-threshold WARN emitted on redemption (see [`should_warn`]) is **operational
+//! alerting only** — it never trims the set; it just tells an operator the set is large.
 
 use std::io;
 
@@ -12,12 +20,24 @@ use async_trait::async_trait;
 use nil_core::durable::DurableSet;
 
 /// Atomic single-use check-and-record for spent token messages.
+///
+/// The set is **unbounded by design**: implementations MUST NOT evict. See the module docs — a
+/// spent token must stay spent forever (no token expiry exists yet), so dropping an entry would
+/// reopen a double-spend. [`approx_len`](NullifierStore::approx_len) exists for operational
+/// visibility, not to drive eviction.
 #[async_trait]
 pub trait NullifierStore: Send + Sync {
     /// Record `key` as spent. `Ok(true)` ⇒ newly recorded (first redemption); `Ok(false)` ⇒
     /// already present (double-spend); `Err` ⇒ could not be durably recorded — callers fail
     /// closed (grant nothing) rather than risk a double-spend.
     async fn insert_once(&self, key: &str) -> io::Result<bool>;
+
+    /// Approximate number of recorded (spent) entries, for operational visibility only — never to
+    /// drive eviction. `None` (the default) means the backend does not cheaply expose a size; a
+    /// backend MUST NOT run an expensive count on the hot redeem path just to answer this.
+    async fn approx_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 #[async_trait]
@@ -28,6 +48,18 @@ impl NullifierStore for DurableSet {
         // blocking syscall on the redeem path.
         self.insert(key)
     }
+
+    async fn approx_len(&self) -> Option<usize> {
+        // The in-memory index size is O(1) to read — cheap enough for the redeem path.
+        Some(self.len())
+    }
+}
+
+/// Whether crossing `n` recorded entries should fire the soft size WARN. True only on the exact
+/// crossing (`n == threshold`) so the alert fires **once**, not on every subsequent redeem; a
+/// zero threshold disables it. Pure decision split out so it is unit-tested without I/O.
+pub fn should_warn(n: usize, threshold: usize) -> bool {
+    threshold != 0 && n == threshold
 }
 
 #[cfg(feature = "postgres")]
@@ -138,6 +170,43 @@ mod tests {
         assert!(s.insert_once("tok-a").await.unwrap(), "first insert newly records");
         assert!(!s.insert_once("tok-a").await.unwrap(), "replay is rejected");
         assert!(s.insert_once("tok-b").await.unwrap(), "a distinct token records independently");
+    }
+
+    #[test]
+    fn should_warn_fires_once_on_the_crossing() {
+        let threshold = 1_000_000;
+        assert!(!should_warn(threshold - 1, threshold), "below threshold: silent");
+        assert!(should_warn(threshold, threshold), "exactly at threshold: fire once");
+        assert!(
+            !should_warn(threshold + 1, threshold),
+            "past threshold: do not re-fire (it fires only on the exact crossing)"
+        );
+        assert!(!should_warn(0, threshold), "empty set: silent");
+        assert!(!should_warn(0, 0), "zero threshold disables the alert");
+    }
+
+    /// A mock store that records nothing and inherits every default — used to confirm the
+    /// `approx_len` default is `None` (a backend with no cheap size opts out, not in).
+    struct OpaqueStore;
+
+    #[async_trait]
+    impl NullifierStore for OpaqueStore {
+        async fn insert_once(&self, _key: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn approx_len_defaults_to_none() {
+        assert_eq!(OpaqueStore.approx_len().await, None, "the trait default is None");
+    }
+
+    #[tokio::test]
+    async fn durable_set_reports_its_size() {
+        let s = DurableSet::in_memory();
+        assert_eq!(s.approx_len().await, Some(0));
+        let _ = s.insert_once("tok-a").await.unwrap();
+        assert_eq!(s.approx_len().await, Some(1), "DurableSet exposes a cheap size");
     }
 
     #[cfg(feature = "postgres")]

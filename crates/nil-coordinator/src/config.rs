@@ -25,7 +25,15 @@ pub struct CoordConfig {
     pub grant_key: Option<Vec<u8>>,
     /// Lifetime of node grants minted after token redemption.
     pub grant_ttl: Duration,
+    /// Soft alerting threshold for the spent-token nullifier set's size (`NW_NULLIFIER_WARN_AT`,
+    /// default 1_000_000). The set is unbounded BY DESIGN (it never evicts — a spent token is
+    /// spent forever); crossing this size logs a single PII-free WARN for operational visibility.
+    /// It is not a cap and never drops an entry. See [`crate::nullifier`].
+    pub nullifier_warn_at: usize,
 }
+
+/// Default soft alerting threshold for the nullifier set size when `NW_NULLIFIER_WARN_AT` is unset.
+pub const DEFAULT_NULLIFIER_WARN_AT: usize = 1_000_000;
 
 impl CoordConfig {
     pub fn from_env() -> anyhow::Result<Self> {
@@ -71,6 +79,10 @@ impl CoordConfig {
             .and_then(|s| s.parse::<u64>().ok())
             .map(Duration::from_secs)
             .unwrap_or_else(|| Duration::from_secs(300));
+        let nullifier_warn_at = std::env::var("NW_NULLIFIER_WARN_AT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_NULLIFIER_WARN_AT);
         let registry = NodeRegistry::from_env()?;
         Ok(Self {
             addr,
@@ -80,6 +92,7 @@ impl CoordConfig {
             nullifier_path,
             grant_key,
             grant_ttl,
+            nullifier_warn_at,
         })
     }
 }
