@@ -15,6 +15,8 @@ use std::time::Duration;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
 use nil_core::{Grant, IpPacket, NodeEndpoint, TransportKind};
+use nil_crypto::psk::{responder_encapsulate, PqOffer};
+use nil_transport::pqwg::{decode_parts, encode_parts};
 use nil_transport::{
     derive_request_path, PqWgCore, Transport, WgKeypair, WgStep, WstunnelTransport,
 };
@@ -55,7 +57,28 @@ where
     };
     let mut client_pub = [0u8; 32];
     client_pub.copy_from_slice(&preface);
-    let mut core = PqWgCore::without_psk(node_secret, PublicKey::from(client_pub), 2);
+
+    // Frame 2: the client's PQ hybrid-PSK offer; encapsulate against it, reply with ciphertexts,
+    // and key the WireGuard responder with the derived PSK (the rung is PQ-by-default now).
+    let offer_bytes = loop {
+        match ws.next().await {
+            Some(Ok(Message::Binary(b))) => break b,
+            Some(Ok(_)) => continue,
+            _ => return,
+        }
+    };
+    let parts = decode_parts(&offer_bytes).expect("PQ offer parts");
+    assert_eq!(parts.len(), 2, "PQ offer = [ml-kem ek, mceliece pk]");
+    let offer = PqOffer {
+        mlkem_ek: parts[0].clone(),
+        mceliece_pk: parts[1].clone(),
+    };
+    let (cts, psk) = responder_encapsulate(&offer).expect("node encapsulates");
+    ws.send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
+        .await
+        .expect("send PQ ciphertexts");
+
+    let mut core = PqWgCore::new(node_secret, PublicKey::from(client_pub), &psk, 2);
     let (mut sink, mut stream) = ws.split();
 
     while let Some(Ok(msg)) = stream.next().await {
@@ -122,8 +145,10 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
         expected: None,
         grant: None,
     };
+    // Generous: the node's Classic McEliece responder_encapsulate is CPU-heavy (tens of seconds in
+    // a debug build) — the PQ exchange now runs inline before the WG handshake.
     let session = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(120),
         transport.connect(target, Grant::mock()),
     )
     .await
@@ -238,5 +263,109 @@ async fn wrong_path_is_refused() {
     assert!(
         result.is_err(),
         "connect on the wrong path must be refused (404), not establish a tunnel"
+    );
+}
+
+/// PQ-by-default proof: a node that keys WireGuard with a DIFFERENT (independently-derived) PSK
+/// than the one it handed the client must fail the IKpsk2 handshake — so the PQ PSK really is
+/// mixed into the WireGuard handshake, not merely exchanged and discarded. The node here runs a
+/// correct PQ exchange (so the client derives PSK_A) but then keys its responder `Tunn` with a
+/// fresh, unrelated PSK_B; `connect` must error rather than establish a tunnel.
+#[tokio::test]
+async fn mismatched_pq_psk_fails_the_wstunnel_handshake() {
+    let node_kp = WgKeypair::generate().unwrap();
+    let node_pub = *node_kp.public.as_bytes();
+    let node_secret = node_kp.secret;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let acceptor = tls_acceptor();
+    let expected_path = derive_request_path(&node_pub);
+
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        #[allow(clippy::result_large_err)]
+        let gate = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            if req.uri().path() == expected_path {
+                Ok(resp)
+            } else {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(None)
+                    .unwrap())
+            }
+        };
+        let mut ws = tokio_tungstenite::accept_hdr_async(tls, gate).await.unwrap();
+
+        // Frame 1: client WG pubkey.
+        let preface = loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(b))) => break b,
+                Some(Ok(_)) => continue,
+                _ => return,
+            }
+        };
+        let mut client_pub = [0u8; 32];
+        client_pub.copy_from_slice(&preface);
+
+        // Frame 2: the client's offer — reply with VALID ciphertexts (so the client finishes the
+        // PQ exchange and derives PSK_A) ...
+        let offer_bytes = loop {
+            match ws.next().await {
+                Some(Ok(Message::Binary(b))) => break b,
+                Some(Ok(_)) => continue,
+                _ => return,
+            }
+        };
+        let parts = decode_parts(&offer_bytes).unwrap();
+        let offer = PqOffer {
+            mlkem_ek: parts[0].clone(),
+            mceliece_pk: parts[1].clone(),
+        };
+        let (cts, _psk_a) = responder_encapsulate(&offer).unwrap();
+        ws.send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
+            .await
+            .unwrap();
+
+        // ... but key the responder Tunn with a FRESH, unrelated PSK_B. The IKpsk2 handshake must
+        // fail because the preshared keys differ.
+        let (other_init, other_offer) = nil_crypto::psk::PqInitiator::generate();
+        let (other_cts, _) = responder_encapsulate(&other_offer).unwrap();
+        let psk_b = other_init.finish(&other_cts).unwrap();
+        let mut core = PqWgCore::new(node_secret, PublicKey::from(client_pub), &psk_b, 2);
+        let (mut sink, mut stream) = ws.split();
+        // Best-effort: process the client's handshake init; the response will carry the wrong PSK,
+        // so the client rejects it and `connect` fails.
+        while let Some(Ok(Message::Binary(b))) = stream.next().await {
+            match core.decapsulate(&b) {
+                WgStep::Network(out) => {
+                    let _ = sink.send(Message::Binary(out)).await;
+                }
+                _ => break,
+            }
+        }
+    });
+
+    let transport = WstunnelTransport::new(node_pub, Some("127.0.0.1".to_string()), Some(port));
+    let target = NodeEndpoint {
+        host: "127.0.0.1".to_string(),
+        port,
+        kind: TransportKind::Wstunnel,
+        wg_pub: Some(node_pub),
+        expected: None,
+        grant: None,
+    };
+    // Generous bound: two McEliece encapsulations happen here (the valid reply + the fresh PSK_B
+    // exchange) before the WG handshake fails. Debug-build McEliece is slow.
+    let result = tokio::time::timeout(
+        Duration::from_secs(180),
+        transport.connect(target, Grant::mock()),
+    )
+    .await
+    .expect("connect attempt should not hang");
+    assert!(
+        result.is_err(),
+        "a mismatched PQ PSK must make the WireGuard handshake (and thus connect) fail"
     );
 }

@@ -6,17 +6,18 @@
 //! it — confidentiality/authentication are the inner WireGuard's).
 //!
 //! Framing: the first WebSocket binary frame is the client's 32-byte WG static pubkey (the
-//! responder needs the initiator's static key up front); every subsequent binary frame is one
+//! responder needs the initiator's static key up front); the second binary frame is the client's
+//! PQ hybrid-PSK offer (`encode_parts([ml-kem ek, mceliece pk])`); the node replies with one frame
+//! of ciphertexts (`encode_parts([ml-kem ct, mceliece ct])`). Every subsequent binary frame is one
 //! WireGuard datagram. WS-over-TLS is reliable + ordered, so no junk/obfuscation codec is needed.
 //!
-//! **PQ status (honest limitation):** this rung currently runs *classical* WireGuard
-//! (`PqWgCore::without_psk`, X25519 only) — it does NOT carry the post-quantum hybrid PSK that the
-//! default MASQUE transport (`PqWgTransport`) does. Unlike the AmneziaWG rung (whose raw-UDP
-//! channel genuinely cannot ship the ~512 KiB McEliece offer), this rung's reliable WS channel
-//! *could* carry the PQ exchange (exactly as `PqWgTransport` does over MASQUE), so the downgrade
-//! here is incidental, not fundamental. TODO: run the PQ hybrid PSK exchange over the WS control
-//! frames before the WG handshake to make wstunnel PQ-by-default like the primary transport. Until
-//! then, treat this last-resort rung as classical-crypto only.
+//! **PQ status:** this rung is now **PQ-by-default** like the primary MASQUE transport. Before the
+//! WireGuard Noise handshake, the client and node run the same ML-KEM-1024 + Classic McEliece
+//! hybrid PSK exchange ([`nil_crypto::psk`]) that `PqWgTransport` runs over MASQUE — carried over
+//! the reliable WS control frames (which, unlike the AmneziaWG rung's raw-UDP channel, can ship the
+//! ~512 KiB McEliece offer). The derived PSK is mixed into the WireGuard IKpsk2 handshake, so the
+//! tunnel is safe if *either* the classical X25519 Noise handshake or the PQ PSK holds. The TLS
+//! envelope is still NOT a trust boundary (no server-cert verification); the inner PQ-WireGuard is.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,10 +33,16 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 use tokio_util::sync::CancellationToken;
 
-use crate::pqwg::{PqWgCore, WgKeypair, WgStep};
+use crate::pqwg::{decode_parts, encode_parts, PqWgCore, WgKeypair, WgStep};
 use crate::Transport;
+use nil_crypto::psk::{PqCiphertexts, PqInitiator};
 
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Separate, more generous bound for the PQ hybrid-PSK exchange: the node's Classic McEliece
+/// `responder_encapsulate` is CPU-heavy (seconds, especially in debug builds), so the WG-handshake
+/// slowloris bound (`WS_HANDSHAKE_TIMEOUT`) is too tight for the ciphertexts round-trip. Mirrors
+/// `pqwg::PQWG_HANDSHAKE_TIMEOUT`.
+const WS_PQ_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const WS_QUEUE: usize = 1024;
 const WS_TICK: Duration = Duration::from_millis(250);
 
@@ -180,10 +187,40 @@ impl Transport for WstunnelTransport {
                 // string at WARN on step-down, and node IPs must never reach a log line.
                 .map_err(|e| Error::Transport(format!("wstunnel connect failed: {e}")))?;
 
-        // Frame 1: our WG static pubkey. Then the WireGuard handshake as binary frames.
+        // Frame 1: our WG static pubkey.
         let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
-        let mut core = PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
         ws_send(&mut ws, client_kp.public.as_bytes().to_vec()).await?;
+
+        // Frame 2: the PQ hybrid-PSK offer (ML-KEM-1024 ek + Classic McEliece pk, ~512 KiB). The
+        // reliable WS channel carries it (unlike the raw-UDP AmneziaWG rung). The node replies with
+        // the two KEM ciphertexts; both sides derive the same PSK, which never crosses the wire.
+        let (initiator, offer) = PqInitiator::generate();
+        ws_send(&mut ws, encode_parts(&[&offer.mlkem_ek, &offer.mceliece_pk])).await?;
+        let cts_msg = tokio::time::timeout(WS_PQ_HANDSHAKE_TIMEOUT, ws_recv_binary(&mut ws))
+            .await
+            .map_err(|_| Error::Transport("wstunnel PQ handshake timed out".into()))??;
+        let parts = decode_parts(&cts_msg)
+            .ok_or_else(|| Error::Transport("wstunnel: malformed PQ ciphertexts".into()))?;
+        if parts.len() != 2 {
+            return Err(Error::Transport(
+                "wstunnel PQ ciphertexts: expected 2 parts".into(),
+            ));
+        }
+        let cts = PqCiphertexts {
+            mlkem_ct: parts[0].clone(),
+            mceliece_ct: parts[1].clone(),
+        };
+        let psk = initiator
+            .finish(&cts)
+            .map_err(|e| Error::Transport(format!("wstunnel PQ decapsulate: {e}")))?;
+
+        // The WireGuard IKpsk2 handshake, with the hybrid PSK mixed in (PQ-by-default).
+        let mut core = PqWgCore::new(
+            client_kp.secret,
+            PublicKey::from(self.cfg.node_wg_pub),
+            &psk,
+            1,
+        );
         let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         ws_send(&mut ws, init).await?;
 
@@ -195,7 +232,7 @@ impl Transport for WstunnelTransport {
             WgStep::Network(keepalive) => ws_send(&mut ws, keepalive).await?,
             other => return Err(Error::Transport(format!("wstunnel handshake failed: {other:?}"))),
         }
-        tracing::info!("wstunnel tunnel established (WireGuard over WebSocket-over-TLS)");
+        tracing::info!("wstunnel tunnel established (PQ-WireGuard over WebSocket-over-TLS)");
 
         let (to_tx, to_rx) = mpsc::channel(WS_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(WS_QUEUE);

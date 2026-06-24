@@ -17,7 +17,9 @@ pub mod loopback;
 pub mod udpip;
 #[cfg(feature = "masque")]
 pub mod masque;
-#[cfg(feature = "masque")]
+// The trust-split onion now PQ-keys the exit hop (`PqWgTransport::wrap_session`), so it depends on
+// the pqwg core, not just masque.
+#[cfg(feature = "pqwg")]
 pub mod path;
 #[cfg(feature = "pqwg")]
 pub mod amneziawg;
@@ -29,7 +31,7 @@ pub mod wstunnel;
 pub use transport::Transport;
 #[cfg(feature = "masque")]
 pub use masque::{MasqueConfig, MasqueTransport};
-#[cfg(feature = "masque")]
+#[cfg(feature = "pqwg")]
 pub use path::PathTransport;
 #[cfg(feature = "pqwg")]
 pub use amneziawg::{AmneziaWgConfig, AmneziaWgTransport, ObfsParams};

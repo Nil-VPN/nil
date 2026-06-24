@@ -230,7 +230,11 @@ fn assemble(
     ) = path
     {
         if p.wg_pub.is_some() {
-            tracing::warn!("a path is configured — ignoring NW_NODE_WG_PUB; multi-hop uses plain nested MASQUE");
+            // The single-node NW_NODE_WG_PUB does not apply to a multi-hop path. Per-hop PQ keys
+            // ride on each hop's own `wg_pub` (from the Coordinator-redeemed path); the exit hop's
+            // is PQ-wrapped by PathTransport. The static NW_PATH dev shim carries no per-hop keys,
+            // so it stays plain nested MASQUE.
+            tracing::warn!("a path is configured — ignoring single-node NW_NODE_WG_PUB; per-hop PQ uses each hop's own key");
         }
         let entry = hops[0].clone();
         tracing::info!(hops = hops.len(), "trust-split path");
