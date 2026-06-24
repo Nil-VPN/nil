@@ -18,10 +18,19 @@
 //!
 //! **Per-hop PQ-WireGuard (spec §4.2 over §6):** when a hop carries a `wg_pub`, that hop runs the
 //! ML-KEM-1024 + Classic McEliece hybrid-PSK WireGuard handshake *inside* its MASQUE tunnel
-//! (`PqWgTransport::wrap_session`), exactly like the single-hop primary transport. The **exit**
-//! hop is wired today (it carries the user's real IP packets, so PQ-protecting it is the
-//! highest-value rung); intermediate hops with a `wg_pub` are NOT yet PQ-wrapped — see the note on
-//! [`PathTransport::connect`]. A hop with no `wg_pub` stays plain nested MASQUE.
+//! (`PqWgTransport::wrap_session`). This is wired for **every** hop, not just the exit: dialing and
+//! PQ-wrapping are interleaved (dial hop N → PQ-wrap it → dial hop N+1 *through that PQ-WG tunnel*),
+//! so the carrier for the next hop is hop N's PQ-WG session, and every leg's payload rides a hybrid
+//! PSK — not just the exit's. `connect_nested` is already carrier-generic (it only calls
+//! `send`/`recv`/`tunnel_mtu` on the outer transport, which `PqWgTransport` implements), so a PQ-WG
+//! session is a valid nesting carrier with no change to the nesting code. A hop with no `wg_pub`
+//! stays plain nested MASQUE and forwards the next hop over its MASQUE session.
+//!
+//! **Live status (honest):** this is the CLIENT-side assembly. A *live* all-PQ onion also needs each
+//! intermediate node to terminate its PQ-WireGuard responder and forward the decapsulated inner QUIC
+//! to the next hop; that node-side forwarding is not built yet (see `nil-node` config), so an all-PQ
+//! path is in-process-proven here but not yet live-testable past the exit. A 3-hop all-PQ path is
+//! also MTU-tight — `connect_nested` fails closed below the QUIC floor rather than corrupt.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -33,6 +42,29 @@ use nil_core::{
 
 use crate::{MasqueTransport, PqWgTransport, Transport};
 
+/// One established hop of the onion, tagged by how its data plane is carried — so teardown closes
+/// each hop through the right transport (innermost first). `Pq` hops are closed via `pqwg` (which
+/// also closes the underlying MASQUE session); `Plain` hops via the inner MASQUE transport.
+#[derive(Clone, Copy)]
+enum HopHandle {
+    /// A PQ-WireGuard-wrapped hop; the `Session` is the PQ session (its inner MASQUE session is
+    /// owned by `pqwg` and torn down with it).
+    Pq(Session),
+    /// A plain nested-MASQUE hop (no `wg_pub`).
+    Plain(Session),
+}
+
+impl HopHandle {
+    fn session(&self) -> Session {
+        match self {
+            HopHandle::Pq(s) | HopHandle::Plain(s) => *s,
+        }
+    }
+    fn is_pq(&self) -> bool {
+        matches!(self, HopHandle::Pq(_))
+    }
+}
+
 /// A multi-hop MASQUE path: entry → … → exit, nested as a CONNECT-IP onion.
 pub struct PathTransport {
     inner: Arc<MasqueTransport>,
@@ -42,12 +74,14 @@ pub struct PathTransport {
     pqwg: Arc<PqWgTransport>,
     /// Ordered hops, outermost (entry) first, innermost (exit) last. Non-empty.
     hops: Vec<NodeEndpoint>,
-    /// Map an active exit session id → the intermediate sessions (entry…second-to-last) kept
-    /// alive behind it, so `close` can tear the whole onion down.
-    intermediates: Mutex<HashMap<SessionId, Vec<Session>>>,
-    /// Exit session ids whose data plane is PQ-WireGuard-wrapped: `send`/`recv`/`close` for these
-    /// route through `pqwg` (the PQ pump), not the raw MASQUE session. A plain (no-`wg_pub`) exit
-    /// is absent here and uses `inner` directly.
+    /// Map an active exit session id → the FULL ordered list of established hop handles (entry…exit,
+    /// dial order), each tagged PQ/plain, so `close` tears the whole onion down innermost-first
+    /// through the correct transport for each hop.
+    onion: Mutex<HashMap<SessionId, Vec<HopHandle>>>,
+    /// Exit session ids whose data plane is PQ-WireGuard-wrapped: the datapath only ever drives the
+    /// EXIT session, so `send`/`recv`/`tunnel_mtu` dispatch on this set. (Intermediate PQ sessions
+    /// are driven as nesting carriers by `connect_nested`, never through this dispatch.) A plain
+    /// (no-`wg_pub`) exit is absent here and uses `inner` directly.
     pq_exits: Mutex<HashSet<SessionId>>,
     /// Guards the connect→register critical section so concurrent `connect`s don't interleave
     /// hops on the shared inner transport in a way that confuses teardown bookkeeping.
@@ -64,7 +98,7 @@ impl PathTransport {
             inner,
             pqwg,
             hops,
-            intermediates: Mutex::new(HashMap::new()),
+            onion: Mutex::new(HashMap::new()),
             pq_exits: Mutex::new(HashSet::new()),
             connect_lock: tokio::sync::Mutex::new(()),
         }
@@ -108,6 +142,23 @@ impl PathTransport {
             .map_err(|_| Error::Transport("path pq set poisoned".into()))?
             .contains(&id))
     }
+
+    /// Close a list of established hops innermost-first (reverse of dial order) through the correct
+    /// transport for each. Best-effort — used both for mid-connect unwinding (no partial onion may
+    /// linger) and as the body of `close`. Returns the first error encountered, if any.
+    async fn teardown(&self, hops: Vec<HopHandle>) -> Result<()> {
+        let mut first_err = Ok(());
+        for h in hops.into_iter().rev() {
+            let r = match h {
+                HopHandle::Pq(s) => self.pqwg.close(s).await,
+                HopHandle::Plain(s) => self.inner.close(s).await,
+            };
+            if first_err.is_ok() {
+                first_err = r;
+            }
+        }
+        first_err
+    }
 }
 
 #[async_trait]
@@ -116,100 +167,83 @@ impl Transport for PathTransport {
     /// the hops are fixed at construction (the datapath passes the entry endpoint as `target`
     /// for routing symmetry).
     ///
-    /// **Per-hop PQ:** if the **exit** hop carries a `wg_pub`, its nested MASQUE session is then
-    /// PQ-WireGuard-wrapped (`pqwg.wrap_session`), so the user's IP packets ride the PQ hybrid-PSK
-    /// WireGuard tunnel end-to-end — not just plain nested MASQUE (TLS-1.3 only). PARTIAL (honest):
-    /// only the exit hop is PQ-wrapped here. Intermediate hops that carry a `wg_pub` are NOT yet
-    /// PQ-keyed — doing so requires re-keying each *inner* carrier before dialing the next hop
-    /// through it (the carrier for hop N+1 would become hop N's PQ-WG tunnel, not its MASQUE
-    /// session), a deeper change to the nesting in `connect_nested`. Wrapping the exit is the
-    /// highest-value rung (it carries the real client IP packets); the rest is deferred and
-    /// tracked here rather than silently skipped.
+    /// **Per-hop PQ:** every hop carrying a `wg_pub` is PQ-WireGuard-wrapped, interleaved with the
+    /// dial: dial hop N (over real UDP for entry, else *through the previous hop's carrier*), then if
+    /// it has a `wg_pub` PQ-wrap it, then use that PQ-WG session as the carrier to dial hop N+1. So
+    /// the carrier for hop N+1 is hop N's PQ-WG tunnel (not its MASQUE session), and every leg's
+    /// payload rides a hybrid PSK. Wrapping happens BEFORE the next hop is dialed, so no downstream
+    /// driver is running on a hop's datagram channel during its PQ handshake (no re-keying race). A
+    /// hop with no `wg_pub` forwards the next hop over its plain MASQUE session. Any failure tears
+    /// the whole onion down innermost-first — no partial / unattested-data-plane tunnel may linger.
     async fn connect(&self, _target: NodeEndpoint, creds: Grant) -> Result<Session> {
         if self.hops.is_empty() {
             return Err(Error::Transport("path has no hops".into()));
         }
         let _guard = self.connect_lock.lock().await;
 
-        // Outermost hop: a real QUIC/UDP connection (attestation appraised inside).
-        let entry = self.hops[0].clone();
-        let entry_grant = Self::grant_for(&entry, &creds)?;
-        let mut prev = self
-            .inner
-            .connect(entry, entry_grant)
-            .await
-            .map_err(|e| Error::Transport(format!("path hop 0 (entry): {e}")))?;
+        // Established hops in dial order (entry…exit), for teardown. The carrier for the NEXT nested
+        // dial is the previous hop's (transport, session): a PQ-WG carrier if that hop was wrapped,
+        // else the inner MASQUE transport. `None` for hop 0 (a real QUIC/UDP connection).
+        let mut hops: Vec<HopHandle> = Vec::new();
+        let mut carrier: Option<(Arc<dyn Transport>, Session)> = None;
 
-        // Each subsequent hop rides the previous tunnel.
-        let mut intermediates: Vec<Session> = Vec::new();
-        for (i, hop) in self.hops.iter().enumerate().skip(1) {
-            let nested = self
-                .inner
-                .connect_nested(
-                    hop.clone(),
-                    Self::grant_for(hop, &creds)?,
-                    self.inner.clone(),
-                    prev,
-                )
-                .await;
-            match nested {
-                Ok(next) => {
-                    intermediates.push(prev); // prev is now an intermediate
-                    prev = next;
-                }
+        for (i, hop) in self.hops.iter().enumerate() {
+            let grant = Self::grant_for(hop, &creds)?;
+            // Dial this hop: hop 0 over real UDP; hop i>0 nested through the previous carrier.
+            // (Attestation is appraised inside connect/connect_nested before either returns.)
+            let masque = match &carrier {
+                None => self.inner.connect(hop.clone(), grant).await,
+                Some((ct, cs)) => self.inner.connect_nested(hop.clone(), grant, ct.clone(), *cs).await,
+            };
+            let masque = match masque {
+                Ok(s) => s,
                 Err(e) => {
-                    // Tear down everything dialed so far — no partial onion may linger.
-                    let _ = self.inner.close(prev).await;
-                    for s in intermediates.into_iter().rev() {
-                        let _ = self.inner.close(s).await;
-                    }
+                    let _ = self.teardown(hops).await;
                     return Err(Error::Transport(format!("path hop {i}: {e}")));
                 }
+            };
+            // PQ-wrap this hop if it carries a node WG key; the wrapped session becomes the carrier
+            // for the next hop. `Session` is `Copy`, so on wrap failure we still hold `masque` to
+            // close it (a failed `wrap_session` does not register the inner session in `pqwg`).
+            if let Some(wg_pub) = hop.wg_pub {
+                match self.pqwg.wrap_session(masque, wg_pub).await {
+                    Ok(pq) => {
+                        hops.push(HopHandle::Pq(pq));
+                        carrier = Some((self.pqwg.clone(), pq));
+                    }
+                    Err(e) => {
+                        let _ = self.inner.close(masque).await;
+                        let _ = self.teardown(hops).await;
+                        return Err(Error::Transport(format!("path hop {i} PQ-WireGuard: {e}")));
+                    }
+                }
+            } else {
+                hops.push(HopHandle::Plain(masque));
+                carrier = Some((self.inner.clone(), masque));
             }
         }
 
-        // `prev` is the exit hop's MASQUE session. If the exit hop carries a node WG key, PQ-key
-        // its data plane (hybrid-PSK WireGuard inside the nested MASQUE tunnel). On any failure,
-        // tear the whole onion down — no partial / unattested-data-plane tunnel may linger.
-        let exit_hop = &self.hops[self.hops.len() - 1];
-        let exit = if let Some(wg_pub) = exit_hop.wg_pub {
-            // `Session` is `Copy`, so keep the MASQUE exit handle to tear down on PQ failure (a
-            // failed `wrap_session` does not register/own the inner session, so its driver would
-            // otherwise leak until the connection idle-times out).
-            let masque_exit = prev;
-            match self.pqwg.wrap_session(prev, wg_pub).await {
-                Ok(pq) => {
-                    self.pq_exits
-                        .lock()
-                        .map_err(|_| Error::Transport("path pq set poisoned".into()))?
-                        .insert(pq.id);
-                    pq
-                }
-                Err(e) => {
-                    // Tear the whole onion down — exit first, then unwind outward. No partial /
-                    // non-PQ-keyed data plane may linger (kill-switch holds).
-                    let _ = self.inner.close(masque_exit).await;
-                    for s in intermediates.into_iter().rev() {
-                        let _ = self.inner.close(s).await;
-                    }
-                    return Err(Error::Transport(format!("path exit hop PQ-WireGuard: {e}")));
-                }
-            }
-        } else {
-            prev
-        };
-
-        // Record the intermediates for teardown, keyed by the (possibly PQ-wrapped) exit id.
-        self.intermediates
+        // The last hop is the exit — the session the datapath drives. (hops is non-empty: the path
+        // has >= 1 hop and every iteration pushes exactly one handle.)
+        let exit = *hops.last().expect("non-empty path established at least one hop");
+        let pq_hops = hops.iter().filter(|h| h.is_pq()).count();
+        if exit.is_pq() {
+            self.pq_exits
+                .lock()
+                .map_err(|_| Error::Transport("path pq set poisoned".into()))?
+                .insert(exit.session().id);
+        }
+        // Record the full ordered hop list for teardown, keyed by the exit session id.
+        self.onion
             .lock()
             .map_err(|_| Error::Transport("path map poisoned".into()))?
-            .insert(exit.id, intermediates);
+            .insert(exit.session().id, hops);
         tracing::info!(
             hops = self.hops.len(),
-            pq_exit = exit_hop.wg_pub.is_some(),
+            pq_hops,
             "trust-split path established (entry→…→exit)"
         );
-        Ok(exit)
+        Ok(exit.session())
     }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
@@ -231,29 +265,20 @@ impl Transport for PathTransport {
     }
 
     async fn close(&self, session: Session) -> Result<()> {
-        let intermediates = self
-            .intermediates
+        let hops = self
+            .onion
             .lock()
             .map_err(|_| Error::Transport("path map poisoned".into()))?
             .remove(&session.id)
             .unwrap_or_default();
-        let was_pq = self
-            .pq_exits
+        self.pq_exits
             .lock()
             .map_err(|_| Error::Transport("path pq set poisoned".into()))?
             .remove(&session.id);
-        // Close innermost (exit) first, then unwind outward — mirror of the build order. A
-        // PQ-wrapped exit is closed via `pqwg` (which also closes its own MASQUE inner session);
-        // a plain exit via `inner`.
-        let res = if was_pq {
-            self.pqwg.close(session).await
-        } else {
-            self.inner.close(session).await
-        };
-        for s in intermediates.into_iter().rev() {
-            let _ = self.inner.close(s).await;
-        }
-        res
+        // Tear the onion down innermost (exit) first, then outward — the mirror of the dial order.
+        // Each hop closes through its own transport (PQ hops via `pqwg`, which also closes their
+        // underlying MASQUE session); a plain hop via `inner`. See `teardown`.
+        self.teardown(hops).await
     }
 
     fn kind(&self) -> TransportKind {
@@ -350,7 +375,7 @@ mod tests {
     }
 
     #[test]
-    fn a_freshly_built_path_registers_no_intermediates() {
+    fn a_freshly_built_path_registers_no_onion_hops() {
         // The teardown bookkeeping starts empty: only a completed `connect` ever inserts an entry,
         // and the connect path tears everything down on any hop failure (no partial onion). The
         // real over-the-wire accept/reject of a hop is covered by tests/masque_attest.rs.
@@ -359,8 +384,8 @@ mod tests {
             vec![ep("entry"), ep("middle"), ep("exit")],
         );
         assert!(
-            t.intermediates.lock().expect("map").is_empty(),
-            "no intermediate sessions exist before a successful connect"
+            t.onion.lock().expect("map").is_empty(),
+            "no onion hops exist before a successful connect"
         );
     }
 
@@ -404,19 +429,32 @@ mod tests {
     }
 
     #[test]
-    fn exit_hop_wg_pub_is_what_selects_per_hop_pq() {
-        // The selection signal for PQ-wrapping is the EXIT hop carrying a wg_pub. A path with a
-        // PQ exit hop exposes it on the last hop; the entry/middle carrying keys does not (today)
-        // make the exit PQ — only the exit hop's own key does (documented partial).
+    fn each_hops_wg_pub_selects_per_hop_pq() {
+        // Every hop carrying a wg_pub is PQ-wrapped (not just the exit): the per-hop key is the
+        // selection signal, applied at each hop as it is dialed. Here entry and exit carry keys
+        // (so both legs they terminate are PQ); the middle has none (plain nested MASQUE).
         let t = PathTransport::new(
             Arc::new(MasqueTransport::new()),
             vec![ep_pq("entry", [1u8; 32]), ep("middle"), ep_pq("exit", [9u8; 32])],
         );
-        let exit_hop = &t.hops[t.hops.len() - 1];
-        assert_eq!(exit_hop.wg_pub, Some([9u8; 32]), "exit hop carries its PQ key");
+        assert_eq!(t.hops[0].wg_pub, Some([1u8; 32]), "entry hop carries its PQ key");
+        assert_eq!(t.hops[1].wg_pub, None, "middle hop is plain nested MASQUE");
+        assert_eq!(t.hops[2].wg_pub, Some([9u8; 32]), "exit hop carries its PQ key");
         // On the wire the onion is still MASQUE/QUIC regardless of the inner PQ-WireGuard layer.
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
+    }
+
+    #[test]
+    fn hop_handle_reports_its_session_and_pq_kind() {
+        // teardown + the exit-dispatch decision both key off these: a Pq hop closes via pqwg (which
+        // also closes its inner MASQUE session) and is the dispatch target only when it is the exit;
+        // a Plain hop closes via inner. Lock the accessor semantics the connect/close paths rely on.
+        let s = Session { id: SessionId(42), kind: TransportKind::Masque };
+        assert_eq!(HopHandle::Pq(s).session().id, SessionId(42));
+        assert_eq!(HopHandle::Plain(s).session().id, SessionId(42));
+        assert!(HopHandle::Pq(s).is_pq(), "a PQ hop reports PQ");
+        assert!(!HopHandle::Plain(s).is_pq(), "a plain hop reports not-PQ");
     }
 
     #[test]
