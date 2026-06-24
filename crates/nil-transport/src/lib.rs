@@ -36,4 +36,4 @@ pub use amneziawg::{AmneziaWgConfig, AmneziaWgTransport, ObfsParams};
 #[cfg(feature = "pqwg")]
 pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};
 #[cfg(feature = "wstunnel")]
-pub use wstunnel::{WstunnelConfig, WstunnelTransport};
+pub use wstunnel::{derive_request_path, WstunnelConfig, WstunnelTransport};

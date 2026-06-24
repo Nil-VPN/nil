@@ -444,6 +444,73 @@ mod tests {
         assert!(cascade.connect(NodeEndpoint::loopback(), Grant::mock()).await.is_err());
     }
 
+    /// An in-process echo transport: `recv` returns whatever was last `send`, tagged with the
+    /// rung's kind in byte 0 so a test can prove which rung actually carried the packet. Used to
+    /// drive the `CascadeTransport` seam end-to-end after a step-down.
+    struct Echo(TransportKind, std::sync::Mutex<Option<Vec<u8>>>);
+    impl Echo {
+        fn new(kind: TransportKind) -> Self {
+            Self(kind, std::sync::Mutex::new(None))
+        }
+    }
+    #[async_trait]
+    impl Transport for Echo {
+        async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
+            Ok(Session { id: SessionId(1), kind: self.0 })
+        }
+        async fn send(&self, _s: &Session, p: IpPacket) -> Result<()> {
+            let mut buf = p.into_bytes();
+            buf.insert(0, self.0 as u8); // tag with the rung that carried it
+            *self.1.lock().expect("echo lock") = Some(buf);
+            Ok(())
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            self.1
+                .lock()
+                .expect("echo lock")
+                .take()
+                .map(IpPacket::new)
+                .ok_or(Error::Closed)
+        }
+        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
+        fn kind(&self) -> TransportKind { self.0 }
+        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+    }
+
+    #[tokio::test]
+    async fn cascade_transport_routes_traffic_through_the_rung_that_won() {
+        // MASQUE is blocked; the cascade steps down to the wstunnel echo rung. Driving the
+        // CascadeTransport seam (connect → send → recv) must route through THAT rung — proving the
+        // adapter binds the session to the winner, not just that connect picked one.
+        let cascade = Cascade::new(vec![
+            Arc::new(Blocked(TransportKind::Masque)),
+            Arc::new(Echo::new(TransportKind::Wstunnel)),
+        ]);
+        let ct = CascadeTransport::new(cascade);
+        let session = ct
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .expect("cascade lands on the working rung");
+        assert_eq!(session.kind, TransportKind::Wstunnel, "session carries the winner's kind");
+
+        ct.send(&session, IpPacket::new(vec![0xAA, 0xBB]))
+            .await
+            .expect("send routes to the winning rung");
+        let got = ct.recv(&session).await.expect("recv routes to the winning rung");
+        assert_eq!(
+            got.as_bytes(),
+            &[TransportKind::Wstunnel as u8, 0xAA, 0xBB],
+            "the wstunnel rung (not the blocked MASQUE rung) carried the packet"
+        );
+
+        // After close, the session is gone and the seam reports SessionNotFound (no dangling rung).
+        ct.close(session).await.expect("close tears down the winner");
+        assert!(matches!(
+            ct.send(&session, IpPacket::new(vec![0])).await,
+            Err(Error::SessionNotFound(_))
+        ));
+    }
+
     #[test]
     fn dns_query_is_well_formed() {
         let q = dns_query("example.com");

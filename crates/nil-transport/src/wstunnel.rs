@@ -39,6 +39,32 @@ const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const WS_QUEUE: usize = 1024;
 const WS_TICK: Duration = Duration::from_millis(250);
 
+/// HKDF `info` label for the secret request path. A fixed, version-tagged domain separator so the
+/// derived path can't collide with any other use of the node's static key.
+const WS_PATH_LABEL: &[u8] = b"nil-vpn/wstunnel/request-path/v1";
+/// Bytes of HKDF output expanded into the path (32 bytes ⇒ a 64-hex-char path component).
+const WS_PATH_LEN: usize = 32;
+
+/// Derive the **secret** WebSocket request path both peers agree on, deterministically from the
+/// node's pinned WireGuard static public key — the shared identity the client already pins and the
+/// node already owns. An active prober that doesn't know the node's key cannot guess the path, so
+/// the node `404`s every other path and the rung is not trivially probeable on `/`.
+///
+/// `HKDF-SHA256(ikm = node_wg_pub, info = WS_PATH_LABEL)` expanded to [`WS_PATH_LEN`] bytes, then
+/// lowercase-hex, prefixed with `/`. Pure + shared by client and node (re-exported as
+/// [`crate::wstunnel::derive_request_path`]) so the contract can never drift.
+pub fn derive_request_path(node_wg_pub: &[u8; 32]) -> String {
+    let hk = hkdf::Hkdf::<sha2::Sha256>::new(None, node_wg_pub);
+    let mut okm = [0u8; WS_PATH_LEN];
+    // `expand` only fails for an absurd output length; WS_PATH_LEN is well within one HKDF block.
+    hk.expand(WS_PATH_LABEL, &mut okm)
+        .expect("WS_PATH_LEN is a valid HKDF output length");
+    let mut path = String::with_capacity(1 + WS_PATH_LEN * 2);
+    path.push('/');
+    path.push_str(&crate::connectip::to_hex(&okm));
+    path
+}
+
 /// Configuration for the wstunnel rung.
 pub struct WstunnelConfig {
     /// The node's WireGuard static public key (the inner crypto's pinned identity).
@@ -141,7 +167,10 @@ impl Transport for WstunnelTransport {
     async fn connect(&self, target: NodeEndpoint, _creds: Grant) -> Result<Session> {
         let host = self.cfg.host.clone().unwrap_or_else(|| target.host.clone());
         let port = self.cfg.port.unwrap_or(target.port);
-        let url = format!("wss://{host}:{port}/");
+        // Request the secret path derived from the node's pinned key, not `/`. The node 404s every
+        // other path, so the rung can't be confirmed by an active prober that lacks the node key.
+        let path = derive_request_path(&self.cfg.node_wg_pub);
+        let url = format!("wss://{host}:{port}{path}");
 
         let connector = tls_connector()?;
         let (mut ws, _resp) =

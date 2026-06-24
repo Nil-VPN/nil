@@ -18,6 +18,8 @@ use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::http;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use tun_rs::AsyncDevice;
@@ -34,6 +36,11 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
         "wstunnel responder listening — pin this as the client's NW_NODE_WSTUNNEL_WG_PUB"
     );
     let node_secret = kp.secret;
+    // The single secret path the node serves: derived from its own pinned WG static key, the same
+    // shared identity the client derives from. Any other path gets a 404 so the rung is not
+    // confirmable by an active prober that doesn't know the node's key. Shared derivation with the
+    // client (`nil_transport::derive_request_path`) so the contract can't drift.
+    let expected_path = nil_transport::derive_request_path(kp.public.as_bytes());
     let acceptor = tls_acceptor()?;
     let mut tun_buf = vec![0u8; 65535];
 
@@ -52,9 +59,28 @@ pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> 
         // Bound the TLS + WS upgrade so a peer that stalls mid-handshake (slowloris) can't wedge
         // the node. TLS/WS accept errors are dropped silently — they are attacker-triggerable
         // (TLS is no-client-auth) and the data plane keeps no connection logs.
-        let upgrade = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
+        //
+        // Path gate: only the secret path derived from this node's key upgrades; every other path
+        // gets a `404` (the WS handshake callback rejects it). An active prober on `/` therefore
+        // can't confirm the rung. The path is not user-linkable (it's a function of the node's
+        // static key, identical for every client), so logging nothing about it keeps PD-3 intact.
+        let expected_path = expected_path.clone();
+        let acceptor = acceptor.clone();
+        let upgrade = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async move {
             let tls = acceptor.accept(tcp).await.ok()?;
-            tokio_tungstenite::accept_async(tls).await.ok()
+            // The `Result<Response, ErrorResponse>` shape is dictated by the tokio-tungstenite
+            // accept-callback API; both variants are owned `http::Response` values we cannot box.
+            #[allow(clippy::result_large_err)]
+            let gate = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+                if req.uri().path() == expected_path {
+                    return Ok(resp);
+                }
+                // Wrong path → 404, exactly like a vanilla web server with nothing at that URL.
+                let mut deny = ErrorResponse::new(None);
+                *deny.status_mut() = http::StatusCode::NOT_FOUND;
+                Err(deny)
+            };
+            tokio_tungstenite::accept_hdr_async(tls, gate).await.ok()
         })
         .await;
         let ws = match upgrade {

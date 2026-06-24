@@ -223,6 +223,45 @@ mod tests {
         assert!(matches!(err, Error::Transport(_)), "got {err:?}");
     }
 
+    #[tokio::test]
+    async fn three_hop_path_exposes_entry_and_holds_per_hop_grant_independence() {
+        // A 3-hop onion: entry→middle→exit. The seam exposes the onion as a single MASQUE tunnel
+        // (kind/profile), routes via the entry hop, and mints an INDEPENDENT fresh nonce per hop
+        // for hops that carry no Coordinator grant (so no cross-hop correlation via a shared nonce).
+        let t = PathTransport::new(
+            Arc::new(MasqueTransport::new()),
+            vec![ep("entry"), ep("middle"), ep("exit")],
+        );
+        assert_eq!(t.hop_count(), 3);
+        assert_eq!(t.entry().expect("entry hop").host, "entry");
+        assert_eq!(t.kind(), TransportKind::Masque, "every hop is MASQUE on the wire");
+
+        let base = Grant { token: vec![9, 9, 9], nonce: [0u8; 32] };
+        // Each hop with no pinned grant gets a fresh per-hop grant; nonces must all differ.
+        let g_entry = PathTransport::grant_for(&t.hops[0], &base).expect("entry grant");
+        let g_middle = PathTransport::grant_for(&t.hops[1], &base).expect("middle grant");
+        let g_exit = PathTransport::grant_for(&t.hops[2], &base).expect("exit grant");
+        assert_ne!(g_entry.nonce, g_middle.nonce, "entry and middle nonces independent");
+        assert_ne!(g_middle.nonce, g_exit.nonce, "middle and exit nonces independent");
+        assert_ne!(g_entry.nonce, g_exit.nonce, "entry and exit nonces independent");
+        assert_eq!(g_entry.token, base.token, "the payment token carries through every hop");
+    }
+
+    #[test]
+    fn a_freshly_built_path_registers_no_intermediates() {
+        // The teardown bookkeeping starts empty: only a completed `connect` ever inserts an entry,
+        // and the connect path tears everything down on any hop failure (no partial onion). The
+        // real over-the-wire accept/reject of a hop is covered by tests/masque_attest.rs.
+        let t = PathTransport::new(
+            Arc::new(MasqueTransport::new()),
+            vec![ep("entry"), ep("middle"), ep("exit")],
+        );
+        assert!(
+            t.intermediates.lock().expect("map").is_empty(),
+            "no intermediate sessions exist before a successful connect"
+        );
+    }
+
     #[test]
     fn fresh_grants_have_independent_nonces() {
         let base = Grant {

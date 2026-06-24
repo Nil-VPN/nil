@@ -15,10 +15,13 @@ use std::time::Duration;
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
 use nil_core::{Grant, IpPacket, NodeEndpoint, TransportKind};
-use nil_transport::{PqWgCore, Transport, WgKeypair, WgStep, WstunnelTransport};
+use nil_transport::{
+    derive_request_path, PqWgCore, Transport, WgKeypair, WgStep, WstunnelTransport,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
+use tokio_tungstenite::tungstenite::{http, Message};
 use tokio_tungstenite::WebSocketStream;
 
 /// A self-signed TLS acceptor (the TLS is an obfuscation envelope, not the trust boundary).
@@ -89,10 +92,24 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
     let port = listener.local_addr().unwrap().port();
     let acceptor = tls_acceptor();
 
+    // The responder serves ONLY the secret path derived from the node's pinned key (mirrors the
+    // `nil-node` gate); any other path gets a 404. This proves the client requests that exact path.
+    let expected_path = derive_request_path(&node_pub);
     tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
         let tls = acceptor.accept(tcp).await.unwrap();
-        let ws = tokio_tungstenite::accept_async(tls).await.unwrap();
+        #[allow(clippy::result_large_err)]
+        let gate = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            if req.uri().path() == expected_path {
+                Ok(resp)
+            } else {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(None)
+                    .unwrap())
+            }
+        };
+        let ws = tokio_tungstenite::accept_hdr_async(tls, gate).await.unwrap();
         serve(ws, node_secret).await;
     });
 
@@ -139,4 +156,87 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
     );
 
     transport.close(session).await.unwrap();
+}
+
+/// The derived path is deterministic and key-bound: same key → same path; different key → different
+/// path; and it is a single hex `/`-prefixed component (64 hex chars = 32 bytes of HKDF output).
+#[test]
+fn request_path_is_deterministic_and_key_bound() {
+    let a = [7u8; 32];
+    let b = [9u8; 32];
+    let pa = derive_request_path(&a);
+    let pb = derive_request_path(&b);
+    assert_eq!(pa, derive_request_path(&a), "same key derives the same path");
+    assert_ne!(pa, pb, "different node keys derive different paths");
+    assert!(pa.starts_with('/'), "path is rooted");
+    assert_eq!(pa.len(), 1 + 64, "/ + 32 bytes of lowercase hex");
+    assert!(
+        pa[1..].bytes().all(|c| c.is_ascii_hexdigit()),
+        "path body is hex"
+    );
+}
+
+/// A client that pins the WRONG node key derives the WRONG path; the responder (which serves only
+/// the path derived from its real key) 404s the upgrade, so `connect` fails. This is the active-
+/// probe defense: without the node's key you cannot reach the WebSocket at all.
+#[tokio::test]
+async fn wrong_path_is_refused() {
+    let node_kp = WgKeypair::generate().unwrap();
+    let node_pub = *node_kp.public.as_bytes();
+    let node_secret = node_kp.secret;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let acceptor = tls_acceptor();
+
+    // Responder gates on the path derived from its REAL key.
+    let expected_path = derive_request_path(&node_pub);
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let Ok(tls) = acceptor.accept(tcp).await else {
+            return;
+        };
+        #[allow(clippy::result_large_err)]
+        let gate = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
+            if req.uri().path() == expected_path {
+                Ok(resp)
+            } else {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .body(None)
+                    .unwrap())
+            }
+        };
+        // The wrong-path upgrade is rejected here; nothing further is served.
+        let _ = tokio_tungstenite::accept_hdr_async(tls, gate).await;
+        let _ = node_secret;
+    });
+
+    // The client pins a DIFFERENT key, so it requests a different (wrong) path.
+    let mut wrong_pub = node_pub;
+    wrong_pub[0] ^= 0xff;
+    assert_ne!(
+        derive_request_path(&wrong_pub),
+        derive_request_path(&node_pub),
+        "the wrong key must derive a different path for this test to be meaningful"
+    );
+    let transport = WstunnelTransport::new(wrong_pub, Some("127.0.0.1".to_string()), Some(port));
+    let target = NodeEndpoint {
+        host: "127.0.0.1".to_string(),
+        port,
+        kind: TransportKind::Wstunnel,
+        wg_pub: Some(wrong_pub),
+        expected: None,
+        grant: None,
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        transport.connect(target, Grant::mock()),
+    )
+    .await
+    .expect("connect attempt should not hang");
+    assert!(
+        result.is_err(),
+        "connect on the wrong path must be refused (404), not establish a tunnel"
+    );
 }
