@@ -48,9 +48,14 @@ if [ "$(id -u)" -ne 0 ]; then
   exit 2
 fi
 
-# Build the harness if the prebuilt release binary is missing (build needs no root).
-if [ ! -x "$BIN" ]; then
-  echo "building nil-client-e2e (release)…"
+# ALWAYS rebuild the harness from the current checkout (build needs no root). cargo is incremental,
+# so this is cheap when nothing changed — but it guarantees a `git pull` is reflected. Building only
+# when the binary was MISSING let a stale binary silently run after a pull: e.g. a pre-#13 binary
+# ignores the client-side measurement cross-check, so a reject test would "connect" against a wrong
+# pin and look like an attestation bypass when it is really just old code. Set NW_E2E_NO_REBUILD=1
+# only to deliberately test an already-built binary.
+if [ "${NW_E2E_NO_REBUILD:-0}" != "1" ] || [ ! -x "$BIN" ]; then
+  echo "building nil-client-e2e (release) from the current checkout…"
   ( cd "$ROOT" && cargo build --release --bin nil-client-e2e ) \
     || { echo "FAIL: cargo build"; exit 1; }
 fi
