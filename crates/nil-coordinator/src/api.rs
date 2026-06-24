@@ -111,30 +111,36 @@ pub async fn redeem_logic(
     let msg = from_hex(&req.msg).ok_or(RedeemError::Malformed)?;
     let token = from_hex(&req.token).ok_or(RedeemError::Malformed)?;
 
-    if !verifier.verify(&token, &msg) {
-        return Err(RedeemError::BadToken);
-    }
-    // Single-use: durably record this token message, rejecting it if already spent. The key is
-    // the token itself — there is no account or identity in the nullifier set. We persist BEFORE
-    // selecting a path, and fail closed if the record can't be made durable (a path granted on
-    // an unpersisted nullifier would be double-spendable after a restart).
+    // Verify AND learn the epoch (issuer key generation) that signed this token. A token whose
+    // epoch key is no longer held returns None → BadToken: this rejection of retired-epoch tokens
+    // is exactly what makes dropping that epoch's nullifier partition safe (a token that can't
+    // verify can never re-enter the set). The epoch is DERIVED here, never sent on the wire — the
+    // RedeemRequest stays {msg, token}, so unlinkability is unchanged (Pillar 4).
+    let epoch = verifier
+        .verify_with_epoch(&token, &msg)
+        .ok_or(RedeemError::BadToken)?;
+    // Single-use: durably record this token message UNDER ITS EPOCH, rejecting it if already spent.
+    // The key is the token itself — there is no account or identity in the nullifier set. We persist
+    // BEFORE selecting a path, and fail closed if the record can't be made durable (a path granted
+    // on an unpersisted nullifier would be double-spendable after a restart).
     //
     // Key on the LOWERCASE HEX OF THE DECODED BYTES, never the raw request string: the same token
     // submitted as "ab.." and "AB.." decodes to identical bytes, so it must hit the same nullifier.
     // Keying on the raw string would let an attacker re-spend one token by flipping hex case.
     let nullifier_key = to_hex(&msg);
-    match state.nullifiers.insert_once(&nullifier_key).await {
+    match state.nullifiers.insert_once_in_epoch(epoch, &nullifier_key).await {
         Ok(true) => {
-            // Operational visibility only: the nullifier set is unbounded BY DESIGN (it never
-            // evicts — a spent token is spent forever), so warn once when its size crosses the
-            // soft threshold. PII-free: only the set size is logged — never the token bytes, the
-            // key, or any user/account count. This is alerting, not a cap; nothing is dropped.
+            // Operational visibility only: warn once when the set crosses the soft size threshold.
+            // The set is now bounded BY EPOCH (a retired epoch's partition is dropped wholesale),
+            // not unbounded — but a single never-rotated deployment still grows, so the alert
+            // stays. PII-free: only the set size is logged — never the token bytes, key, epoch, or
+            // any user/account count. This is alerting, not a cap; nothing is dropped here.
             if let Some(n) = state.nullifiers.approx_len().await {
                 if crate::nullifier::should_warn(n, state.cfg.nullifier_warn_at) {
                     tracing::warn!(
                         nullifier_set_size = n,
-                        "spent-token nullifier set crossed its soft size threshold; it is \
-                         unbounded by design (never evicts) — bounded GC awaits token expiry"
+                        "spent-token nullifier set crossed its soft size threshold; it is bounded \
+                         by epoch (retired epochs are GC'd) — rotate issuer keys to keep it flat"
                     );
                 }
             }
@@ -249,6 +255,7 @@ mod tests {
             path_hops: 3,
             verifier: Some(verifier),
             nullifier_path: None,
+            nullifier_dir: None,
             grant_key: None,
             grant_ttl: std::time::Duration::from_secs(300),
             nullifier_warn_at: crate::config::DEFAULT_NULLIFIER_WARN_AT,
@@ -262,6 +269,21 @@ mod tests {
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// A CoordConfig with a given (epoch-tagged) verifier and no persistence — for epoch/GC tests.
+    fn cfg_with_verifier(verifier: Verifier) -> CoordConfig {
+        CoordConfig {
+            addr: "127.0.0.1:9090".parse().unwrap(),
+            registry: NodeRegistry::dev_default(),
+            path_hops: 3,
+            verifier: Some(verifier),
+            nullifier_path: None,
+            nullifier_dir: None,
+            grant_key: None,
+            grant_ttl: std::time::Duration::from_secs(300),
+            nullifier_warn_at: crate::config::DEFAULT_NULLIFIER_WARN_AT,
+        }
     }
 
     #[tokio::test]
@@ -342,6 +364,62 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The GC-safety property, end to end: dropping a RETIRED key's nullifier partition can never
+    /// reintroduce a double-spend, because a token signed by a retired key no longer verifies — it
+    /// is rejected at `verify_with_epoch` BEFORE the nullifier check, so it can never re-enter the
+    /// set. The epoch is KEY-DERIVED, so a still-held key cannot be renumbered out from under its
+    /// live nullifiers. (This is the proof in nil-coordinator::nullifier, demonstrated.)
+    #[tokio::test]
+    async fn gc_dropping_a_retired_key_partition_cannot_re_spend_its_token() {
+        use nil_core::durable::EpochDurableSet;
+        use std::collections::BTreeSet;
+
+        // A token minted under issuer key A.
+        let issuer_a = Issuer::generate().unwrap();
+        let pk_a = issuer_a.public_der().unwrap();
+        let ea = nil_crypto::key_epoch(&pk_a);
+        let msg = b"gc-safety-token-nonce-0123456789".to_vec();
+        let req = token::blind(&pk_a, &msg).unwrap();
+        let tok = token::finalize(&pk_a, &req, &issuer_a.blind_sign(&req.blind_msg).unwrap()).unwrap();
+        let redeem = RedeemRequest { msg: hex(&msg), token: hex(&tok) };
+
+        // One epoch-partitioned nullifier store shared across the rotation.
+        let nullifiers: Arc<dyn NullifierStore> = Arc::new(EpochDurableSet::in_memory());
+
+        // Boot 1: verifier holds key A. Redeem → recorded under key A's derived epoch; a replay is
+        // rejected as a double-spend while key A is still held (the nullifier is present).
+        let boot1 = CoordState::with_nullifiers(
+            Arc::new(cfg_with_verifier(Verifier::from_public_ders(std::slice::from_ref(&pk_a)).unwrap())),
+            nullifiers.clone(),
+        );
+        assert!(redeem_logic(&boot1, &redeem).await.is_ok(), "first redemption succeeds under key A");
+        assert_eq!(nullifiers.approx_len().await, Some(1), "nullifier recorded in key A's partition");
+        assert!(matches!(redeem_logic(&boot1, &redeem).await, Err(RedeemError::AlreadyRedeemed)));
+
+        // Retire key A: a NEW verifier holds only key B. GC retains key B's derived epoch + the
+        // reserved LEGACY_EPOCH, dropping key A's partition.
+        let issuer_b = Issuer::generate().unwrap();
+        let pk_b = issuer_b.public_der().unwrap();
+        let retained = BTreeSet::from([nil_crypto::key_epoch(&pk_b), nil_crypto::LEGACY_EPOCH]);
+        assert!(!retained.contains(&ea), "key A's derived epoch is no longer retained");
+        let dropped = nullifiers.drop_epochs(&retained).await.unwrap();
+        assert_eq!(dropped, 1, "key A's partition is dropped wholesale");
+        assert_eq!(nullifiers.approx_len().await, Some(0), "its nullifier is gone");
+
+        // Boot 2: verifier holds only key B (key A is retired). Re-redeeming the key-A token now
+        // returns BadToken — it no longer verifies — NOT a fresh path. So even though its nullifier
+        // was dropped, the token can never be re-spent. GC is safe.
+        let boot2 = CoordState::with_nullifiers(
+            Arc::new(cfg_with_verifier(Verifier::from_public_ders(&[pk_b]).unwrap())),
+            nullifiers.clone(),
+        );
+        assert!(
+            matches!(redeem_logic(&boot2, &redeem).await, Err(RedeemError::BadToken)),
+            "a retired-key token is rejected at verify — a dropped nullifier cannot be re-spent"
+        );
+        assert_eq!(nullifiers.approx_len().await, Some(0), "the rejected token never re-entered the set");
     }
 
     #[tokio::test]
@@ -441,6 +519,7 @@ mod tests {
             path_hops: 3,
             verifier: None,
             nullifier_path: None,
+            nullifier_dir: None,
             grant_key: None,
             grant_ttl: std::time::Duration::from_secs(300),
             nullifier_warn_at: crate::config::DEFAULT_NULLIFIER_WARN_AT,

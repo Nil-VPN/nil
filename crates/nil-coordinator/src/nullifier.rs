@@ -6,31 +6,53 @@
 //! no account, payment, or identity in the set (Pillar 4 / PD-3). It records only "this token was
 //! already redeemed".
 //!
-//! **Unbounded by design (fail-closed).** The set never evicts an entry: a spent token is spent
-//! forever. This is deliberate — Privacy Pass tokens (RFC 9578) carry no expiry, so dropping a
-//! nullifier would re-permit redemption of that exact token (a double-spend). Age-based GC is
-//! therefore unsafe until tokens gain expiry metadata; bounding the set is a *separate, deferred*
-//! change that depends on that token-expiry work, not something the eviction-free store may do on
-//! its own. The size-threshold WARN emitted on redemption (see [`should_warn`]) is **operational
-//! alerting only** — it never trims the set; it just tells an operator the set is large.
+//! **Bounded by epoch (fail-closed).** Tokens now carry an epoch via their *signing key* (the
+//! nil-crypto multi-key [`Verifier`](nil_crypto::Verifier) holds one key per issuer key-generation).
+//! The set is partitioned by the epoch that verified each token, and a retired epoch's partition is
+//! dropped wholesale via [`NullifierStore::drop_epochs`]. This is the ONLY eviction primitive —
+//! there is NO age- or size-based trimming. It is SAFE because a token whose epoch key is retired no
+//! longer verifies (it is rejected at redeem BEFORE it can touch the set), so a dropped nullifier
+//! can never be re-inserted — a partition is dropped only after its key is already gone. See
+//! `redeem_logic` for the verify-then-record ordering and the single-use invariant + proof. The
+//! size-threshold WARN ([`should_warn`]) stays **operational alerting only** — it never trims.
 
+use std::collections::BTreeSet;
 use std::io;
 
 use async_trait::async_trait;
-use nil_core::durable::DurableSet;
+use nil_core::durable::{DurableSet, EpochDurableSet};
 
-/// Atomic single-use check-and-record for spent token messages.
+/// Atomic single-use check-and-record for spent token messages, partitioned by issuer epoch.
 ///
-/// The set is **unbounded by design**: implementations MUST NOT evict. See the module docs — a
-/// spent token must stay spent forever (no token expiry exists yet), so dropping an entry would
-/// reopen a double-spend. [`approx_len`](NullifierStore::approx_len) exists for operational
-/// visibility, not to drive eviction.
+/// Eviction is **only** by retired epoch ([`drop_epochs`](NullifierStore::drop_epochs)) — never by
+/// age or size. A spent token stays spent for as long as its epoch key is still accepted; once that
+/// key is retired the token no longer verifies, so dropping its partition cannot reopen a
+/// double-spend. [`approx_len`](NullifierStore::approx_len) is for operational visibility, not
+/// eviction.
 #[async_trait]
 pub trait NullifierStore: Send + Sync {
-    /// Record `key` as spent. `Ok(true)` ⇒ newly recorded (first redemption); `Ok(false)` ⇒
-    /// already present (double-spend); `Err` ⇒ could not be durably recorded — callers fail
-    /// closed (grant nothing) rather than risk a double-spend.
-    async fn insert_once(&self, key: &str) -> io::Result<bool>;
+    /// Record `key` as spent under `epoch` (the issuer epoch whose key verified the token).
+    /// `Ok(true)` ⇒ newly recorded (first redemption); `Ok(false)` ⇒ already present
+    /// (double-spend); `Err` ⇒ could not be durably recorded — callers fail closed (grant nothing)
+    /// rather than risk a double-spend.
+    async fn insert_once_in_epoch(&self, epoch: u32, key: &str) -> io::Result<bool>;
+
+    /// Drop every partition whose epoch is NOT in `retained`, returning the number of entries
+    /// removed. The default is a no-op (`Ok(0)`) for non-partitioned backends (in-memory / a single
+    /// legacy file) — those simply never GC, which is safe (more retention is always safe). The
+    /// caller MUST pass the set of epochs the verifier still accepts; a partition is dropped only
+    /// after its key is retired, so its tokens are already unverifiable.
+    async fn drop_epochs(&self, _retained: &BTreeSet<u32>) -> io::Result<usize> {
+        Ok(0)
+    }
+
+    /// Whether this backend actually evicts by epoch (a real [`drop_epochs`](Self::drop_epochs), not
+    /// the no-op default). The flat single-file / in-memory store returns `false` — it never GCs
+    /// (safe: it over-retains forever), so the Coordinator can warn an operator that rotating issuer
+    /// keys will NOT shrink the spent-token set unless they use the epoch-partitioned backend.
+    fn supports_epoch_gc(&self) -> bool {
+        false
+    }
 
     /// Approximate number of recorded (spent) entries, for operational visibility only — never to
     /// drive eviction. `None` (the default) means the backend does not cheaply expose a size; a
@@ -40,18 +62,42 @@ pub trait NullifierStore: Send + Sync {
     }
 }
 
+/// A single flat (non-partitioned) store — dev/in-memory and the legacy single-file
+/// `NW_NULLIFIER_PATH`. It ignores the epoch (one partition) and never GCs (`drop_epochs` is the
+/// trait default no-op). Correct for a single-key deployment that never rotates; use
+/// [`EpochDurableSet`] (a directory/epoch-tagged file) to get bounded-by-epoch GC.
 #[async_trait]
 impl NullifierStore for DurableSet {
-    async fn insert_once(&self, key: &str) -> io::Result<bool> {
+    async fn insert_once_in_epoch(&self, _epoch: u32, key: &str) -> io::Result<bool> {
         // `DurableSet::insert` is synchronous (it fsyncs before returning, so `Ok` means durably
-        // recorded). Run it inline — parity with the prior direct call; the fsync is a brief
-        // blocking syscall on the redeem path.
+        // recorded). Run it inline — the fsync is a brief blocking syscall on the redeem path.
         self.insert(key)
     }
 
     async fn approx_len(&self) -> Option<usize> {
         // The in-memory index size is O(1) to read — cheap enough for the redeem path.
         Some(self.len())
+    }
+}
+
+/// The epoch-partitioned durable store: records each nullifier under its verifying epoch and drops
+/// a retired epoch's partition wholesale, keeping the set bounded by epoch (not monotonic).
+#[async_trait]
+impl NullifierStore for EpochDurableSet {
+    async fn insert_once_in_epoch(&self, epoch: u32, key: &str) -> io::Result<bool> {
+        self.insert_in_epoch(epoch, key)
+    }
+
+    async fn drop_epochs(&self, retained: &BTreeSet<u32>) -> io::Result<usize> {
+        self.drop_epochs(retained)
+    }
+
+    async fn approx_len(&self) -> Option<usize> {
+        Some(self.len())
+    }
+
+    fn supports_epoch_gc(&self) -> bool {
+        true
     }
 }
 
@@ -72,13 +118,24 @@ mod pg {
     use super::*;
     use tokio_postgres::Client;
 
-    /// The nullifier table. Idempotent so `connect` can run it on startup. The PRIMARY KEY makes
-    /// the single-use check a single atomic statement.
-    pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS nullifiers (msg TEXT PRIMARY KEY)";
+    /// The nullifier table. Idempotent so `connect` can run it on startup. `msg` stays the PRIMARY
+    /// KEY (a token message is globally unique, so it is the dedup key); `epoch` is an added column
+    /// used ONLY for partition GC. The `ALTER ... ADD COLUMN IF NOT EXISTS` migrates an old table
+    /// (pre-epoch rows default to epoch 0, matching the file store's legacy migration); the index
+    /// makes `drop_epochs` a cheap single statement.
+    pub const SCHEMA: &str = "\
+        CREATE TABLE IF NOT EXISTS nullifiers (msg TEXT PRIMARY KEY, epoch INT NOT NULL DEFAULT 0); \
+        ALTER TABLE nullifiers ADD COLUMN IF NOT EXISTS epoch INT NOT NULL DEFAULT 0; \
+        CREATE INDEX IF NOT EXISTS nullifiers_epoch_idx ON nullifiers (epoch)";
 
     /// Atomic single-use: `ON CONFLICT DO NOTHING` makes a replay a no-op (0 rows), which
-    /// `insert_once` maps to `Ok(false)` — no read-then-write race, even across instances.
-    const INSERT_SQL: &str = "INSERT INTO nullifiers (msg) VALUES ($1) ON CONFLICT (msg) DO NOTHING";
+    /// `insert_once_in_epoch` maps to `Ok(false)` — no read-then-write race, even across instances.
+    const INSERT_SQL: &str =
+        "INSERT INTO nullifiers (msg, epoch) VALUES ($1, $2) ON CONFLICT (msg) DO NOTHING";
+
+    /// Drop every partition whose epoch is NOT retained: a single indexed statement. The current
+    /// epoch is always in `retained`, so this never contends with hot inserts.
+    const DROP_SQL: &str = "DELETE FROM nullifiers WHERE epoch <> ALL($1)";
 
     /// Bound the single-use check (it sits on the hot redeem path): a stalled DB must surface as a
     /// clean error → `RedeemError::Unavailable` (503), never hang the redeem request indefinitely.
@@ -150,12 +207,32 @@ mod pg {
 
     #[async_trait]
     impl NullifierStore for PgNullifierStore {
-        async fn insert_once(&self, key: &str) -> io::Result<bool> {
-            let affected = tokio::time::timeout(DB_TIMEOUT, self.client.execute(INSERT_SQL, &[&key]))
-                .await
-                .map_err(|_| io::Error::other("postgres nullifier insert timed out"))?
-                .map_err(|e| io::Error::other(format!("postgres nullifier insert: {e}")))?;
+        async fn insert_once_in_epoch(&self, epoch: u32, key: &str) -> io::Result<bool> {
+            let epoch = epoch as i32;
+            let affected =
+                tokio::time::timeout(DB_TIMEOUT, self.client.execute(INSERT_SQL, &[&key, &epoch]))
+                    .await
+                    .map_err(|_| io::Error::other("postgres nullifier insert timed out"))?
+                    .map_err(|e| io::Error::other(format!("postgres nullifier insert: {e}")))?;
             Ok(affected == 1) // 1 ⇒ newly recorded; 0 ⇒ ON CONFLICT (already spent)
+        }
+
+        async fn drop_epochs(&self, retained: &BTreeSet<u32>) -> io::Result<usize> {
+            if retained.is_empty() {
+                // Defensive: `epoch <> ALL('{}')` is TRUE for every row and would wipe the table.
+                // The verifier always holds >=1 epoch, so this is unreachable — refuse rather than nuke.
+                return Ok(0);
+            }
+            let epochs: Vec<i32> = retained.iter().map(|e| *e as i32).collect();
+            let affected = tokio::time::timeout(DB_TIMEOUT, self.client.execute(DROP_SQL, &[&epochs]))
+                .await
+                .map_err(|_| io::Error::other("postgres nullifier drop_epochs timed out"))?
+                .map_err(|e| io::Error::other(format!("postgres nullifier drop_epochs: {e}")))?;
+            Ok(affected as usize)
+        }
+
+        fn supports_epoch_gc(&self) -> bool {
+            true
         }
     }
 }
@@ -167,9 +244,27 @@ mod tests {
     #[tokio::test]
     async fn durable_set_insert_once_is_single_use() {
         let s = DurableSet::in_memory();
-        assert!(s.insert_once("tok-a").await.unwrap(), "first insert newly records");
-        assert!(!s.insert_once("tok-a").await.unwrap(), "replay is rejected");
-        assert!(s.insert_once("tok-b").await.unwrap(), "a distinct token records independently");
+        assert!(s.insert_once_in_epoch(0, "tok-a").await.unwrap(), "first insert newly records");
+        assert!(!s.insert_once_in_epoch(0, "tok-a").await.unwrap(), "replay is rejected");
+        assert!(s.insert_once_in_epoch(0, "tok-b").await.unwrap(), "a distinct token records independently");
+        // A non-partitioned store never GCs — drop_epochs is the trait default no-op.
+        assert_eq!(s.drop_epochs(&BTreeSet::from([0])).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn epoch_store_partitions_and_gcs_by_epoch() {
+        // Exercise via the trait object (EpochDurableSet has an inherent sync `drop_epochs` that
+        // would otherwise shadow the async trait method on the concrete type).
+        let store: &dyn NullifierStore = &EpochDurableSet::in_memory();
+        assert!(store.insert_once_in_epoch(7, "tok-old").await.unwrap());
+        assert!(store.insert_once_in_epoch(8, "tok-new").await.unwrap());
+        assert!(!store.insert_once_in_epoch(7, "tok-old").await.unwrap(), "replay rejected within epoch");
+        assert_eq!(store.approx_len().await, Some(2));
+        // Retire epoch 7: its partition is dropped; epoch 8 survives. (At redeem, a retired-epoch
+        // token would already fail verify_with_epoch, so it can never re-enter — see redeem_logic.)
+        assert_eq!(store.drop_epochs(&BTreeSet::from([8])).await.unwrap(), 1);
+        assert_eq!(store.approx_len().await, Some(1));
+        assert!(!store.insert_once_in_epoch(8, "tok-new").await.unwrap(), "epoch-8 entry intact");
     }
 
     #[test]
@@ -191,7 +286,7 @@ mod tests {
 
     #[async_trait]
     impl NullifierStore for OpaqueStore {
-        async fn insert_once(&self, _key: &str) -> io::Result<bool> {
+        async fn insert_once_in_epoch(&self, _epoch: u32, _key: &str) -> io::Result<bool> {
             Ok(true)
         }
     }
@@ -205,7 +300,7 @@ mod tests {
     async fn durable_set_reports_its_size() {
         let s = DurableSet::in_memory();
         assert_eq!(s.approx_len().await, Some(0));
-        let _ = s.insert_once("tok-a").await.unwrap();
+        let _ = s.insert_once_in_epoch(0, "tok-a").await.unwrap();
         assert_eq!(s.approx_len().await, Some(1), "DurableSet exposes a cheap size");
     }
 

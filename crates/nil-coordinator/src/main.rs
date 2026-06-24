@@ -19,12 +19,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use nil_core::durable::DurableSet;
+use nil_core::durable::{DurableSet, EpochDurableSet};
 use tracing_subscriber::EnvFilter;
 
-/// The non-Postgres nullifier-set selection: file-backed [`DurableSet`] (`NW_NULLIFIER_PATH`) or
-/// volatile in-memory (dev only). Shared by both `postgres`-feature configurations.
+/// The non-Postgres nullifier-set selection: epoch-partitioned [`EpochDurableSet`]
+/// (`NW_NULLIFIER_DIR`, bounded-by-epoch GC), else the flat file-backed [`DurableSet`]
+/// (`NW_NULLIFIER_PATH`, no GC), else volatile in-memory (dev only). Shared by both
+/// `postgres`-feature configurations.
 fn file_or_volatile_nullifiers(cfg: &Arc<config::CoordConfig>) -> Result<api::CoordState> {
+    // Epoch-partitioned store (bounded by epoch). The legacy single file (NW_NULLIFIER_PATH), if
+    // also set, is migrated in as the epoch-0 partition so already-spent tokens stay spent.
+    if let Some(dir) = &cfg.nullifier_dir {
+        let file = dir.join("nullifiers.epoch.log");
+        let set = EpochDurableSet::open(&file, cfg.nullifier_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("open epoch nullifier store {}: {e}", file.display()))?;
+        tracing::info!(path = %file.display(), spent = set.len(), "epoch-partitioned nullifier set loaded");
+        return Ok(api::CoordState::with_nullifiers(cfg.clone(), Arc::new(set)));
+    }
     match &cfg.nullifier_path {
         Some(path) => {
             let set = DurableSet::open(path)
@@ -66,7 +77,8 @@ async fn main() -> Result<()> {
         nodes = cfg.registry.nodes.len(),
         path_hops = cfg.path_hops,
         redeem = cfg.verifier.is_some(),
-        durable_nullifiers = cfg.nullifier_path.is_some(),
+        durable_nullifiers = cfg.nullifier_path.is_some() || cfg.nullifier_dir.is_some(),
+        epoch_partitioned = cfg.nullifier_dir.is_some(),
         "nil-coordinator listening (redeem + measurements)"
     );
 
@@ -89,6 +101,41 @@ async fn main() -> Result<()> {
     };
     #[cfg(not(feature = "postgres"))]
     let state = file_or_volatile_nullifiers(&cfg)?;
+
+    // Bounded-by-epoch GC: at startup, drop any nullifier partition whose KEY the verifier no longer
+    // holds. `retained` = the (key-derived) epochs of the currently-held keys (current + the
+    // operator's grace window, as listed in NW_TOKEN_PUBKEY), UNIONED with the reserved LEGACY_EPOCH
+    // (migrated legacy nullifiers are never auto-dropped — a still-held legacy key keeps its tokens
+    // verifiable, and the fixed legacy remnant is bounded). This is SAFE because a token signed by a
+    // retired key no longer verifies — it is rejected at redeem before it can re-enter the set (see
+    // the nullifier.rs invariant), and the epoch is derived from the key so it can't be renumbered.
+    // It runs right after an operator retires a key from NW_TOKEN_PUBKEY. A failure is non-fatal: the
+    // set just stays larger, which is always safe (more retention can never cause a double-spend).
+    if let Some(verifier) = cfg.verifier.as_ref() {
+        // Honest signal: if multiple issuer keys are configured (a rotation is under way) but the
+        // backend can't GC by epoch (the flat single-file / in-memory store), the spent-token set
+        // will only GROW — rotating keys will NOT shrink it. Tell the operator rather than let them
+        // believe rotation bounds the set.
+        if verifier.key_count() > 1 && !state.nullifiers.supports_epoch_gc() {
+            tracing::warn!(
+                "multiple issuer keys are configured but this nullifier backend does NOT GC by \
+                 epoch (flat/in-memory store) — the spent-token set will only grow. Use \
+                 NW_NULLIFIER_DIR (or NW_NULLIFIER_PG_URL with the postgres feature) for \
+                 bounded-by-epoch GC."
+            );
+        }
+        let mut retained = verifier.epochs();
+        retained.insert(nil_crypto::LEGACY_EPOCH);
+        match state.nullifiers.drop_epochs(&retained).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                dropped = n,
+                retained_epochs = ?retained,
+                "nullifier GC: dropped retired-epoch partition(s)"
+            ),
+            Err(e) => tracing::warn!("nullifier GC (drop_epochs) failed (non-fatal, set stays larger): {e}"),
+        }
+    }
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // ConnectInfo so `/v1/redeem` can rate-limit by client IP (the IP is used transiently for the

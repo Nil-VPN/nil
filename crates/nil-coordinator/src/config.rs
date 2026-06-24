@@ -20,15 +20,19 @@ pub struct CoordConfig {
     /// Where to durably persist the spent-token nullifier set (`NW_NULLIFIER_PATH`). `None` ⇒
     /// volatile in-memory nullifiers (dev only — a restart re-permits double-spend).
     pub nullifier_path: Option<PathBuf>,
+    /// Directory for the EPOCH-PARTITIONED nullifier store (`NW_NULLIFIER_DIR`). When set, the set
+    /// is bounded by epoch (a retired epoch's partition is GC'd); `nullifier_path`, if also set, is
+    /// migrated in as the epoch-0 partition. `None` ⇒ the flat single-file / in-memory store (no GC).
+    pub nullifier_dir: Option<PathBuf>,
     /// Shared Coordinator→node grant MAC key (`NW_GRANT_KEY`, hex). Production nodes require
     /// grants; leaving this unset keeps old local/dev coordinator flows grantless.
     pub grant_key: Option<Vec<u8>>,
     /// Lifetime of node grants minted after token redemption.
     pub grant_ttl: Duration,
     /// Soft alerting threshold for the spent-token nullifier set's size (`NW_NULLIFIER_WARN_AT`,
-    /// default 1_000_000). The set is unbounded BY DESIGN (it never evicts — a spent token is
-    /// spent forever); crossing this size logs a single PII-free WARN for operational visibility.
-    /// It is not a cap and never drops an entry. See [`crate::nullifier`].
+    /// default 1_000_000). The set is bounded BY EPOCH (retired epochs are GC'd via `drop_epochs`);
+    /// crossing this size logs a single PII-free WARN for operational visibility — a hint to rotate
+    /// issuer keys. It is not a cap and never drops an entry on the redeem path. See [`crate::nullifier`].
     pub nullifier_warn_at: usize,
 }
 
@@ -45,10 +49,14 @@ impl CoordConfig {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(3);
-        // The token verifier loads the issuer's PUBLIC key(s) — it can check tokens but never
-        // mint them (the private key stays in the Portal). NW_TOKEN_PUBKEY is a COMMA-SEPARATED
-        // list of hex DER keys: hold both the old and new key during an issuer-key rotation so
-        // tokens minted under either verify with zero downtime.
+        // The token verifier loads the issuer's PUBLIC key(s) — it can check tokens but never mint
+        // them (the private key stays in the Portal). NW_TOKEN_PUBKEY is a COMMA-SEPARATED list of
+        // hex DER public keys: hold the current issuer key plus a GRACE window of recent keys so
+        // tokens minted under any verify with zero downtime. The Coordinator derives each key's
+        // EPOCH from the key itself (`nil_crypto::key_epoch`) — there are NO operator-assigned epoch
+        // numbers, so a still-held key can never be "renumbered" out from under its live nullifiers.
+        // The derived epochs of the held keys ARE the retention set for nullifier GC: a partition is
+        // dropped only once its key leaves this list (i.e. is retired). See main.rs / nullifier.rs.
         let verifier = match std::env::var("NW_TOKEN_PUBKEY") {
             Ok(list) => {
                 let ders: Vec<Vec<u8>> = list
@@ -56,9 +64,8 @@ impl CoordConfig {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|h| {
-                        from_hex(h).ok_or_else(|| {
-                            anyhow::anyhow!("NW_TOKEN_PUBKEY entry is not valid hex")
-                        })
+                        from_hex(h)
+                            .ok_or_else(|| anyhow::anyhow!("NW_TOKEN_PUBKEY entry is not valid hex"))
                     })
                     .collect::<anyhow::Result<_>>()?;
                 if ders.is_empty() {
@@ -73,6 +80,11 @@ impl CoordConfig {
             Err(_) => None,
         };
         let nullifier_path = std::env::var("NW_NULLIFIER_PATH").ok().map(PathBuf::from);
+        // NW_NULLIFIER_DIR enables the EPOCH-PARTITIONED durable store (bounded-by-epoch GC). When
+        // set, the spent-token set lives in an epoch-tagged file under this dir and a retired
+        // epoch's partition is dropped at startup; NW_NULLIFIER_PATH (if also set) is migrated in as
+        // the epoch-0 partition. Without it, NW_NULLIFIER_PATH alone is a single flat file (no GC).
+        let nullifier_dir = std::env::var("NW_NULLIFIER_DIR").ok().map(PathBuf::from);
         let grant_key = load_grant_key()?;
         let grant_ttl = std::env::var("NW_GRANT_TTL_SECS")
             .ok()
@@ -90,6 +102,7 @@ impl CoordConfig {
             path_hops,
             verifier,
             nullifier_path,
+            nullifier_dir,
             grant_key,
             grant_ttl,
             nullifier_warn_at,

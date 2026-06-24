@@ -21,4 +21,4 @@ mod error;
 
 pub use error::CryptoError;
 pub use psk::{PqCiphertexts, PqInitiator, PqOffer, Psk, PskError, responder_encapsulate};
-pub use token::{Issuer, TokenError, TokenRequest, Verifier};
+pub use token::{key_epoch, Issuer, TokenError, TokenRequest, Verifier, LEGACY_EPOCH};

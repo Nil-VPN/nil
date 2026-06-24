@@ -66,40 +66,88 @@ impl Issuer {
     }
 }
 
+/// The reserved epoch for MIGRATED legacy nullifiers (tokens spent before key-derived epochs
+/// existed, under a single untagged issuer key). [`key_epoch`] never produces 0, so this never
+/// collides with a real key's epoch; the Coordinator always retains this partition.
+pub const LEGACY_EPOCH: u32 = 0;
+
+/// The epoch id DERIVED from an issuer public key (DER): the first 4 bytes of SHA-256(DER) as a
+/// big-endian u32, forced to be `>= 1` (0 is reserved — see [`LEGACY_EPOCH`]).
+///
+/// Deriving the epoch from the KEY — never from an operator-assigned number — is what makes
+/// nullifier GC safe: a token's stored epoch and the *retained* epoch of its signing key can never
+/// diverge, so a partition is dropped if and only if its signing key is no longer held. Renumbering
+/// a still-held key (which would drop its live nullifiers and reopen a double-spend) is impossible
+/// by construction. A 32-bit id can collide across keys with probability ~2^-32; a collision only
+/// ever causes two keys to SHARE a partition, so GC over-retains (safe), never under-retains.
+pub fn key_epoch(public_der: &[u8]) -> u32 {
+    use sha2::{Digest, Sha256};
+    let h = Sha256::digest(public_der);
+    let id = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+    if id == LEGACY_EPOCH {
+        1 // keep 0 reserved for legacy migration
+    } else {
+        id
+    }
+}
+
 /// Verifier side (Coordinator trust domain): holds only public key(s).
 ///
 /// It can hold MORE THAN ONE public key so issuer keys rotate without downtime: during a
 /// rotation both the old and new key are accepted, so a token minted under either verifies
 /// (architecture spec §7 / runbook §9). The private key never reaches this trust domain.
 pub struct Verifier {
-    keys: Vec<PublicKey>,
+    /// Each key is tagged with its KEY-DERIVED epoch ([`key_epoch`]) — a stable function of the key
+    /// itself, NOT an operator-chosen number. A token verifies if any held key accepts it;
+    /// `verify_with_epoch` reports the deriving key's epoch so the Coordinator partitions spent-token
+    /// nullifiers by it. Because the epoch is BOUND to the key, a partition is GC'd exactly when its
+    /// key is retired — never while the key is still held (the renumbering double-spend is impossible).
+    keys: Vec<(u32, PublicKey)>,
 }
 
 impl Verifier {
-    /// A single-key verifier.
+    /// A single-key verifier (epoch derived from the key).
     pub fn from_public_der(der: &[u8]) -> Result<Self, TokenError> {
-        Ok(Self { keys: vec![PublicKey::from_der(der).map_err(map_rsa)?] })
+        let key = PublicKey::from_der(der).map_err(map_rsa)?;
+        Ok(Self { keys: vec![(key_epoch(der), key)] })
     }
 
-    /// A multi-key verifier (rotation window): a token verifies if ANY held key accepts it.
+    /// A multi-key verifier (rotation window): a token verifies if ANY held key accepts it. Each
+    /// key's epoch is DERIVED from the key ([`key_epoch`]). Duplicate keys are harmless — they map
+    /// to the same epoch (same partition), so attribution and GC stay consistent.
     pub fn from_public_ders(ders: &[Vec<u8>]) -> Result<Self, TokenError> {
         if ders.is_empty() {
             return Err(TokenError::Rsa("verifier needs at least one public key".into()));
         }
         let keys = ders
             .iter()
-            .map(|d| PublicKey::from_der(d).map_err(map_rsa))
+            .map(|d| PublicKey::from_der(d).map(|k| (key_epoch(d), k)).map_err(map_rsa))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { keys })
     }
 
     /// Verify a redeemed token: is `token_sig` a signature over `msg` under any held key?
     pub fn verify(&self, token_sig: &[u8], msg: &[u8]) -> bool {
-        let sig = Signature(token_sig.to_vec());
-        self.keys.iter().any(|pk| pk.verify(&sig, None, msg).is_ok())
+        self.verify_with_epoch(token_sig, msg).is_some()
     }
 
-    /// Number of public keys held (> 1 during a rotation window).
+    /// Like [`Self::verify`], but on success returns the KEY-DERIVED EPOCH of the key that verified
+    /// the token. A token whose signing key is no longer held returns `None` — that redeem-time
+    /// rejection is exactly what makes dropping that epoch's nullifiers safe (a token that can't
+    /// verify can never re-enter the nullifier set). A token is signed by exactly one key.
+    pub fn verify_with_epoch(&self, token_sig: &[u8], msg: &[u8]) -> Option<u32> {
+        let sig = Signature(token_sig.to_vec());
+        self.keys.iter().find(|(_, pk)| pk.verify(&sig, None, msg).is_ok()).map(|(e, _)| *e)
+    }
+
+    /// The set of (key-derived) epochs this verifier currently accepts. The Coordinator unions this
+    /// with [`LEGACY_EPOCH`] as the `retained` set for nullifier GC: a partition is dropped iff its
+    /// epoch is NOT here — i.e. iff its signing key is no longer held.
+    pub fn epochs(&self) -> std::collections::BTreeSet<u32> {
+        self.keys.iter().map(|(e, _)| *e).collect()
+    }
+
+    /// Number of public keys held (> 1 during a rotation window / when multiple epochs are live).
     pub fn key_count(&self) -> usize {
         self.keys.len()
     }
@@ -207,5 +255,43 @@ mod tests {
         // Once the old key is retired (verifier holds only the new key), the old token is refused.
         let new_only = Verifier::from_public_ders(&[new_pk]).unwrap();
         assert!(!new_only.verify(&token, &msg), "after rotation completes, old-key tokens are refused");
+    }
+
+    #[test]
+    fn verify_with_epoch_reports_the_key_derived_epoch_and_none_when_retired() {
+        // Two distinct issuer keys → two distinct KEY-DERIVED epochs. A token minted under key A.
+        let a = Issuer::generate().unwrap();
+        let b = Issuer::generate().unwrap();
+        let a_pk = a.public_der().unwrap();
+        let b_pk = b.public_der().unwrap();
+        let ea = key_epoch(&a_pk);
+        let eb = key_epoch(&b_pk);
+        assert_ne!(ea, eb, "distinct keys derive distinct epochs");
+        assert_ne!(ea, LEGACY_EPOCH, "a derived epoch is never the reserved legacy 0");
+
+        let msg = token_msg();
+        let req = blind(&a_pk, &msg).unwrap();
+        let token = finalize(&a_pk, &req, &a.blind_sign(&req.blind_msg).unwrap()).unwrap();
+
+        // While both keys are held, the token verifies AND reports key A's derived epoch — the
+        // partition the Coordinator records the nullifier under.
+        let v = Verifier::from_public_ders(&[a_pk.clone(), b_pk.clone()]).unwrap();
+        assert_eq!(v.verify_with_epoch(&token, &msg), Some(ea));
+        assert_eq!(v.epochs(), std::collections::BTreeSet::from([ea, eb]));
+
+        // Retire key A (verifier holds only key B): the token no longer verifies → None. This is
+        // the redeem-time rejection that makes dropping key A's nullifier partition safe.
+        let retired = Verifier::from_public_ders(&[b_pk]).unwrap();
+        assert_eq!(retired.verify_with_epoch(&token, &msg), None);
+        assert!(!retired.verify(&token, &msg));
+
+        // A forged signature verifies under no epoch.
+        assert_eq!(v.verify_with_epoch(b"forged-not-a-signature", &msg), None);
+
+        // The epoch is STABLE per key: re-adding the SAME key (cannot be "renumbered") yields the
+        // same partition, so its live nullifiers are never dropped while the key is held.
+        assert_eq!(key_epoch(&a_pk), ea, "key_epoch is a stable function of the key");
+        let re_added = Verifier::from_public_der(&a_pk).unwrap();
+        assert_eq!(re_added.verify_with_epoch(&token, &msg), Some(ea));
     }
 }
