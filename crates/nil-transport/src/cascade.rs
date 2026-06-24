@@ -300,6 +300,13 @@ scaffold_transport!(
     Profile::WebSocketTls,
     "wstunnel (WebSocket-over-TLS)"
 );
+// The cascade-local scaffolds above (`AmneziaWgTransport`, `WstunnelTransport`, and this
+// `RealityTransport`) are thin placeholders that carry the right `kind()`/`fingerprint_profile()`
+// and slot into the cascade for the step-down tests; the REAL transports live in their own modules
+// behind feature flags ([`crate::amneziawg`], [`crate::wstunnel`], [`crate::reality`]) and are what
+// a deployment actually wires into a [`Cascade`]. They share only the `TransportKind`, never the
+// type, so there is no name conflict. See [`crate::reality`] for which REALITY properties the real
+// rung does / does not yet achieve.
 scaffold_transport!(
     RealityTransport,
     TransportKind::Reality,

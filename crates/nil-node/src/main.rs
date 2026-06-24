@@ -17,6 +17,7 @@ mod exit;
 mod hw;
 mod pool;
 mod pqwg;
+mod reality;
 mod retry;
 mod server;
 mod wstunnel;
@@ -51,6 +52,9 @@ async fn main() -> Result<()> {
     } else if std::env::var("NW_NODE_WSTUNNEL").is_ok() {
         tracing::info!("node mode: wstunnel responder (WireGuard over WebSocket-over-TLS cascade fallback)");
         wstunnel::run(&cfg, exit.tun()).await?;
+    } else if std::env::var("NW_NODE_REALITY").is_ok() {
+        tracing::info!("node mode: reality responder (WireGuard over VLESS-gated TLS cascade fallback)");
+        reality::run(&cfg, exit.tun()).await?;
     } else {
         let cert = cert::DevCert::generate(vec!["nil-node".to_string(), "localhost".to_string()])?;
         server::run(&cfg, &cert, exit.tun()).await?;

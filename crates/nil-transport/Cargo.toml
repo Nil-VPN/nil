@@ -21,6 +21,11 @@ pqwg = ["masque", "dep:boringtun", "dep:nil-crypto", "dep:getrandom", "dep:sha2"
 # HTTPS-shaped wire fingerprint. The inner WireGuard provides the crypto/auth; the TLS is the
 # obfuscation envelope.
 wstunnel = ["pqwg", "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "dep:futures-util", "dep:hkdf"]
+# REALITY/VLESS cascade rung: WireGuard (the pqwg core) carried inside a VLESS-shared-key-gated TLS
+# session — the last-resort, real-TLS-shaped fallback. The inner WireGuard provides the crypto/auth;
+# the TLS is the obfuscation envelope. See `src/reality.rs` for which REALITY properties are / are
+# not yet achieved (the TLS is genuine self-signed, not a borrowed foreign-site handshake).
+reality = ["pqwg", "dep:tokio-rustls", "dep:rustls", "dep:hkdf"]
 
 [dependencies]
 nil-core = { workspace = true }
