@@ -4,8 +4,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 /// A node's position in a trust-split path (architecture spec §6). Entry sees the client IP
 /// but not the destination; exit sees the destination but not the client IP; middle sees
-/// neither. Phase 2/3 implements the exit datapath (NAT to the internet); entry/middle
-/// forwarding to the next hop is the nested-tunnel integration tracked with the inner-WG work.
+/// neither. The exit NATs the tunnel openly to the internet; entry/middle forward the next hop's
+/// QUIC (UDP/443) onward and DROP anything else from the tunnel, so an intermediate node can never
+/// be coerced into an open internet relay (the role-scoped egress in [`crate::exit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeRole {
     Entry,
