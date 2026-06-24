@@ -13,10 +13,10 @@
 # deterministic flags, --locked, --features hw-attest) so the binary this image ships is the
 # byte-identical, reproducibly-built artifact whose measurement is published to Rekor. KEEP THE
 # TWO BUILDER STAGES IN SYNC — if they diverge, the shipped node is no longer the audited binary.
-# TODO(prod): pin both bases by @sha256 (FROM rust:1.96.0-bookworm@sha256:… / debian:…@sha256:…)
-# so a floating-tag re-tag can't change the artifact (resolve via `docker buildx imagetools inspect`).
+# Both bases are pinned by digest + platform (keep the builder stage IN SYNC with
+# deploy/Dockerfile.repro) so a floating-tag re-tag or host-arch change can't alter the artifact.
 
-FROM rust:1.96.0-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
 ARG SOURCE_DATE_EPOCH=0
@@ -24,13 +24,19 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     CARGO_INCREMENTAL=0 \
     LC_ALL=C \
     TZ=UTC \
-    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
 COPY . .
-# No cache mounts — hermetic, so this binary hashes identically to the published measurement.
-RUN cargo build --release --locked -p nil-node --features hw-attest && cp target/release/nil-node /nil-node
+# Hermetic, network-free compile: vendor every dep (deterministic from Cargo.lock + immutable
+# crates.io) into ./vendor, point cargo at it, and build OFFLINE — no cache mounts, so each clean
+# build is identical. With codegen-units=1 (Cargo.toml), the pinned toolchain (rust-toolchain.toml),
+# the digest-pinned linux/amd64 base, --build-id=none and remapped paths, the binary hashes the same.
+RUN mkdir -p .cargo \
+ && cargo vendor --locked vendor >> .cargo/config.toml \
+ && cargo build --release --locked --offline -p nil-node --features hw-attest \
+ && cp target/release/nil-node /nil-node
 
-FROM debian:bookworm-slim
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
 # Datapath tooling: the exit node NATs decapsulated packets to the internet and owns a TUN.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 iptables procps ethtool ca-certificates && rm -rf /var/lib/apt/lists/*

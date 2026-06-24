@@ -6,10 +6,9 @@
 # Honest note: this dev measurement is the hash of the userspace ELF; a real SEV-SNP/TDX
 # measurement covers the whole guest launch state (firmware+kernel+initrd+cmdline). The
 # *interface* (a pinned hex the client appraises) is identical when the real source swaps in.
-# TODO(prod): pin the base by digest — `FROM rust:1.96.0-bookworm@sha256:<digest>` — so a
-# re-tag of the floating tag can't change the measurement (resolve via `docker buildx
-# imagetools inspect rust:1.96.0-bookworm`).
-FROM rust:1.96.0-bookworm AS builder
+# The base is pinned by digest AND platform so a floating-tag re-tag or a different host arch can't
+# change the measurement (re-resolve via `docker buildx imagetools inspect rust:1.96.0-bookworm`).
+FROM --platform=linux/amd64 rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
 ARG SOURCE_DATE_EPOCH=0
@@ -17,8 +16,14 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     CARGO_INCREMENTAL=0 \
     LC_ALL=C \
     TZ=UTC \
-    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo"
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
 COPY . .
-# No cache mounts here — a clean, hermetic build each time so the double-build comparison is meaningful.
-RUN cargo build --release --locked -p nil-node --features hw-attest && cp target/release/nil-node /nil-node
+# Hermetic, network-free compile: vendor every dep (deterministic from Cargo.lock + immutable
+# crates.io) into ./vendor, point cargo at it, and build OFFLINE — no cache mounts, so each clean
+# build is identical. With codegen-units=1 (Cargo.toml), the pinned toolchain (rust-toolchain.toml),
+# the digest-pinned linux/amd64 base, --build-id=none and remapped paths, the binary hashes the same.
+RUN mkdir -p .cargo \
+ && cargo vendor --locked vendor >> .cargo/config.toml \
+ && cargo build --release --locked --offline -p nil-node --features hw-attest \
+ && cp target/release/nil-node /nil-node

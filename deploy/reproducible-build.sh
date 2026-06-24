@@ -30,9 +30,10 @@ if [ -n "$A" ] && [ "$A" = "$B" ]; then
   exit 0
 else
   echo "RESULT: builds are NOT byte-identical ❌"
-  echo "  Rust+BoringSSL bit-for-bit reproducibility can need extra pinning (build-id, vendored"
-  echo "  deps, BuildKit SOURCE_DATE_EPOCH layer rewrite). This is a finding to chase, not a"
-  echo "  script bug. The toolchain (rust-toolchain.toml), --locked, CARGO_INCREMENTAL=0 and"
-  echo "  --remap-path-prefix are in place; next levers are 'cargo vendor' + a pinned base digest."
+  echo "  In place: pinned toolchain (rust-toolchain.toml), codegen-units=1, --locked + vendored"
+  echo "  deps built --offline, CARGO_INCREMENTAL=0, --remap-path-prefix, --build-id=none, and a"
+  echo "  digest-pinned linux/amd64 base. If it still diverges, suspect: a dep build.rs that embeds"
+  echo "  a timestamp/abspath, BoringSSL/cmake nondeterminism, or qemu-vs-native codegen (build on a"
+  echo "  real amd64 host, not an emulated arm64 one). This is a finding to chase, not a script bug."
   exit 1
 fi
