@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use nil_core::durable::DurableSet;
+use nil_core::durable::{DurableSet, TimedDurableSet};
 use nil_crypto::Issuer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -124,18 +124,19 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Pending checkout-reference set: durable when NW_PENDING_PATH is set, else volatile + a
-    // warning (a restart with a volatile set forgets which references were minted, so issuance
-    // for an in-flight checkout would fail closed until a new checkout is started).
+    // Pending checkout-reference set: a TIMED set so abandoned checkouts are pruned by age (TTL)
+    // and it stays bounded. Durable when NW_PENDING_PATH is set, else volatile + a warning (a
+    // restart with a volatile set forgets which references were minted, so issuance for an in-flight
+    // checkout would fail closed until a new checkout is started).
     let pending = match std::env::var("NW_PENDING_PATH") {
         Ok(path) => {
-            let s = DurableSet::open(&path).map_err(|e| anyhow::anyhow!("open pending store {path}: {e}"))?;
+            let s = TimedDurableSet::open(&path).map_err(|e| anyhow::anyhow!("open pending store {path}: {e}"))?;
             tracing::info!(%path, pending = s.len(), "durable checkout-reference set loaded");
             Arc::new(s)
         }
         Err(_) => {
             tracing::warn!("NW_PENDING_PATH unset — the checkout-reference set is VOLATILE (dev only; a restart drops in-flight checkouts)");
-            Arc::new(DurableSet::in_memory())
+            Arc::new(TimedDurableSet::in_memory())
         }
     };
 
@@ -153,6 +154,45 @@ async fn main() -> Result<()> {
             TokenState::with_issued(issuer, watcher, Arc::new(DurableSet::in_memory()), pending)
         }
     };
+
+    // TTL-prune the pending checkout-reference set in the background so abandoned checkouts don't
+    // accumulate (the set would otherwise grow unbounded). NW_CHECKOUT_TTL_SECS (default 1h) must
+    // exceed worst-case Monero confirmation latency, since pruning a reference whose payment lands
+    // after the TTL denies that checkout. Pruning is FAIL-CLOSED: it can only refuse a stale
+    // checkout (issuance returns "unknown reference" 402), never enable a double-issue (that guard
+    // is the SEPARATE, never-pruned `issued` set).
+    // Floor the TTL at the prune interval: a TTL below it (or a malformed/zero value) would prune
+    // references almost as fast as they're minted, denying legitimate in-flight checkouts.
+    const CHECKOUT_TTL_FLOOR_SECS: u64 = 300;
+    let ttl_secs = match std::env::var("NW_CHECKOUT_TTL_SECS") {
+        Ok(s) => match s.parse::<u64>() {
+            Ok(v) if v >= CHECKOUT_TTL_FLOOR_SECS => v,
+            Ok(v) => {
+                tracing::warn!(
+                    requested = v, floor = CHECKOUT_TTL_FLOOR_SECS,
+                    "NW_CHECKOUT_TTL_SECS below the floor — clamping (a tiny TTL would prune in-flight checkouts)"
+                );
+                CHECKOUT_TTL_FLOOR_SECS
+            }
+            Err(_) => {
+                tracing::warn!(value = %s, "NW_CHECKOUT_TTL_SECS is not a u64 — using the 3600s default");
+                3600
+            }
+        },
+        Err(_) => 3600,
+    };
+    let pending_for_prune = token_state.pending.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let cutoff = nil_core::grant::now_unix_secs().saturating_sub(ttl_secs);
+            match pending_for_prune.prune_older_than(cutoff) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "pending checkout-reference TTL prune"),
+                Err(e) => tracing::warn!("pending-set prune failed (non-fatal): {e}"),
+            }
+        }
+    });
 
     let app = app::router(AppState::new(store))
         .merge(token_router(token_state.clone()))

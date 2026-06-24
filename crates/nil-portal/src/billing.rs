@@ -57,7 +57,7 @@ async fn checkout(State(state): State<TokenState>) -> Result<Json<CheckoutRespon
     // Record as pending BEFORE returning it, durably. A reference handed to a buyer but not
     // persisted would be rejected at issuance after a restart (fail-closed) — recording first
     // avoids charging a buyer for a reference we'd later refuse.
-    match state.pending.insert(&reference) {
+    match state.pending.insert(&reference, nil_core::grant::now_unix_secs()) {
         Ok(true) => Ok(Json(CheckoutResponse { payment_reference: reference })),
         // A 256-bit collision is cryptographically impossible; treat it as an error rather than
         // hand back a reference already bound to another (possibly paid) checkout.
@@ -74,7 +74,7 @@ async fn checkout(State(state): State<TokenState>) -> Result<Json<CheckoutRespon
 
 /// Whether `reference` is one this Portal minted via checkout (i.e. issuance is allowed to
 /// proceed for it once the payment also confirms). Used by [`crate::tokens::issue_logic`].
-pub fn is_known_reference(pending: &Arc<nil_core::durable::DurableSet>, reference: &str) -> bool {
+pub fn is_known_reference(pending: &Arc<nil_core::durable::TimedDurableSet>, reference: &str) -> bool {
     pending.contains(reference)
 }
 
@@ -119,8 +119,36 @@ mod tests {
 
         // The buyer's reference WAS minted via checkout (recorded pending) and is confirmed →
         // issuance succeeds.
-        state.pending.insert(&reference).unwrap();
+        state.pending.insert(&reference, 0).unwrap();
         let ok = IssueRequest { payment_id: reference, blind_msg: hexmsg };
         assert!(issue_logic(&state, &ok).is_ok());
+    }
+
+    #[test]
+    fn pruning_a_stale_pending_reference_fails_issuance_closed_without_double_issue() {
+        // A checkout reference minted at t=100, then a confirmed payment for it.
+        let issuer = Arc::new(Issuer::generate().unwrap());
+        let pub_der = issuer.public_der().unwrap();
+        let reference = mint_reference().unwrap();
+        let watcher = Arc::new(MockWatcher::with_paid([reference.clone()]));
+        let state = TokenState::new(issuer, watcher);
+        state.pending.insert(&reference, 100).unwrap();
+
+        let msg = b"token-nonce-0123456789abcdef0123".to_vec();
+        let req = token::blind(&pub_der, &msg).unwrap();
+        let hexmsg: String = req.blind_msg.iter().map(|b| format!("{b:02x}")).collect();
+
+        // TTL prune removes the stale reference (inserted at 100, cutoff 1000) → issuance now
+        // fails CLOSED with UnknownReference (402), never granting a token for the pruned checkout.
+        assert_eq!(state.pending.prune_older_than(1000).unwrap(), 1);
+        let after = IssueRequest { payment_id: reference.clone(), blind_msg: hexmsg.clone() };
+        assert!(matches!(issue_logic(&state, &after), Err(IssueError::UnknownReference)));
+
+        // And the one-token-per-payment guard (the SEPARATE issued set) is untouched by pruning:
+        // re-minting the reference + re-confirming lets issuance succeed exactly ONCE, then 409.
+        state.pending.insert(&reference, 2000).unwrap();
+        let again = IssueRequest { payment_id: reference, blind_msg: hexmsg };
+        assert!(issue_logic(&state, &again).is_ok(), "a fresh checkout for the ref issues once");
+        assert!(matches!(issue_logic(&state, &again), Err(IssueError::AlreadyIssued)), "issued set still enforces one-per-payment");
     }
 }

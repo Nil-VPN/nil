@@ -12,7 +12,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use nil_core::durable::DurableSet;
+use nil_core::durable::{DurableSet, TimedDurableSet};
 use nil_crypto::Issuer;
 use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
 
@@ -61,8 +61,11 @@ pub struct TokenState {
     /// Issuance is gated on the `payment_id` being a reference WE minted — this is what blocks
     /// front-running of a confirmed payment id by a stranger. Durable for the same reason as
     /// `issued`: a restart must not forget which references are legitimate. References are opaque
-    /// and non-identifying (they index a payment, never a person), so this stays PII-free.
-    pub pending: Arc<DurableSet>,
+    /// and non-identifying (they index a payment, never a person), so this stays PII-free. It is a
+    /// TIMED set: abandoned checkouts are pruned by age (TTL), so it stays bounded. Pruning is
+    /// fail-closed — it can only deny a stale checkout, never enable a double-issue (that is the
+    /// SEPARATE `issued` set, which is never TTL'd).
+    pub pending: Arc<TimedDurableSet>,
 }
 
 impl TokenState {
@@ -77,7 +80,7 @@ impl TokenState {
             issuer,
             watcher,
             issued: Arc::new(DurableSet::in_memory()),
-            pending: Arc::new(DurableSet::in_memory()),
+            pending: Arc::new(TimedDurableSet::in_memory()),
             limiter: Self::limiter(),
         }
     }
@@ -87,7 +90,7 @@ impl TokenState {
         issuer: Arc<dyn TokenSigner>,
         watcher: Arc<dyn PaymentWatcher>,
         issued: Arc<DurableSet>,
-        pending: Arc<DurableSet>,
+        pending: Arc<TimedDurableSet>,
     ) -> Self {
         Self { issuer, watcher, issued, pending, limiter: Self::limiter() }
     }
@@ -210,7 +213,7 @@ mod tests {
         let watcher = Arc::new(MockWatcher::with_paid(["pay-1".to_string()]));
         let state = TokenState::new(issuer, watcher);
         // "pay-1" is a checkout reference the Portal minted (front-running guard).
-        state.pending.insert("pay-1").unwrap();
+        state.pending.insert("pay-1", 0).unwrap();
 
         // Client blinds a fresh token message.
         let msg = b"token-nonce-0123456789abcdef0123".to_vec();
@@ -221,7 +224,7 @@ mod tests {
         assert!(matches!(issue_logic(&state, &unminted), Err(IssueError::UnknownReference)));
 
         // A minted-but-unpaid reference → refused (no confirmed payment).
-        state.pending.insert("pay-unpaid").unwrap();
+        state.pending.insert("pay-unpaid", 0).unwrap();
         let unpaid = IssueRequest { payment_id: "pay-unpaid".into(), blind_msg: to_hex(&req.blind_msg) };
         assert!(matches!(issue_logic(&state, &unpaid), Err(IssueError::Unpaid)));
 
@@ -261,9 +264,9 @@ mod tests {
             issuer.clone(),
             watcher.clone(),
             Arc::new(DurableSet::open(&path).unwrap()),
-            Arc::new(DurableSet::in_memory()),
+            Arc::new(TimedDurableSet::in_memory()),
         );
-        boot1.pending.insert("pay-1").unwrap();
+        boot1.pending.insert("pay-1", 0).unwrap();
         assert!(issue_logic(&boot1, &paid).is_ok(), "first issuance for the payment succeeds");
         drop(boot1); // simulate a Portal restart
 
@@ -273,9 +276,9 @@ mod tests {
             issuer,
             watcher,
             Arc::new(DurableSet::open(&path).unwrap()),
-            Arc::new(DurableSet::in_memory()),
+            Arc::new(TimedDurableSet::in_memory()),
         );
-        boot2.pending.insert("pay-1").unwrap();
+        boot2.pending.insert("pay-1", 0).unwrap();
         assert!(
             matches!(issue_logic(&boot2, &paid), Err(IssueError::AlreadyIssued)),
             "a payment that already minted a token must not mint a second one after a restart"

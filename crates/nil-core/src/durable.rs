@@ -327,6 +327,166 @@ impl EpochDurableSet {
     }
 }
 
+struct TimedInner {
+    /// key (opaque reference) → the unix time (secs) it was inserted. Dedup is by key; the
+    /// timestamp drives TTL pruning.
+    seen: HashMap<String, u64>,
+    file: Option<File>,
+}
+
+/// A durable set whose entries carry an insertion TIME, so old ones can be pruned by age — for the
+/// Portal's pending checkout-reference set, which would otherwise grow unbounded as abandoned
+/// checkouts accumulate. A checkout reference is NOT a Privacy Pass token (it is a pre-payment,
+/// server-minted, never-blinded value indexing a payment, not a person — PD-3/PD-4), so attaching
+/// an insertion time leaks nothing.
+///
+/// **Pruning is fail-closed and cannot cause a double-issue.** Removing a pending reference only
+/// makes a later `/v1/tokens/issue` for it return "unknown reference" (402) — it never grants
+/// anything. One-token-per-payment is enforced by the SEPARATE issued set, which this never
+/// touches. The only failure mode is pruning a reference whose payment confirms after the TTL
+/// (an availability tradeoff), so the TTL is set well above worst-case confirmation latency.
+///
+/// On-disk format: one `"<key> <unix>"` line per entry (append-only). [`Self::prune_older_than`]
+/// compacts the file by atomically rewriting it (temp + fsync + rename + parent-dir fsync,
+/// commit-after-durable). PII-free by contract, like [`DurableSet`].
+pub struct TimedDurableSet {
+    inner: Mutex<TimedInner>,
+    path: Option<PathBuf>,
+}
+
+impl TimedDurableSet {
+    /// A volatile, memory-only timed set (dev/tests). NOT durable across restarts.
+    pub fn in_memory() -> Self {
+        Self { inner: Mutex::new(TimedInner { seen: HashMap::new(), file: None }), path: None }
+    }
+
+    /// Open a file-backed timed set, loading existing `"<key> <unix>"` lines. A malformed/torn line
+    /// is skipped on load (fail-closed: at worst a present key reads as absent → a re-insert).
+    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let mut seen: HashMap<String, u64> = HashMap::new();
+        if let Ok(f) = File::open(&path) {
+            for line in BufReader::new(f).lines() {
+                let line = line?;
+                let line = line.trim();
+                if let Some((k, t)) = line.split_once(' ') {
+                    if let (false, Ok(ts)) = (k.is_empty(), t.parse::<u64>()) {
+                        seen.insert(k.to_string(), ts);
+                    }
+                }
+            }
+        }
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        Ok(Self { inner: Mutex::new(TimedInner { seen, file: Some(file) }), path: Some(path) })
+    }
+
+    /// Record `key` with insertion time `now_unix`. `Ok(true)` ⇒ newly inserted; `Ok(false)` ⇒
+    /// already present; `Err` ⇒ not durably recorded → caller fails closed. fsync before the
+    /// in-memory insert, like [`DurableSet::insert`].
+    pub fn insert(&self, key: &str, now_unix: u64) -> io::Result<bool> {
+        if key.contains('\n') || key.contains(' ') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "timed-durable key must not contain a space or newline (on-disk format is `<key> <unix>`)",
+            ));
+        }
+        let mut inner = self.inner.lock().expect("TimedDurableSet mutex poisoned");
+        if inner.seen.contains_key(key) {
+            return Ok(false);
+        }
+        if let Some(file) = inner.file.as_mut() {
+            file.write_all(format!("{key} {now_unix}\n").as_bytes())?;
+            file.flush()?;
+            file.sync_all()?;
+        }
+        inner.seen.insert(key.to_string(), now_unix);
+        Ok(true)
+    }
+
+    /// Whether `key` is present.
+    pub fn contains(&self, key: &str) -> bool {
+        self.inner.lock().expect("TimedDurableSet mutex poisoned").seen.contains_key(key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().expect("TimedDurableSet mutex poisoned").seen.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_durable(&self) -> bool {
+        self.path.is_some()
+    }
+
+    /// Remove every entry inserted strictly before `cutoff_unix`, returning the count removed. The
+    /// file is rewritten atomically (temp + fsync + rename + parent-dir fsync), commit-after-durable
+    /// (in-memory set mutated only after the rewrite is durable). Pruning is fail-closed — see the
+    /// type docs: it can only deny a stale checkout, never enable a double-issue.
+    pub fn prune_older_than(&self, cutoff_unix: u64) -> io::Result<usize> {
+        let mut inner = self.inner.lock().expect("TimedDurableSet mutex poisoned");
+        let to_drop = inner.seen.values().filter(|t| **t < cutoff_unix).count();
+        if to_drop == 0 {
+            return Ok(0);
+        }
+        if let Some(path) = &self.path {
+            let survivors: Vec<(String, u64)> = inner
+                .seen
+                .iter()
+                .filter(|(_, t)| **t >= cutoff_unix)
+                .map(|(k, t)| (k.clone(), *t))
+                .collect();
+            let tmp = path.with_extension("compact.tmp");
+            let compact = || -> io::Result<()> {
+                {
+                    let mut f =
+                        OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+                    for (k, t) in &survivors {
+                        f.write_all(format!("{k} {t}\n").as_bytes())?;
+                    }
+                    f.flush()?;
+                    f.sync_all()?;
+                }
+                std::fs::rename(&tmp, path)?;
+                if let Some(parent) = path.parent() {
+                    let dir = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+                    if let Ok(d) = File::open(dir) {
+                        let _ = d.sync_all();
+                    }
+                }
+                Ok(())
+            };
+            if let Err(e) = compact() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+            // The compaction (rewrite + rename + fsync) is durable: disk now holds survivors only.
+            // Commit the in-memory set to MATCH disk BEFORE the fallible append-handle reopen, so a
+            // reopen error can never leave memory holding pruned refs while disk dropped them. The
+            // reopen is then best-effort: on failure, log and keep the file handle as-is — the next
+            // insert/prune or a restart rebinds it. (A divergence here would only be fail-closed
+            // anyway, but keeping memory == disk avoids the stale-handle write entirely.)
+            inner.seen.retain(|_, t| *t >= cutoff_unix);
+            // Best-effort reopen: on failure keep the previous handle (nil-core has no logger). The
+            // next insert/prune or a restart rebinds it; memory already matches disk, so the only
+            // effect of a stale handle is that a subsequent insert may fail to persist — which is
+            // fail-closed for issuance (a non-durable pending ref is forgotten on restart).
+            if let Ok(f) = OpenOptions::new().create(true).append(true).open(path) {
+                inner.file = Some(f);
+            }
+            return Ok(to_drop);
+        }
+        inner.seen.retain(|_, t| *t >= cutoff_unix);
+        Ok(to_drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,6 +619,51 @@ mod tests {
         // auto-dropped (a still-held legacy key keeps its tokens unverifiable-safe).
         assert_eq!(s2.drop_epochs(&BTreeSet::from([1])).unwrap(), 1);
         assert!(!s2.contains("legacy-tok"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn timed_set_dedups_and_prunes_by_age() {
+        let s = TimedDurableSet::in_memory();
+        assert!(s.insert("ref-old", 100).unwrap(), "first insert is new");
+        assert!(!s.insert("ref-old", 999).unwrap(), "duplicate key is rejected (time ignored)");
+        assert!(s.insert("ref-new", 200).unwrap());
+        assert_eq!(s.len(), 2);
+
+        // Prune everything inserted strictly before t=150: ref-old (100) goes, ref-new (200) stays.
+        assert_eq!(s.prune_older_than(150).unwrap(), 1);
+        assert!(!s.contains("ref-old"));
+        assert!(s.contains("ref-new"));
+        assert_eq!(s.prune_older_than(150).unwrap(), 0, "no-op when nothing is old enough");
+        // A pruned reference can be re-inserted (a fresh checkout reuses neither — refs are random).
+        assert!(s.insert("ref-old", 300).unwrap(), "a pruned key is absent and can be re-inserted");
+
+        // A space/newline in the key is rejected (would corrupt the "<key> <unix>" line format).
+        assert!(s.insert("bad key", 1).is_err());
+        assert!(s.insert("bad\nkey", 1).is_err());
+    }
+
+    #[test]
+    fn timed_set_survives_restart_and_prune_is_durable() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = TimedDurableSet::open(&path).expect("open");
+            assert!(s.insert("ref-a", 100).unwrap());
+            assert!(s.insert("ref-b", 500).unwrap());
+        } // restart
+        let s2 = TimedDurableSet::open(&path).expect("reopen");
+        assert!(s2.contains("ref-a") && s2.contains("ref-b"), "both survive a restart with their times");
+        // Prune ref-a (100 < 300); confirm the compaction is durable: a third open must not see it.
+        assert_eq!(s2.prune_older_than(300).unwrap(), 1);
+        // Insert a NEW ref AFTER the prune — it must write through the rebound append handle (the
+        // pre-prune handle pointed at the now-renamed-away inode), so it must survive a restart too.
+        assert!(s2.insert("ref-c", 600).unwrap());
+        drop(s2);
+        let s3 = TimedDurableSet::open(&path).expect("reopen 2");
+        assert!(!s3.contains("ref-a"), "pruned entry stays pruned after restart (compacted)");
+        assert!(s3.contains("ref-b"));
+        assert!(s3.contains("ref-c"), "a ref inserted AFTER a prune survives (rebound append handle is live)");
         let _ = std::fs::remove_file(&path);
     }
 }
