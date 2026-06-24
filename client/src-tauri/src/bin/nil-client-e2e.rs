@@ -45,15 +45,27 @@ async fn run() -> anyhow::Result<()> {
     anyhow::ensure!(acct.recovery_phrase.len() == 7, "expected a 7-word recovery phrase");
     println!("ACCOUNT-OK words={}", acct.recovery_phrase.len());
 
-    // 2. Token store (temp). Buy one token if a payment id is provided.
+    // 2. Token store (temp). Acquire one token via the REAL checkout flow (NW_CHECKOUT=1: mint a
+    //    server reference, then issue against it — exercises the front-running guard end to end) or
+    //    a pre-minted reference (NW_PAYMENT_ID, back-compat). With neither, no token is bought.
     let store_path = std::env::temp_dir().join(format!("nil-e2e-tokens-{}.json", std::process::id()));
     let _ = std::fs::remove_file(&store_path);
     let store = TokenStore::open(store_path.clone());
-    if let Some(pid) = env("NW_PAYMENT_ID") {
-        let token = TokenClient::with_base_url(portal.clone())
-            .acquire(&pid)
+    let client = TokenClient::with_base_url(portal.clone());
+    let reference = if let Some(pid) = env("NW_PAYMENT_ID") {
+        Some(pid)
+    } else if env("NW_CHECKOUT").is_some() {
+        let co = client.init_checkout().await.map_err(|e| anyhow::anyhow!("checkout: {e}"))?;
+        println!("CHECKOUT-OK ref_len={}", co.payment_reference.len());
+        Some(co.payment_reference)
+    } else {
+        None
+    };
+    if let Some(reference) = reference {
+        let token = client
+            .acquire(&reference)
             .await
-            .map_err(|e| anyhow::anyhow!("buy_tokens: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("acquire: {e}"))?;
         store.add(&[token]).map_err(|e| anyhow::anyhow!("token store: {e}"))?;
     }
     let bal = store.count().map_err(|e| anyhow::anyhow!("token count: {e}"))?;

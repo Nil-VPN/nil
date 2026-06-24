@@ -64,18 +64,15 @@ done
 [ "$cup" = 1 ] && echo "  coordinator listening" \
   || { echo "  FAIL: coordinator did not start"; $DC exec -T coordinator tail -n 15 /tmp/coord.log 2>/dev/null; exit 1; }
 
-# Acquire an unlinkable token, following the REAL client flow: POST /v1/billing/checkout for a
-# server-minted (unguessable) payment reference, then blind-issue against it. The Portal runs with
-# NW_MOCK_PAID_ALL=1, so the reference reads as paid (standing in for a confirmed Monero payment) —
-# but the front-running guard still requires it to be a reference we minted, so this exercises the
-# composed checkout→issue path. Echoes the NW_TOKEN_* lines. nil-provision stderr is left visible
-# (not /dev/null'd) so an issuance refusal shows up in the log instead of a silent empty result.
+# Acquire an unlinkable token via the REAL client flow. nil-provision now does the whole thing:
+# POST /v1/billing/checkout to mint a server reference, then blind-issue against it. The Portal runs
+# with NW_MOCK_PAID_ALL=1, so the minted reference reads as paid (standing in for a confirmed Monero
+# payment) — but the front-running guard still requires it to be a reference we minted, so this
+# exercises the composed checkout→issue path through the production client code (no NW_PAYMENT_ID).
+# Echoes the NW_TOKEN_* lines on STDOUT; nil-provision's human prompts/errors go to STDERR (left
+# visible, not /dev/null'd) so an issuance refusal shows in the log instead of a silent empty result.
 acquire() {
-  local ref
-  ref=$($DC exec -T client curl -s --max-time 10 -X POST "http://$PORTAL:8080/v1/billing/checkout" \
-        | tr -d '\r' | sed -n 's/.*"payment_reference":"\([0-9a-f]*\)".*/\1/p')
-  if [ -z "$ref" ]; then echo "  checkout produced no payment reference" >&2; return 1; fi
-  $DC exec -T -e NW_PORTAL_URL="http://$PORTAL:8080" -e NW_PAYMENT_ID="$ref" client nil-provision | tr -d '\r'
+  $DC exec -T -e NW_PORTAL_URL="http://$PORTAL:8080" client nil-provision | tr -d '\r'
 }
 
 echo

@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use nil_proto::token::{IssueRequest, IssueResponse, PubKeyResponse};
+use nil_proto::token::{CheckoutResponse, IssueRequest, IssueResponse, PubKeyResponse};
 
 const DEFAULT_PORTAL_URL: &str = "http://127.0.0.1:8080";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,6 +37,8 @@ pub enum TokenError {
     AlreadyIssued,
     #[error("the token service rejected the request (HTTP {0})")]
     IssuerRejected(u16),
+    #[error("this Portal has no checkout endpoint (it predates the front-running guard)")]
+    CheckoutUnsupported,
     #[error("couldn't reach the token service — is nil-portal running? ({0})")]
     Unreachable(String),
     #[error("{0}")]
@@ -79,9 +81,35 @@ impl TokenClient {
         }
     }
 
-    /// Acquire ONE unblinded token against a confirmed `payment_id`. The blinding secret stays in
-    /// this process; the Portal blind-signs without ever seeing `msg`. The Portal enforces
-    /// one-token-per-payment (a repeat → `AlreadyIssued`); top up with a new payment.
+    /// Mint a fresh, unguessable payment reference via `POST /v1/billing/checkout`. The buyer pays
+    /// this reference (as their Monero payment id); it is then passed to [`Self::acquire`] once the
+    /// payment confirms. The front-running guard means issuance only proceeds for a reference WE
+    /// minted, so this checkout step is mandatory against a hardened Portal. A Portal that predates
+    /// checkout returns 404/405 → [`TokenError::CheckoutUnsupported`], so the caller can fall back to
+    /// the legacy manual payment-id flow. The reference indexes a payment, never a person (PD-3/PD-4).
+    pub async fn init_checkout(&self) -> Result<CheckoutResponse, TokenError> {
+        self.ensure_safe_base_url()?;
+        let base = self.base_url.trim_end_matches('/');
+        let resp = self
+            .http
+            .post(format!("{base}/v1/billing/checkout"))
+            .send()
+            .await
+            .map_err(net_err)?;
+        if let Some(err) = checkout_error_for_status(resp.status().as_u16()) {
+            return Err(err);
+        }
+        // Log a count/fact only — never the reference itself (PD-2).
+        tracing::info!("checkout: minted a payment reference");
+        resp.json().await.map_err(net_err)
+    }
+
+    /// Acquire ONE unblinded token against a `payment_id` (a checkout reference from
+    /// [`Self::init_checkout`]). The blinding secret stays in this process; the Portal blind-signs
+    /// without ever seeing `msg`. The Portal returns `402` (→ [`TokenError::PaymentNotConfirmed`])
+    /// until the payment confirms, so a caller polls by retrying this at a WIDE interval (the issue
+    /// endpoint is rate-limited); a `402` attempt issues nothing, so retrying is safe. One token per
+    /// payment is enforced (a repeat → `AlreadyIssued`).
     pub async fn acquire(&self, payment_id: &str) -> Result<StoredToken, TokenError> {
         self.ensure_safe_base_url()?;
         let base = self.base_url.trim_end_matches('/');
@@ -149,6 +177,17 @@ impl TokenClient {
     }
 }
 
+/// Map a `/v1/billing/checkout` HTTP status to a client error (or `None` on success). Pure, so the
+/// 404/405 → [`TokenError::CheckoutUnsupported`] fallback (a Portal that predates checkout) and the
+/// non-2xx → [`TokenError::IssuerRejected`] mapping are unit-testable without a network round-trip.
+fn checkout_error_for_status(status: u16) -> Option<TokenError> {
+    match status {
+        200..=299 => None,
+        404 | 405 => Some(TokenError::CheckoutUnsupported),
+        other => Some(TokenError::IssuerRejected(other)),
+    }
+}
+
 fn net_err(e: reqwest::Error) -> TokenError {
     match e.status() {
         Some(s) => TokenError::IssuerRejected(s.as_u16()),
@@ -203,6 +242,19 @@ mod tests {
             client.ensure_safe_base_url(),
             Err(TokenError::UnsafeUrl(_))
         ));
+    }
+
+    #[test]
+    fn checkout_status_mapping_handles_unsupported_and_errors() {
+        // Success: no error. The actual reference parse is wire-tested in nil-proto.
+        assert!(checkout_error_for_status(200).is_none());
+        assert!(checkout_error_for_status(201).is_none());
+        // A Portal that predates the checkout endpoint → graceful fallback signal.
+        assert!(matches!(checkout_error_for_status(404), Some(TokenError::CheckoutUnsupported)));
+        assert!(matches!(checkout_error_for_status(405), Some(TokenError::CheckoutUnsupported)));
+        // Any other non-2xx is surfaced as a rejection with its code (no fallback).
+        assert!(matches!(checkout_error_for_status(503), Some(TokenError::IssuerRejected(503))));
+        assert!(matches!(checkout_error_for_status(429), Some(TokenError::IssuerRejected(429))));
     }
 
     #[test]

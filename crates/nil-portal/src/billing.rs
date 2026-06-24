@@ -25,19 +25,10 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Json, Router};
 use axum::routing::post;
-use serde::{Deserialize, Serialize};
+
+use nil_proto::token::CheckoutResponse;
 
 use crate::tokens::TokenState;
-
-/// `POST /v1/billing/checkout` response: the server-minted payment reference the buyer must use
-/// as their Monero payment id. Lowercase hex, 256 bits of CSPRNG entropy — unguessable, so it
-/// cannot be front-run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckoutResponse {
-    /// The opaque payment reference. Use this as the Monero payment id when paying, then pass it
-    /// as `payment_id` to `/v1/tokens/issue`.
-    pub payment_reference: String,
-}
 
 /// Length of a minted reference in bytes (256 bits). A Monero short payment id is 8 bytes (16
 /// hex) — see [`crate::monero`] for why short ids are deprecated; a 32-byte reference here is
