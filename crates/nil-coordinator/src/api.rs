@@ -124,7 +124,21 @@ pub async fn redeem_logic(
     // Keying on the raw string would let an attacker re-spend one token by flipping hex case.
     let nullifier_key = to_hex(&msg);
     match state.nullifiers.insert_once(&nullifier_key).await {
-        Ok(true) => {}                                         // newly spent — proceed
+        Ok(true) => {
+            // Operational visibility only: the nullifier set is unbounded BY DESIGN (it never
+            // evicts — a spent token is spent forever), so warn once when its size crosses the
+            // soft threshold. PII-free: only the set size is logged — never the token bytes, the
+            // key, or any user/account count. This is alerting, not a cap; nothing is dropped.
+            if let Some(n) = state.nullifiers.approx_len().await {
+                if crate::nullifier::should_warn(n, state.cfg.nullifier_warn_at) {
+                    tracing::warn!(
+                        nullifier_set_size = n,
+                        "spent-token nullifier set crossed its soft size threshold; it is \
+                         unbounded by design (never evicts) — bounded GC awaits token expiry"
+                    );
+                }
+            }
+        } // newly spent — proceed
         Ok(false) => return Err(RedeemError::AlreadyRedeemed), // replay
         Err(e) => {
             tracing::error!("nullifier persist failed: {e}");
@@ -237,6 +251,7 @@ mod tests {
             nullifier_path: None,
             grant_key: None,
             grant_ttl: std::time::Duration::from_secs(300),
+            nullifier_warn_at: crate::config::DEFAULT_NULLIFIER_WARN_AT,
         };
         let redeem = RedeemRequest {
             msg: hex(&msg),
@@ -428,6 +443,7 @@ mod tests {
             nullifier_path: None,
             grant_key: None,
             grant_ttl: std::time::Duration::from_secs(300),
+            nullifier_warn_at: crate::config::DEFAULT_NULLIFIER_WARN_AT,
         };
         let state = CoordState::new(Arc::new(cfg));
         let req = RedeemRequest {
