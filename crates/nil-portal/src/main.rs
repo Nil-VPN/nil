@@ -100,9 +100,18 @@ async fn main() -> Result<()> {
             tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
             w
         }
-        // Dev only: seed the mock watcher with already-"paid" payment ids from NW_MOCK_PAID
-        // (comma-separated). Lets the integration harness mint a token without a live monerod;
-        // never use in production (NW_MONERO_RPC takes precedence above).
+        // Dev only: a mock watcher so the integration harness can mint a token without a live
+        // monerod. Never reachable in production — a real NW_MONERO_RPC takes precedence above.
+        // NW_MOCK_PAID_ALL confirms every id (for checkout references unknowable at startup);
+        // NW_MOCK_PAID seeds a fixed set of already-"paid" ids (comma-separated).
+        Err(_) if nil_core::net::env_flag("NW_MOCK_PAID_ALL") => {
+            // Integration harnesses pay a server-minted checkout reference, which is random and so
+            // can't be listed in NW_MOCK_PAID ahead of time. This mock confirms every id — the
+            // front-running guard still requires the id to be a minted checkout reference, so the
+            // composed flow (checkout → issue) is exercised without a live monerod. Dev only.
+            tracing::warn!("NW_MOCK_PAID_ALL set — mock watcher CONFIRMS EVERY payment (dev/integration only)");
+            Arc::new(MockWatcher::confirm_everything())
+        }
         Err(_) => {
             let paid: Vec<String> = std::env::var("NW_MOCK_PAID")
                 .ok()

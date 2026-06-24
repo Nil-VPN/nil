@@ -6,6 +6,10 @@
 //! then redeem at the Coordinator for a trust-split path. This is the "separate client step" the
 //! datapath redeem module references; it completes the client control flow.
 //!
+//! `NW_PAYMENT_ID` is the *checkout reference* the Portal minted via `POST /v1/billing/checkout`
+//! (and which the buyer paid) — not a free-chosen string. Issuance enforces that front-running
+//! guard, so an id that was never minted by checkout is refused even if a payment confirmed for it.
+//!
 //! Privacy: it talks ONLY to the Business plane (Portal) and never sees a packet. The token is
 //! blinded locally, so the Portal's signature cannot be linked to the token the Coordinator later
 //! sees (Pillar 4). Nothing identifying is printed — only the opaque token bytes.
@@ -41,8 +45,8 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let portal = std::env::var("NW_PORTAL_URL").context("NW_PORTAL_URL (Portal base URL) is required")?;
-    let payment_id =
-        std::env::var("NW_PAYMENT_ID").context("NW_PAYMENT_ID (a confirmed payment id) is required")?;
+    let payment_id = std::env::var("NW_PAYMENT_ID")
+        .context("NW_PAYMENT_ID (the checkout reference from POST /v1/billing/checkout) is required")?;
     let portal = portal.trim_end_matches('/');
     // The blinded request, the blind signature, and the payment id are sensitive — never send them
     // in cleartext to a non-loopback Portal. Require TLS unless loopback, or an explicit dev opt-in.

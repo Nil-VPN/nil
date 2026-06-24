@@ -22,14 +22,27 @@ pub trait PaymentWatcher: Send + Sync {
     fn is_confirmed(&self, payment_id: &str) -> bool;
 }
 
-/// Test/dev watcher: a fixed (or mutable) set of confirmed payment ids.
+/// Test/dev watcher: a fixed (or mutable) set of confirmed payment ids — or, for integration
+/// harnesses that pay a *server-minted checkout reference* (a 256-bit value unknowable when the
+/// Portal starts, so it cannot be pre-seeded), a mode that treats every id as confirmed.
 pub struct MockWatcher {
     confirmed: Mutex<HashSet<String>>,
+    /// Dev/integration only: confirm ANY payment id, standing in for "the buyer paid the reference
+    /// the server just minted". This does NOT weaken the front-running guard: issuance still
+    /// requires the id to be one the Portal minted via `/v1/billing/checkout`
+    /// ([`crate::billing::is_known_reference`]), so an un-minted id is rejected regardless of
+    /// confirmation. Enabled via `NW_MOCK_PAID_ALL`; never reachable in production, where a live
+    /// `NW_MONERO_RPC` watcher takes precedence over any mock.
+    confirm_all: bool,
 }
 
 impl MockWatcher {
     pub fn with_paid<I: IntoIterator<Item = String>>(ids: I) -> Self {
-        Self { confirmed: Mutex::new(ids.into_iter().collect()) }
+        Self { confirmed: Mutex::new(ids.into_iter().collect()), confirm_all: false }
+    }
+    /// A dev/integration watcher that treats every payment id as confirmed (see `confirm_all`).
+    pub fn confirm_everything() -> Self {
+        Self { confirmed: Mutex::new(HashSet::new()), confirm_all: true }
     }
     /// Mark a payment confirmed (e.g. when the real watcher observes it). Used by tests.
     #[allow(dead_code)]
@@ -40,7 +53,7 @@ impl MockWatcher {
 
 impl PaymentWatcher for MockWatcher {
     fn is_confirmed(&self, payment_id: &str) -> bool {
-        self.confirmed.lock().expect("mock watcher mutex").contains(payment_id)
+        self.confirm_all || self.confirmed.lock().expect("mock watcher mutex").contains(payment_id)
     }
 }
 
@@ -234,6 +247,16 @@ mod tests {
         assert!(!w.is_confirmed("pay-2"));
         w.confirm("pay-2");
         assert!(w.is_confirmed("pay-2"));
+    }
+
+    #[test]
+    fn confirm_everything_mode_confirms_any_id() {
+        // The dev/integration mode for server-minted checkout references (unknowable at startup):
+        // every id reads as paid. The front-running guard (is_known_reference) is what still
+        // restricts issuance to minted references — that is exercised in billing.rs tests.
+        let w = MockWatcher::confirm_everything();
+        assert!(w.is_confirmed("any-reference-at-all"));
+        assert!(w.is_confirmed(""));
     }
 
     #[test]

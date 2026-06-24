@@ -20,8 +20,11 @@ x-node-base: &node-base
     - net.ipv4.ip_forward=1
 
 services:
-  # Business plane: mints anonymous Privacy Pass tokens. NW_MOCK_PAID stands in for confirmed
-  # Monero payments (dev/integration only — no live monerod in CI).
+  # Business plane: mints anonymous Privacy Pass tokens. The real flow is checkout (server-minted
+  # reference) → pay → blind-issue; NW_MOCK_PAID_ALL stands in for the "paid" step so the harness
+  # can confirm the random checkout reference without a live monerod (dev/integration only). The
+  # front-running guard still requires a minted reference, so the composed checkout→issue path is
+  # what gets exercised.
   portal:
     build:
       context: ..
@@ -29,7 +32,7 @@ services:
     command: ["nil-portal"]
     environment:
       - NW_PORTAL_ADDR=0.0.0.0:8080
-      - NW_MOCK_PAID=e2e-pay-redeem,e2e-pay-tunnel,e2e-pay-spare
+      - NW_MOCK_PAID_ALL=1
       - RUST_LOG=info,nil_portal=debug
     networks:
       nilnet:

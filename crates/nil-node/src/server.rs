@@ -279,11 +279,14 @@ fn handle_packet(
         }
     };
 
-    // The DCID the client used AFTER our Retry becomes the connection's SCID; `odcid` (recovered
-    // from the validated token) is required by quiche to complete the handshake transcript.
-    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    getrandom::getrandom(&mut scid).map_err(|_| anyhow::anyhow!("scid entropy"))?;
-    let scid_cid = quiche::ConnectionId::from_ref(&scid);
+    // The client copied our Retry's SCID into its DCID, so `hdr.dcid` IS our Retry SCID — and it
+    // MUST become the connection's SCID. quiche derives the `retry_source_connection_id` transport
+    // parameter from the scid passed to `accept`, and the client rejects the handshake with
+    // InvalidTransportParam unless that matches the SCID it saw in our Retry. Generating a fresh
+    // random scid here desynchronised them, breaking EVERY real (source-validated) connection while
+    // the loopback tests — which skip Retry — stayed green. `odcid` (recovered from the validated
+    // token) is the original pre-Retry DCID, which quiche needs to complete the handshake transcript.
+    let scid_cid = quiche::ConnectionId::from_ref(&hdr.dcid);
     let odcid_cid = quiche::ConnectionId::from_ref(&odcid);
     let conn = quiche::accept(&scid_cid, Some(&odcid_cid), local, from, config)?;
     // No source address logged: nil-node is the data plane (SOUL §3 / PD-3 — no source-IP retention).
@@ -303,7 +306,9 @@ fn handle_packet(
         },
     };
     let _ = client.conn.recv(pkt, info);
-    clients.insert(scid.to_vec(), client);
+    // Key the connection by its SCID (`hdr.dcid` post-Retry = `key`): subsequent client packets
+    // address it with this as their DCID, matching the `clients.get_mut(&key)` lookup above.
+    clients.insert(key, client);
     Ok(None)
 }
 
@@ -653,6 +658,104 @@ mod tests {
         assert!(
             find(&resp, connectip::ATTEST_REPORT_HEADER.as_bytes()).is_none(),
             "no report header when the node has no attestation identity"
+        );
+    }
+
+    /// Coverage for the QUIC source-address-validation (Retry) path of `handle_packet`, which had
+    /// none: drive a real quiche client through Initial → Retry → token'd Initial → `accept` →
+    /// established. Guards the broad flow — Retry issuance, token mint/validate, and `accept`.
+    ///
+    /// HONEST SCOPE: this does NOT reproduce the specific scid-desync bug it sits next to (the node
+    /// `accept`ing with a fresh random scid instead of `hdr.dcid`, so `retry_source_connection_id`
+    /// mismatched the Retry and real clients got `InvalidTransportParam`). That failure only
+    /// manifests over the real datapath (UDP sockets + the production driver), not this in-memory
+    /// lockstep pump — verified by reintroducing the bug here and watching the test still pass. The
+    /// regression guard for the scid-desync is the full-stack `deploy/verify-e2e.sh` (in CI via
+    /// `dataplane-e2e.yml`), which went red→green on the fix. Kept here for the Retry-path coverage.
+    #[test]
+    fn retry_handshake_establishes_through_source_validation() {
+        let cert = DevCert::generate(vec!["localhost".into()]).expect("dev cert");
+        let mut server_config = build_server_config(&cert).expect("server config");
+        let retry_key = crate::retry::RetryKey::generate().expect("retry key");
+
+        let server_addr: SocketAddr = "127.0.0.1:4433".parse().unwrap();
+        let client_addr: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        // A minimal client config (params mirror the node; the self-signed RA-TLS cert is trusted
+        // here because attestation is appraised at the app layer, not at the QUIC layer).
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).unwrap();
+        client_config.set_application_protos(&[b"h3"]).unwrap();
+        client_config.verify_peer(false);
+        client_config.set_max_idle_timeout(5_000);
+        client_config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
+        client_config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
+        client_config.set_initial_max_data(1_000_000);
+        client_config.set_initial_max_stream_data_bidi_local(100_000);
+        client_config.set_initial_max_stream_data_bidi_remote(100_000);
+        client_config.set_initial_max_streams_bidi(10);
+        client_config.set_initial_max_streams_uni(10);
+        // Mirror the production client's HTTPS/QUIC shaping (build_client_config / apply_quic_shape).
+        // The Retry-scid desync only manifested against a client shaped like this (the trigger the
+        // minimal loopback config did not reproduce), so the regression test must shape too.
+        client_config.grease(true);
+        client_config.set_active_connection_id_limit(4);
+        client_config.set_disable_active_migration(true);
+        client_config.set_max_connection_window(24 * 1024 * 1024);
+        client_config.set_max_stream_window(16 * 1024 * 1024);
+
+        let cscid = quiche::ConnectionId::from_ref(&[0x42u8; quiche::MAX_CONN_ID_LEN]);
+        let mut client =
+            quiche::connect(Some("localhost"), &cscid, client_addr, server_addr, &mut client_config)
+                .expect("client connect");
+
+        let mut clients: HashMap<Vec<u8>, Client> = HashMap::new();
+        let mut out = [0u8; 2048];
+        let mut saw_retry = false;
+
+        // Pump packets between client and server until the client completes the handshake. Bounded
+        // so a stuck handshake fails the test instead of hanging.
+        for _ in 0..40 {
+            // Client → server.
+            loop {
+                match client.send(&mut out) {
+                    Ok((len, _)) => {
+                        let mut pkt = out[..len].to_vec();
+                        if let Some(resp) =
+                            handle_packet(&mut clients, &mut pkt, client_addr, server_addr, &mut server_config, false, &retry_key)
+                                .expect("handle_packet")
+                        {
+                            // A stateless reply (Retry / version negotiation) — feed it back.
+                            saw_retry = true;
+                            let mut rb = resp;
+                            let _ = client.recv(&mut rb, quiche::RecvInfo { from: server_addr, to: client_addr });
+                        }
+                    }
+                    Err(quiche::Error::Done) => break,
+                    Err(e) => panic!("client send: {e}"),
+                }
+            }
+            // Server connection(s) → client.
+            for c in clients.values_mut() {
+                loop {
+                    match c.conn.send(&mut out) {
+                        Ok((len, _)) => {
+                            let _ = client.recv(&mut out[..len], quiche::RecvInfo { from: server_addr, to: client_addr });
+                        }
+                        Err(quiche::Error::Done) => break,
+                        Err(e) => panic!("server send: {e}"),
+                    }
+                }
+            }
+            if client.is_established() {
+                break;
+            }
+        }
+
+        assert!(saw_retry, "the node must challenge the first Initial with a Retry");
+        assert!(
+            client.is_established(),
+            "client must complete the handshake through Retry — retry_source_connection_id must \
+             match the Retry SCID (regression: a fresh random accept scid breaks this)"
         );
     }
 

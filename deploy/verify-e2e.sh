@@ -47,8 +47,14 @@ $DC exec -T coordinator sh -c 'cat > /tmp/registry.json' <<EOF
 EOF
 
 echo "==> start the Coordinator (verifier = the Portal's PUBLIC key only; 3-hop diverse paths)"
+# NW_NULLIFIER_PATH points the spent-token set at a durable file, so this e2e exercises the REAL
+# production nullifier path (the fail-closed DurableSet with fsync) — not the volatile dev escape
+# hatch. The Coordinator refuses to boot with a volatile set unless NW_ALLOW_DEV_FALLBACKS=1; an
+# end-to-end test should prove the durable path composes, so we give it a real file rather than
+# opting out of the guard.
 $DC exec -e NW_COORDINATOR_ADDR=0.0.0.0:9000 -e NW_TOKEN_PUBKEY="$PUBKEY" \
   -e NW_NODE_REGISTRY=/tmp/registry.json -e NW_PATH_HOPS=3 \
+  -e NW_NULLIFIER_PATH=/tmp/nullifiers.log \
   -d coordinator sh -c 'nil-coordinator > /tmp/coord.log 2>&1'
 cup=0
 for _ in $(seq 1 20); do
@@ -58,14 +64,23 @@ done
 [ "$cup" = 1 ] && echo "  coordinator listening" \
   || { echo "  FAIL: coordinator did not start"; $DC exec -T coordinator tail -n 15 /tmp/coord.log 2>/dev/null; exit 1; }
 
-# Acquire a token from the Portal for a given (mock-paid) payment id; echoes the NW_TOKEN_* lines.
+# Acquire an unlinkable token, following the REAL client flow: POST /v1/billing/checkout for a
+# server-minted (unguessable) payment reference, then blind-issue against it. The Portal runs with
+# NW_MOCK_PAID_ALL=1, so the reference reads as paid (standing in for a confirmed Monero payment) —
+# but the front-running guard still requires it to be a reference we minted, so this exercises the
+# composed checkout→issue path. Echoes the NW_TOKEN_* lines. nil-provision stderr is left visible
+# (not /dev/null'd) so an issuance refusal shows up in the log instead of a silent empty result.
 acquire() {
-  $DC exec -T -e NW_PORTAL_URL="http://$PORTAL:8080" -e NW_PAYMENT_ID="$1" client nil-provision 2>/dev/null | tr -d '\r'
+  local ref
+  ref=$($DC exec -T client curl -s --max-time 10 -X POST "http://$PORTAL:8080/v1/billing/checkout" \
+        | tr -d '\r' | sed -n 's/.*"payment_reference":"\([0-9a-f]*\)".*/\1/p')
+  if [ -z "$ref" ]; then echo "  checkout produced no payment reference" >&2; return 1; fi
+  $DC exec -T -e NW_PORTAL_URL="http://$PORTAL:8080" -e NW_PAYMENT_ID="$ref" client nil-provision | tr -d '\r'
 }
 
 echo
 echo "================ CONTROL PLANE: issue → redeem → single-use ================"
-prov=$(acquire e2e-pay-redeem)
+prov=$(acquire)
 MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
 TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
 if [ -z "$MSG" ] || [ -z "$TOK" ]; then
@@ -82,7 +97,7 @@ fi
 
 echo
 echo "================ DATA PLANE: token → coordinator-granted onion → real traffic ================"
-prov=$(acquire e2e-pay-tunnel)
+prov=$(acquire)
 MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
 TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
 if [ -z "$TOK" ]; then
