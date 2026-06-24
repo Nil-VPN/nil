@@ -323,6 +323,14 @@ impl Transport for PqWgTransport {
         // Inherent method (priority over this trait method): MASQUE MTU minus WG's 32 bytes.
         PqWgTransport::tunnel_mtu(self, session)
     }
+
+    fn assigned_ip(&self, session: &Session) -> Option<std::net::Ipv4Addr> {
+        // Delegate to the underlying MASQUE session: when a PQ-WG session is used as a nesting
+        // carrier (a per-hop-PQ onion), the next hop's udpip source must still be the inner node's
+        // ADDRESS_ASSIGN'd per-client IP, so concurrent clients don't collide at that node.
+        let s = self.state(session).ok()?;
+        self.inner.assigned_ip(&s.inner_session)
+    }
 }
 
 /// The data pump: app IP packets → WG encapsulate → inner MASQUE; inner MASQUE → WG

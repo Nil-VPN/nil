@@ -214,12 +214,18 @@ impl MasqueTransport {
                      for the inner QUIC payload"
                 ))
             })?;
-        // A fixed inner client address (inside the nodes' tunnel CIDR); the outer node NATs it
-        // away before the next hop, and the reply routes back through the node's TUN.
-        let inner_ip = self
-            .config
-            .nested_client_ip
-            .unwrap_or(DEFAULT_NESTED_CLIENT_IP);
+        // The inner client address (inside the nodes' tunnel CIDR) stamped as the udpip SOURCE of
+        // this hop's inner QUIC. The OUTER node (the hop we tunnel through) decapsulates these,
+        // learns `source → this client` for reply routing, and NATs the source away before the
+        // next hop. So the source MUST be unique per client at that outer node, or two concurrent
+        // onion clients collide in its route table and the second is dropped. Use the inner IP the
+        // outer node ASSIGNED us (ADDRESS_ASSIGN / `nil-assigned-ip`, distinct per client from its
+        // pool); fall back to the configured/default fixed address only when the node didn't assign
+        // one (single-client/dev — unchanged behavior).
+        let inner_ip = nested_source_ip(
+            outer.assigned_ip(&outer_session),
+            self.config.nested_client_ip,
+        );
         let local = SocketAddrV4::new(inner_ip, NESTED_CLIENT_PORT);
         let authority = self
             .config
@@ -974,6 +980,14 @@ fn status_of(list: &[quiche::h3::Header]) -> Option<u16> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Pick the udpip SOURCE address for a nested hop's inner QUIC. Precedence: the inner IP the outer
+/// node ASSIGNED us (distinct per client → no collision in that node's reply-route table when
+/// several onion clients share it) > a configured fixed address > the default. Pure so the
+/// precedence is unit-tested without a live connection.
+fn nested_source_ip(assigned: Option<Ipv4Addr>, configured: Option<Ipv4Addr>) -> Ipv4Addr {
+    assigned.or(configured).unwrap_or(DEFAULT_NESTED_CLIENT_IP)
+}
+
 /// Parse the node's `nil-assigned-ip` response header (dotted-quad IPv4) — the ADDRESS_ASSIGN
 /// subset. Absent or malformed ⇒ `None` (the datapath then keeps its configured address).
 fn assigned_ip_of(list: &[quiche::h3::Header]) -> Option<Ipv4Addr> {
@@ -991,6 +1005,19 @@ mod tests {
         let t = MasqueTransport::new();
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
+    }
+
+    #[test]
+    fn nested_source_ip_prefers_the_node_assigned_address() {
+        let assigned = Ipv4Addr::new(10, 74, 0, 7);
+        let configured = Ipv4Addr::new(10, 74, 0, 9);
+        // The outer node's ADDRESS_ASSIGN'd IP wins — this is the per-client uniqueness that stops
+        // two concurrent onion clients colliding in that node's reply-route table.
+        assert_eq!(nested_source_ip(Some(assigned), Some(configured)), assigned);
+        assert_eq!(nested_source_ip(Some(assigned), None), assigned);
+        // No assignment → the configured fixed address, else the default (single-client/dev).
+        assert_eq!(nested_source_ip(None, Some(configured)), configured);
+        assert_eq!(nested_source_ip(None, None), DEFAULT_NESTED_CLIENT_IP);
     }
 
     #[test]
