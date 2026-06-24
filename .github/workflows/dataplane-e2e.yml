@@ -1,0 +1,30 @@
+name: dataplane-e2e
+
+# Full-stack data-plane e2e: brings up the Dockerized Portal + Coordinator + entry/middle/exit
+# nodes + client (synthetic-attest), then proves the whole pipeline — token issue → redeem
+# (200 then 409 single-use) → 3-hop attested MASQUE onion → real egress. The synthetic RA-TLS
+# report stands in for real TEE hardware (the nil-attest KATs cover the genuine vendor chains).
+# Heavy (full image build), so it runs on main pushes + nightly + on demand, NOT on every PR —
+# release-attest.yml (tags) and reproducibility.yml stay the other native gates.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 6 * * *"   # nightly ~06:41 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dataplane-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: token -> redeem(200/409) -> 3-hop attested onion -> egress
+        run: bash deploy/verify-e2e.sh
