@@ -1,0 +1,32 @@
+name: reproducibility
+
+# Early-warning reproducibility check for the nil-node measurement.
+#
+# release-attest.yml (on v* tags) is the AUTHORITATIVE gate — it refuses to publish a
+# non-byte-identical nil-node and signs the measurement into Rekor. This workflow re-runs the
+# SAME double-build (deploy/reproducible-build.sh) on a schedule and on demand, so reproducibility
+# drift introduced by a dependency bump / toolchain change is caught BETWEEN releases instead of
+# at tag time. A full clean double-build is ~20-30 min, so it deliberately does NOT run on every
+# PR. Native amd64 runner — Dockerfile.repro pins linux/amd64, the node's architecture.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # nightly ~07:17 UTC (off the top-of-hour cron rush)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reproducibility
+  cancel-in-progress: true
+
+jobs:
+  double-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # reproducible-build.sh derives SOURCE_DATE_EPOCH from HEAD's commit time; the default
+        # shallow checkout includes that, so no extra fetch-depth is needed.
+      - name: Double-build nil-node and assert byte-identical (prints MEASUREMENT)
+        run: ./deploy/reproducible-build.sh
