@@ -199,11 +199,14 @@ mod tests {
     use super::*;
 
     fn tmp_path() -> PathBuf {
+        // A process-unique counter, not a timestamp: two tests in the same binary running in
+        // parallel can land on the same nanosecond and then collide on one path (one test's
+        // teardown races the other's `save`, flaking the run). A monotonic counter guarantees
+        // uniqueness regardless of timing.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
         p.push(format!(
             "nil-config-test-{}-{n}/config.json",
             std::process::id()
