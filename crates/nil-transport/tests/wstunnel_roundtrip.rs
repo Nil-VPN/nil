@@ -146,9 +146,11 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
         grant: None,
     };
     // Generous: the node's Classic McEliece responder_encapsulate is CPU-heavy (tens of seconds in
-    // a debug build) — the PQ exchange now runs inline before the WG handshake.
+    // a debug build) — the PQ exchange runs inline before the WG handshake. CI runs the suite in
+    // parallel, so under CPU contention this is ~5-6x slower than locally (the sibling 2-encapsulation
+    // test flaked at 180s in CI); allow ample headroom while still catching a true hang.
     let session = tokio::time::timeout(
-        Duration::from_secs(120),
+        Duration::from_secs(240),
         transport.connect(target, Grant::mock()),
     )
     .await
@@ -357,9 +359,11 @@ async fn mismatched_pq_psk_fails_the_wstunnel_handshake() {
         grant: None,
     };
     // Generous bound: two McEliece encapsulations happen here (the valid reply + the fresh PSK_B
-    // exchange) before the WG handshake fails. Debug-build McEliece is slow.
+    // exchange) before the WG handshake fails. Debug-build McEliece is slow, and CI runs the suite
+    // in parallel — under CPU contention this is ~5-6x slower than locally (a 180s bound flaked in
+    // CI, timing out at exactly ~182s), so we allow ample headroom while still catching a true hang.
     let result = tokio::time::timeout(
-        Duration::from_secs(180),
+        Duration::from_secs(360),
         transport.connect(target, Grant::mock()),
     )
     .await
