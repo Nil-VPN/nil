@@ -25,6 +25,8 @@ pub mod amneziawg;
 pub mod pqwg;
 #[cfg(feature = "wstunnel")]
 pub mod wstunnel;
+#[cfg(feature = "reality")]
+pub mod reality;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]
@@ -37,3 +39,8 @@ pub use amneziawg::{AmneziaWgConfig, AmneziaWgTransport, ObfsParams};
 pub use pqwg::{PqWgCore, PqWgTransport, WgKeypair, WgStep};
 #[cfg(feature = "wstunnel")]
 pub use wstunnel::{derive_request_path, WstunnelConfig, WstunnelTransport};
+#[cfg(feature = "reality")]
+pub use reality::{
+    derive_auth_id, read_record_from, write_record_to, RealityConfig, RealityTransport,
+    REALITY_AUTH_ID_LEN,
+};
