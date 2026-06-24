@@ -40,25 +40,28 @@ else
 fi
 
 GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
-STMT="$OUT/attestation.intoto.json"
-cat > "$STMT" <<JSON
+# `cosign attest-blob --predicate` expects the PREDICATE OBJECT ONLY — cosign builds the in-toto
+# Statement itself (subject = the signed blob, predicateType from --type). Passing a full Statement
+# made cosign read {_type,predicateType,subject,predicate} as the predicate and fail validation.
+# This is a reproducible-build MEASUREMENT attestation (a binary SHA-256), not SLSA provenance, so
+# we use a custom predicate type rather than overclaiming slsaprovenance.
+PRED="$OUT/predicate.json"
+cat > "$PRED" <<JSON
 {
-  "_type": "https://in-toto.io/Statement/v1",
-  "predicateType": "https://slsa.dev/provenance/v1",
-  "subject": [{ "name": "nil-node", "digest": { "sha256": "$MEASUREMENT" } }],
-  "predicate": {
-    "buildType": "https://nilvpn/reproducible-build/v1",
-    "builder": { "id": "deploy/reproducible-build.sh" },
-    "metadata": { "gitCommit": "$GIT_COMMIT", "toolchain": "rust 1.96.0", "measurementKind": "dev-binary-sha256" }
-  }
+  "buildType": "https://nilvpn.com/reproducible-build/v1",
+  "builder": { "id": "https://github.com/Nil-VPN/nil/.github/workflows/release-attest.yml" },
+  "measurement": "$MEASUREMENT",
+  "measurementKind": "dev-binary-sha256",
+  "gitCommit": "$GIT_COMMIT",
+  "toolchain": "rust 1.96.0"
 }
 JSON
-echo "  attestation → $STMT"
+echo "  predicate → $PRED"
 
 case "$MODE" in
   offline)
     echo; echo "==> OFFLINE (dry run) — would publish to Rekor with:"
-    echo "    cosign attest-blob --yes --type slsaprovenance --predicate $STMT \\"
+    echo "    cosign attest-blob --yes --type custom --predicate $PRED \\"
     echo "      --bundle nil-node.attestation.bundle <nil-node binary>"
     echo "  Pin the resulting Rekor log index in the Coordinator (NW_PINNED_MEASUREMENT=$MEASUREMENT)."
     ;;
@@ -81,9 +84,16 @@ case "$MODE" in
     fi
     # Keyless: Fulcio issues a short-lived cert from the CI OIDC identity and the entry lands in
     # the public Rekor log; the bundle carries the inclusion proof + Rekor log index.
-    cosign attest-blob --yes --type slsaprovenance --predicate "$STMT" \
-      --bundle "$OUT/nil-node.attestation.bundle" "$OUT/nil-node"
-    echo "  published to Rekor (keyless); bundle → $OUT/nil-node.attestation.bundle"
+    BUNDLE="$OUT/nil-node.attestation.bundle"
+    # FAIL-CLOSED: a publish error MUST fail the workflow. A measurement that wasn't actually
+    # anchored can never report success — that would defeat the whole transparency guarantee
+    # (and is exactly the masked-failure bug this replaces).
+    if ! cosign attest-blob --yes --type custom --predicate "$PRED" \
+         --bundle "$BUNDLE" "$OUT/nil-node"; then
+      echo "Rekor publish FAILED — measurement NOT anchored"; exit 1
+    fi
+    [ -s "$BUNDLE" ] || { echo "no Rekor bundle produced — publish did not complete"; exit 1; }
+    echo "  published to Rekor (keyless); bundle → $BUNDLE"
     echo "  pin NW_PINNED_MEASUREMENT=$MEASUREMENT in the Coordinator (and the Rekor index from the bundle)."
     ;;
   *) echo "unknown mode: $MODE (use offline|real)"; exit 1 ;;
