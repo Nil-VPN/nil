@@ -7,6 +7,12 @@
 //!   - `NW_NODE_WG_PUB` set → inner PQ-WireGuard over a single MASQUE hop (spec §4.2);
 //!   - otherwise → a single plain MASQUE hop.
 //!
+//! A Coordinator-redeemed path (`NW_COORDINATOR_URL`) takes priority and is the production
+//! multi-hop default (entry/middle/exit, exercised end-to-end by `deploy/verify-e2e.sh`); a single
+//! configured node is the explicit fallback and logs an honest "this is NOT trust-split" warning
+//! unless `NW_FORCE_SINGLE_HOP=1` acknowledges it (PD-8). Endpoint rotation and all-PQ-per-hop
+//! intermediate forwarding are tracked trust-split follow-ups (see `nil-transport::path`).
+//!
 //! The datapath sizes the TUN from the tunnel's *negotiated* MTU, so the `mtu` here is only a
 //! ceiling.
 
@@ -310,6 +316,16 @@ fn params_from_env() -> Result<TunnelParams> {
     })
 }
 
+/// Whether the resolved path is effectively single-hop: no path at all, or a path of fewer than
+/// two hops. A single-hop tunnel is **not** trust-split — the one node sees BOTH the client's IP
+/// and the destination, so this is a privacy property the operator/user must be told about (PD-8).
+/// Multi-hop nested-MASQUE trust-split (entry/middle/exit) is the production default and is
+/// exercised end-to-end by the Docker data-plane e2e harness (`deploy/verify-e2e.sh`); single-hop
+/// is only the explicit fallback.
+fn is_single_hop(path: &Option<Vec<NodeEndpoint>>) -> bool {
+    path.as_ref().map_or(true, |hops| hops.len() < 2)
+}
+
 /// Build a network-aware [`SelectorTransport`] + [`TunnelConfig`] for a single configured node
 /// (`NW_SELECTOR`). The selector probes the path then orders the cascade fast-first (Clean) or
 /// resistant-first (Hostile); the resistant rungs are always the tail (so a wrong "clean" guess
@@ -401,6 +417,27 @@ fn assemble(
     p: TunnelParams,
     path: Option<Vec<NodeEndpoint>>,
 ) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    // Honest single-hop disclosure (PD-8): a single-hop tunnel is not trust-split — the one node
+    // sees both the client IP and the destination. Warn unless the operator has explicitly
+    // acknowledged it (NW_FORCE_SINGLE_HOP). `env_flag` accepts only "1"/"true". No PII in the log.
+    if is_single_hop(&path) && !nil_core::net::env_flag("NW_FORCE_SINGLE_HOP") {
+        // Tailor the remediation: if a Coordinator IS configured, "set NW_COORDINATOR_URL" is wrong
+        // advice (it returned a 1-hop path) — the fix is operator-side. Only suggest configuring a
+        // Coordinator when there isn't one.
+        if std::env::var("NW_COORDINATOR_URL").is_ok() {
+            tracing::warn!(
+                "single-hop path: this node sees BOTH your IP and your destination — NOT \
+                 trust-split. The Coordinator returned a single-hop path (multi-hop is the next \
+                 milestone). Set NW_FORCE_SINGLE_HOP=1 to acknowledge and silence this warning."
+            );
+        } else {
+            tracing::warn!(
+                "single-hop mode: this node sees BOTH your IP and your destination — NOT \
+                 trust-split. Set NW_COORDINATOR_URL for a multi-hop path, or NW_FORCE_SINGLE_HOP=1 \
+                 to acknowledge and silence this warning."
+            );
+        }
+    }
     let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) = if let Some(
         hops,
     ) = path
@@ -591,6 +628,20 @@ mod tests {
             expected: None,
             wg_pub: None,
         }
+    }
+
+    #[test]
+    fn single_hop_detection_drives_the_honest_disclosure() {
+        // The PD-8 disclosure fires for no-path and 1-hop; a >=2-hop path is trust-split and silent.
+        assert!(is_single_hop(&None), "no path is single-hop");
+        assert!(
+            is_single_hop(&Some(vec![NodeEndpoint::loopback()])),
+            "a 1-hop path is single-hop (one node sees IP + destination)"
+        );
+        assert!(
+            !is_single_hop(&Some(vec![NodeEndpoint::loopback(), NodeEndpoint::loopback()])),
+            "a 2-hop path is trust-split (no honest-disclosure warning)"
+        );
     }
 
     #[test]

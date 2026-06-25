@@ -138,8 +138,10 @@ fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEn
             resp.hops.len()
         );
     }
-    if resp.hops.len() == 1 {
-        // Honest about the limit (SOUL §6): one hop is not trust-split.
+    if resp.hops.len() == 1 && !nil_core::net::env_flag("NW_FORCE_SINGLE_HOP") {
+        // Honest about the limit (SOUL §6): one hop is not trust-split. Gated by NW_FORCE_SINGLE_HOP
+        // so that flag is the SINGLE acknowledgement that silences single-hop disclosure across both
+        // this redeem path and `launch::assemble` (no asymmetric warn fatigue).
         tracing::warn!(
             "single-hop path: the exit node sees BOTH your IP and your destination — NOT trust-split \
              (acceptable only for the single-hop alpha; trust-split is the next milestone)"
