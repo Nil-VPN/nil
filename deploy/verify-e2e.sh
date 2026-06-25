@@ -163,6 +163,17 @@ else
       echo "  PASS: real traffic flows Portal-issued → Coordinator-granted → onion → $DEST"
     else
       echo "  FAIL: no traffic through the granted onion"; fail=1
+      # Diagnostics for this intermittent failure: the handshake succeeded ("tunnel up") but NO data
+      # traversed the 3-hop onion (HTTP 000 for the whole probe window). The client log alone can't
+      # show WHERE — entry/middle/exit — the data dies, so dump each hop's log + the coordinator's and
+      # the client's tunnel routing. Runs only on this failure path; never affects a passing run.
+      echo "================ DIAGNOSTICS (intermittent onion no-traffic) ================"
+      for svc in coordinator entry middle exit; do
+        echo "---- $svc log (tail 40) ----"
+        $DC logs --tail 40 "$svc" 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g'
+      done
+      echo "---- client tunnel addr + routes ----"
+      $DC exec -T client sh -c 'ip -br addr show nil0; ip route show' 2>/dev/null
     fi
   fi
 fi
