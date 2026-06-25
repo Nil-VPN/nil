@@ -93,9 +93,16 @@ pub fn appraise(
     })
 }
 
-/// Wall-clock seconds since the Unix epoch, for TDX collateral validity. A skewed clock can
-/// at worst widen acceptance of out-of-date collateral; replay is stopped by the nonce, not
-/// the clock (documented limitation, architecture spec §5).
+/// Wall-clock seconds since the Unix epoch, for TDX collateral validity. On a clock error this
+/// fails CLOSED: it returns a far-future value (`u64::MAX / 2`) so an unknown clock treats the
+/// collateral as past its validity window (→ out-of-date / refused) rather than the old `0`, which
+/// reads as "before any window" and could widen acceptance of stale collateral. The sentinel is
+/// `MAX/2`, not `MAX`, to leave headroom in case the DCAP verifier adds a leeway to `now` (no
+/// overflow). Replay of a report within a valid window is stopped by the per-connection nonce, not
+/// the clock — a separate axis (architecture spec §5).
 fn now_unix() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX / 2)
 }

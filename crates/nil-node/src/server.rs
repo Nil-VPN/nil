@@ -536,8 +536,16 @@ fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result
     let grant_hex = header_value(headers, connectip::TUNNEL_GRANT_HEADER.as_bytes())
         .ok_or("missing tunnel grant")?;
     let grant = connectip::from_hex(&grant_hex).ok_or("malformed tunnel grant")?;
-    let verified = nil_core::grant::verify(&grant, key, &binding, nil_core::grant::now_unix_secs())
-        .map_err(|_| "invalid tunnel grant")?;
+    // Fail CLOSED on a broken clock: `now_unix_secs_for_expiry` returns u64::MAX on a clock error,
+    // so an expired grant is rejected rather than accepted (a plain `now = 0` would make `exp < now`
+    // always false → every expired grant accepted, defeating the TTL).
+    let verified = nil_core::grant::verify(
+        &grant,
+        key,
+        &binding,
+        nil_core::grant::now_unix_secs_for_expiry(),
+    )
+    .map_err(|_| "invalid tunnel grant")?;
     if verified.nonce != nonce {
         return Err("tunnel grant nonce mismatch");
     }

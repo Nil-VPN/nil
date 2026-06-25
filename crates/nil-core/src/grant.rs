@@ -88,11 +88,29 @@ pub fn binding_for(tee: Tee, measurement: &[u8]) -> String {
     format!("{tee}:{}", to_hex(measurement))
 }
 
+/// Current Unix time in seconds. On the (essentially impossible) clock-before-1970 error this
+/// returns 0 — the FAIL-CLOSED choice for ISSUANCE and TTL housekeeping: a grant or pending record
+/// stamped at `now = 0` lands in the distant past, so it is born-expired / immediately prunable
+/// rather than long-lived. To test whether a deadline has already PASSED (a gate), use
+/// [`now_unix_secs_for_expiry`] instead — it returns a far-future value on the same error so an
+/// unknown clock treats every deadline as expired (refuse), which is fail-closed for a gate.
 pub fn now_unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| Duration::from_secs(0))
         .as_secs()
+}
+
+/// Current Unix time for EXPIRY checks (e.g. the node's grant-verification gate). Identical to
+/// [`now_unix_secs`] except it fails CLOSED for a "has this deadline passed?" test: on a clock
+/// error it returns `u64::MAX`, so `exp < now` fires for any real `exp` and the credential is
+/// treated as expired → refuse. NEVER use this for MINTING — minting at `now = u64::MAX` would
+/// (via `saturating_add`) produce a never-expiring grant, i.e. fail OPEN.
+pub fn now_unix_secs_for_expiry() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(u64::MAX)
 }
 
 pub fn mint(
@@ -225,6 +243,19 @@ mod tests {
         assert!(matches!(
             verify(&tampered, KEY, "sev-snp:abcd", 100),
             Err(GrantError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn unknown_clock_fails_closed_for_expiry() {
+        // The expiry gate must REFUSE when the clock is unknown. `now_unix_secs_for_expiry()`
+        // returns u64::MAX on a clock error, and `verify` with that `now` treats any real grant as
+        // expired — so a node whose clock is broken rejects rather than accepting an expired grant
+        // (the old `now = 0` fallback made `exp < 0` always false → accepted everything: fail-open).
+        let grant = mint(KEY, "sev-snp:abcd", [1u8; 32], Duration::from_secs(60), 100).unwrap();
+        assert!(matches!(
+            verify(&grant.token, KEY, "sev-snp:abcd", u64::MAX),
+            Err(GrantError::Expired)
         ));
     }
 

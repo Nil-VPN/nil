@@ -26,7 +26,13 @@ impl RateLimiter {
     /// exceeded. The window resets when it has fully elapsed for that key.
     pub fn check(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut buckets = self.buckets.lock().expect("rate limiter mutex");
+        // Recover from a poisoned lock instead of panicking (no unwrap/expect in non-test code, and
+        // a poisoned rate-limiter must not take down the issue endpoint). Mirrors the coordinator's
+        // ratelimit: the bucket map is plain counters, so a poisoned guard's data is still usable.
+        let mut buckets = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Opportunistic GC so a flood of distinct keys can't grow the map without bound.
         if buckets.len() > 4096 {
             buckets.retain(|_, (start, _)| now.duration_since(*start) < self.window);
