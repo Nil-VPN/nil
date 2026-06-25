@@ -159,25 +159,25 @@ impl NodeRegistry {
     /// selector consumes it via [`live_nodes`]. Exercised by the unit tests.
     #[allow(dead_code)] // health-checker seam: wired by tests now, by a probe task in deployment.
     pub fn mark_down(&self, host: &str) {
-        if let Ok(mut dead) = self.dead.lock() {
-            dead.insert(host.to_string());
-        }
+        // Recover the set even from a poisoned lock (a panicked health checker doesn't corrupt the
+        // HashSet) — otherwise a `mark_down` would be silently dropped after a poison, leaving a dead
+        // node admitted to selection (fail-open).
+        self.dead.lock().unwrap_or_else(|e| e.into_inner()).insert(host.to_string());
     }
 
     /// Mark `host` back up (health), re-admitting it to selection.
     #[allow(dead_code)] // health-checker seam (see `mark_down`).
     pub fn mark_up(&self, host: &str) {
-        if let Ok(mut dead) = self.dead.lock() {
-            dead.remove(host);
-        }
+        self.dead.lock().unwrap_or_else(|e| e.into_inner()).remove(host);
     }
 
     fn live_nodes(&self) -> Vec<&RegistryNode> {
-        let dead = self.dead.lock().ok();
-        self.nodes
-            .iter()
-            .filter(|n| dead.as_ref().map(|d| !d.contains(&n.host)).unwrap_or(true))
-            .collect()
+        // FAIL-CLOSED: recover the dead-set even from a poisoned lock rather than treating every node
+        // (including the dead ones) as live. A panic in a health-checker task while holding this lock
+        // must NOT silently re-admit nodes the checker marked unreachable — that would break the
+        // trust-split guarantee that verified-dead nodes are excluded from path selection.
+        let dead = self.dead.lock().unwrap_or_else(|e| e.into_inner());
+        self.nodes.iter().filter(|n| !dead.contains(&n.host)).collect()
     }
 
     /// Select an ordered `hops`-long path whose operators are ALL distinct AND whose
@@ -436,6 +436,36 @@ mod tests {
         // Recovery: marking it back up restores the 3-hop path.
         reg.mark_up("c");
         assert!(reg.select_path(3).is_some(), "marked back up → path returns");
+    }
+
+    #[test]
+    fn poisoned_dead_lock_still_excludes_dead_nodes() {
+        // A health-checker task that panics while holding the dead-set lock poisons it. The selector
+        // must STILL exclude the dead node (fail-closed) — not re-admit every node because the lock
+        // is poisoned (the bug: `.lock().ok()...unwrap_or(true)`).
+        let reg = NodeRegistry {
+            nodes: vec![
+                node("a", "op-a", "US"),
+                node("b", "op-b", "DE"),
+                node("c", "op-c", "CH"),
+            ],
+            dead: Default::default(),
+        };
+        reg.mark_down("c");
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = reg.dead.lock().expect("lock");
+            panic!("simulate a health-checker panic while holding the dead-set lock");
+        }));
+        assert!(poisoned.is_err(), "the dead-set lock is now poisoned");
+        // The dead node must NOT reappear in a path despite the poison.
+        let path = reg.select_path(2).expect("2-hop path from the two live nodes");
+        assert!(
+            path.iter().all(|h| h.host != "c"),
+            "fail-closed: a poisoned lock must not re-admit the dead node"
+        );
+        // And health updates still apply after poison (into_inner recovery, not a silent no-op).
+        reg.mark_up("c");
+        assert!(reg.select_path(3).is_some(), "mark_up applies even after poison");
     }
 
     #[test]
