@@ -21,6 +21,7 @@ nil-attest = { workspace = true }      # shared RA-TLS binding/codec (anti-drift
 nil-crypto = { workspace = true }      # PQ hybrid PSK responder (KEM encapsulate)
 boringtun = { workspace = true }        # WireGuard static keys (x25519)
 sha2 = { workspace = true }             # HMAC for stateless QUIC Retry address-validation tokens
+subtle = { workspace = true }           # constant-time byte comparison (grant nonce, auth path)
 quiche = { workspace = true }
 tun-rs = { workspace = true }
 rcgen = { workspace = true }

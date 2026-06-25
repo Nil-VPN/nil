@@ -14,6 +14,7 @@ use tun_rs::AsyncDevice;
 use boringtun::x25519::StaticSecret;
 use nil_transport::connectip;
 use nil_transport::pqwg::{WgKeypair, WgStep};
+use subtle::ConstantTimeEq;
 
 use crate::cert::DevCert;
 use crate::config::NodeConfig;
@@ -546,7 +547,10 @@ fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result
         nil_core::grant::now_unix_secs_for_expiry(),
     )
     .map_err(|_| "invalid tunnel grant")?;
-    if verified.nonce != nonce {
+    // Constant-time, for uniformity with the rest of the auth path (the grant HMAC and the
+    // attestation report_data/measurement are already compared constant-time). The nonce isn't a
+    // secret a holder can't already see, so this is hygiene/consistency rather than a live oracle.
+    if !bool::from(verified.nonce.ct_eq(&nonce)) {
         return Err("tunnel grant nonce mismatch");
     }
     Ok(())

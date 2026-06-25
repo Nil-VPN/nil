@@ -13,6 +13,9 @@ use std::time::Duration;
 /// Bound on the TLS+WS+preface handshake. A peer that connects and then stalls (slowloris) or
 /// never sends its pubkey preface must not occupy the single-client slot indefinitely.
 const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Deadline for the PQ KEM encapsulation (Classic McEliece is CPU-heavy — can take ~seconds). It
+/// runs on a blocking thread; this bounds how long a hostile offer can occupy one.
+const WS_PQ_ENCAP_TIMEOUT: Duration = Duration::from_secs(30);
 
 use boringtun::x25519::{PublicKey, StaticSecret};
 use futures_util::{SinkExt, StreamExt};
@@ -140,7 +143,19 @@ async fn serve<S>(
                 mlkem_ek: parts[0].clone(),
                 mceliece_pk: parts[1].clone(),
             };
-            let Ok((cts, psk)) = responder_encapsulate(&offer) else { return };
+            // Classic McEliece encapsulation is CPU-heavy (can take ~seconds in debug). Run it on a
+            // blocking thread with a deadline so a hostile/valid-but-expensive offer can't peg an
+            // async worker and stall the node (including Ctrl-C). A timeout / join error / KEM error
+            // all drop the connection (fail-closed; the slot frees; no PII logged).
+            let (cts, psk) = match tokio::time::timeout(
+                WS_PQ_ENCAP_TIMEOUT,
+                tokio::task::spawn_blocking(move || responder_encapsulate(&offer)),
+            )
+            .await
+            {
+                Ok(Ok(Ok(pair))) => pair,
+                _ => return,
+            };
             if ws
                 .send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
                 .await
