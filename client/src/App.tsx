@@ -94,7 +94,16 @@ function App() {
         <EmailSignupScreen busy={busy} onSubmit={handleEmail} onBack={() => setScreen("firstrun")} />
       )}
       {screen === "phrase" && account && (
-        <RecoveryPhraseScreen account={account} onContinue={() => setScreen("main")} />
+        // Drop the recovery phrase / code / account number from app state once the user leaves the
+        // display screen — the frontend has no further need for them, so they must not linger in the
+        // JS heap (DevTools / heap dump / XSS reach) for the rest of the session (SOUL §3, PD-2).
+        <RecoveryPhraseScreen
+          account={account}
+          onContinue={() => {
+            setAccount(null);
+            setScreen("main");
+          }}
+        />
       )}
       {screen === "recover" && (
         <RecoverAccountScreen busy={busy} onSubmit={handleRecover} onBack={() => setScreen("firstrun")} />

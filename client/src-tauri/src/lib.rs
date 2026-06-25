@@ -152,12 +152,21 @@ async fn token_balance(store: State<'_, TokenStore>) -> Result<usize, String> {
     store.count().map_err(|e| e.to_string())
 }
 
+/// A payment reference is a short opaque id (UUID / checkout reference, ~32–64 bytes). Reject
+/// anything implausibly long at the IPC boundary so a hostile/compromised WebView can't make the
+/// client allocate + serialize + transmit a huge string before the Portal's own body limit rejects
+/// it (defense-in-depth — don't defer hostile-input rejection to the network).
+const MAX_PAYMENT_ID: usize = 256;
+
 #[tauri::command]
 async fn buy_tokens(
     payment_id: String,
     config: State<'_, ConfigState>,
     store: State<'_, TokenStore>,
 ) -> Result<usize, String> {
+    if payment_id.len() > MAX_PAYMENT_ID {
+        return Err("payment id too long".to_string());
+    }
     // One token per confirmed payment (the Portal enforces it). Top up with a new payment id.
     let token = TokenClient::with_base_url(config.get().portal_url)
         .acquire(&payment_id)
