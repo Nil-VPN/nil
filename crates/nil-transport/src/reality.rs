@@ -42,6 +42,23 @@
 //!     the cert can still distinguish this from the site named in the SNI. Closing that gap is the
 //!     uTLS-ClientHello-forgery + cert-stealing reverse-proxy work tracked for a later phase.
 //!
+//! ## Alpha decision (why the TLS-borrow is deferred, not faked)
+//! Both the full TLS-borrow (forged ClientHello + a pass-through relay that hands an active prober
+//! the *real* site's certificate) and the lighter "browser-fingerprint-only" variant require the
+//! client to emit a **custom ClientHello** (a real-browser JA3/JA4, with the auth tag carried in the
+//! TLS `SessionId` so the node can tell a key-holder from a prober *before* it responds). `rustls`
+//! does not expose ClientHello customisation, so closing this gap needs either a vetted
+//! ClientHello-capable TLS dependency (a forked/patched stack — a supply-chain commitment) or a
+//! hand-rolled ClientHello plus a TLS-*shaped* channel (no real TLS session). For the alpha we
+//! deliberately ship **neither**: an unreviewed forked TLS stack or a half-baked hand-rolled TLS
+//! would be *more* fingerprintable and harder to audit than an honest "this rung's outer shape is a
+//! real, self-signed TLS session" — and that cuts against PD-5/PD-8. What is deferred is this rung's
+//! **unobservability to an active prober**, NOT its security: the inner PQ-capable WireGuard
+//! ([`crate::pqwg::PqWgCore`]) is the cryptographic boundary, so the rung is safe to use today as
+//! the cascade's last-resort fallback. The network-aware selector (the `selector` feature) routes
+//! to it on a hostile network; its honest limit (a determined active prober can still distinguish
+//! it from the named site) must be stated wherever the rung is described.
+//!
 //! ## PQ status (same honest limitation as the wstunnel rung)
 //! This rung runs *classical* WireGuard (`PqWgCore::without_psk`, X25519 only); it does NOT carry
 //! the post-quantum hybrid PSK the default MASQUE transport does. The reliable TLS byte stream
