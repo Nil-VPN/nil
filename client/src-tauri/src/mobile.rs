@@ -49,6 +49,16 @@ pub struct StartArgs {
     pub grant_nonce_hex: String,
 }
 
+// Mobile kill-switch (honest model): the native datapath is ALWAYS fail-closed *while connected* —
+// the VpnService/PacketTunnel captures the default route (`0.0.0.0/0` + `::/0`) so nothing bypasses
+// the TUN, and the engine blackholes the TUN if the tunnel drops. That posture is unconditional, so
+// there is no per-connection "block without VPN" StartArg (an earlier `block_without_vpn: bool` was
+// hardcoded `true`, never read by the Kotlin/Swift side, and conflated with `setBlocking`, which is
+// only the fd's I/O mode — it implied a configurable control that did not exist; PD-8). The PERSISTENT
+// guarantee — block traffic when the VPN *process* is down — is the OS "Always-on VPN / Block
+// connections without VPN" SYSTEM setting, which an app can deep-link the user to but cannot silently
+// enable; the UI must be honest about that. See the Android/iOS DEVICE_VERIFY notes.
+
 #[derive(Debug, thiserror::Error)]
 pub enum MobileError {
     #[error("no connection token — buy one before connecting")]

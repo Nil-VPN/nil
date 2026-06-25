@@ -193,13 +193,18 @@ async fn set_split_tunnel(enabled: bool, apps: Vec<String>) -> Result<(), String
 
 #[tauri::command]
 fn toggle_kill_switch(enabled: bool, config: State<'_, ConfigState>) -> Result<(), String> {
-    // The kill-switch is enforced by the datapath (`NW_KILLSWITCH`, armed atomically by the
-    // tunnel) — so the toggle persists into config and takes effect on the next connect. The
-    // platform hook stays for future per-OS toggles (e.g. mobile always-on).
+    // The kill-switch is enforced by the datapath (`NW_KILLSWITCH`, armed atomically by the tunnel)
+    // and takes effect on the next connect. `set_enabled` is a no-op platform seam (see
+    // `killswitch`); the env write is done ONLY by `config.update` below, which flips `kill_switch`
+    // and writes `NW_KILLSWITCH` UNDER the config write lock — so a concurrent connect/`reapply_env`
+    // can never observe a half-applied value, AND a concurrent full `set_config` save can't
+    // lost-update it (the whole read-modify-write runs under the lock, not the old get→mutate→set
+    // that spanned two lock acquisitions). (An earlier unlocked env write in `set_enabled` raced
+    // `reapply_env` and could leave the switch OFF — fail-open.)
     killswitch::set_enabled(enabled).map_err(|e| e.to_string())?;
-    let mut cfg = config.get();
-    cfg.kill_switch = enabled;
-    config.set(cfg).map_err(|e| e.to_string())
+    config
+        .update(|cfg| cfg.kill_switch = enabled)
+        .map_err(|e| e.to_string())
 }
 
 /// Register the native VPN datapath plugin on mobile. The Kotlin `NilVpnPlugin` (and the iOS

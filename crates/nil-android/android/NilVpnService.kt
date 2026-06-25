@@ -48,6 +48,12 @@ class NilVpnService : VpnService() {
         val consent = VpnService.prepare(this)
         Log.i(TAG, "VpnService.prepare -> ${if (consent == null) "AUTHORIZED(null)" else "NOT-AUTHORIZED(consent needed)"}")
 
+        // Kill-switch (in-session): capturing the full default route below sends ALL traffic into
+        // the TUN, and the Rust engine blackholes the TUN if the tunnel drops — so traffic fails
+        // closed while connected, unconditionally (there is no per-connection toggle). setBlocking
+        // is the fd's I/O mode, NOT the kill-switch. The PERSISTENT guarantee (block when this VPN
+        // process is down) is the OS "Always-on VPN / Block connections without VPN" system setting,
+        // which the app can deep-link the user to but cannot enable on its own.
         val tun = try {
             Builder()
                 .setSession("NIL VPN")

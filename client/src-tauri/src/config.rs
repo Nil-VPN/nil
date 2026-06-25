@@ -187,6 +187,23 @@ impl ConfigState {
         Ok(())
     }
 
+    /// Atomically read-modify-write a single setting: apply `f` to the current config, then persist
+    /// and re-apply to the env — all UNDER the write lock. A partial setter (e.g. the kill-switch
+    /// toggle) must NOT do `let c = get(); c.field = x; set(c)`: that read-modify-write spans two
+    /// separate lock acquisitions, so a concurrent `set` from the Settings screen interleaving
+    /// between them lost-updates one of the two writes (the toggle's stale snapshot would revert
+    /// the Settings save, or vice-versa). Holding the lock across the whole cycle closes that race;
+    /// disk and in-memory state change only if the save succeeds.
+    pub fn update<F: FnOnce(&mut ClientConfig)>(&self, f: F) -> std::io::Result<()> {
+        let mut g = self.cfg.write().expect("config lock poisoned");
+        let mut new = g.clone();
+        f(&mut new);
+        new.save(&self.path)?;
+        new.apply_env();
+        *g = new;
+        Ok(())
+    }
+
     /// Re-apply the current config to the env (called before connect so the datapath always reads
     /// the latest endpoints/toggles).
     pub fn reapply_env(&self) {
@@ -253,6 +270,31 @@ mod tests {
         ClientConfig::live_defaults().save(&path).expect("save");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "config holds endpoints; keep it owner-only");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn update_changes_only_the_targeted_field_and_persists() {
+        // The atomic partial-update path: flip one field, leave the rest intact, and round-trip
+        // through disk. (This is the writer toggle_kill_switch uses instead of get-mutate-set, so a
+        // concurrent full `set` can't lost-update it — the whole RMW runs under the write lock.)
+        let path = tmp_path();
+        let mut base = ClientConfig::live_defaults();
+        base.coordinator_url = "https://ctrl.example.test".into();
+        let state = ConfigState {
+            cfg: RwLock::new(base.clone()),
+            path: path.clone(),
+        };
+        assert!(base.kill_switch, "precondition: default on");
+        state.update(|c| c.kill_switch = false).expect("update persists");
+
+        let live = state.get();
+        assert!(!live.kill_switch, "targeted field changed");
+        assert_eq!(live.coordinator_url, base.coordinator_url, "other fields preserved");
+        // And it survives a reload from disk.
+        let reloaded = ClientConfig::load(&path);
+        assert!(!reloaded.kill_switch);
+        assert_eq!(reloaded.coordinator_url, base.coordinator_url);
         let _ = std::fs::remove_file(&path);
     }
 
