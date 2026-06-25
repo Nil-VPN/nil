@@ -98,6 +98,11 @@ jobs:
       - name: wstunnel round-trip (nil-transport wstunnel)
         run: cargo test -p nil-transport --features wstunnel --locked
 
+      # Fast-path perf gate: per-packet hotpath throughput + correctness + no-regression floor +
+      # no-PII bench output (the baseline the Linux GSO/GRO follow-up will be measured against).
+      - name: Fast-path perf gate (nil-transport fast-path)
+        run: cargo test -p nil-transport --features fast-path --locked
+
       # Clustered double-spend nullifier: single-use insert + NoTls non-loopback refusal guard.
       - name: Coordinator nullifier (nil-coordinator postgres)
         run: cargo test -p nil-coordinator --features postgres --locked
