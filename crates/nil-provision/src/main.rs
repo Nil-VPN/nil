@@ -171,11 +171,14 @@ async fn main() -> Result<()> {
             break;
         }
     }
-    // No identifiers in the error — just the status and how to proceed.
+    // No identifiers in the error — just the status and how to proceed. The payment reference is a
+    // payment index (PD-3/PD-4); it must not be echoed into an error that lands on stderr / CI logs
+    // / shell history. The caller still has it in NW_PAYMENT_ID, so we guide the retry without
+    // reprinting the value.
     match last_status {
         402 => anyhow::bail!(
-            "payment for reference {payment_id} not confirmed after {attempts} attempt(s). Pay it, \
-             then re-run with NW_PAYMENT_ID={payment_id} (or raise NW_CHECKOUT_POLL_ATTEMPTS)."
+            "payment not confirmed after {attempts} attempt(s); pay the reference shown at checkout, \
+             then re-run with the same NW_PAYMENT_ID (or raise NW_CHECKOUT_POLL_ATTEMPTS)."
         ),
         409 => anyhow::bail!("a token was already issued for this payment reference"),
         429 => anyhow::bail!(
