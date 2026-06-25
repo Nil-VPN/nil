@@ -17,6 +17,16 @@ compile_error!(
      (hardware-attested) node with the synthetic test-report provider compiled in."
 );
 
+// `dev-trace` compiles in per-packet data-plane diagnostic counters (dev/staging only). It must
+// NEVER be built into a hardware-attested production node: it would change the reproducible-build
+// measurement (so clients fail closed) and add data-plane log volume the production datapath must
+// not carry. Refuse the combination at compile time — prod images build `hw-attest` ONLY (PD-2/PD-5).
+#[cfg(all(feature = "hw-attest", feature = "dev-trace"))]
+compile_error!(
+    "nil-node: `dev-trace` must never be compiled into a `hw-attest` production node — it is a \
+     dev/staging-only diagnostic build (changes the measurement; adds data-plane logging)."
+);
+
 use nil_core::Tee;
 
 /// What this node attests to. Populated from the environment (the operator sets it from the

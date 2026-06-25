@@ -9,6 +9,43 @@ use std::sync::{Arc, Mutex};
 use nil_proto::path::{Hop, Tee};
 use serde::Deserialize;
 
+/// The position a node occupies in a path. A node's *egress capability* is physical and fixed by how
+/// its operator configured it (see `nil-node`'s `exit.rs`): an `Exit` node opens egress to the whole
+/// internet; an `Entry`/`Middle` node only ever forwards QUIC to the *next NIL node* (UDP/443) and
+/// DROPs everything else (the open-relay guard). So a path's LAST hop — the one that decapsulates the
+/// user's real IP packets and must route them to an arbitrary destination — can only be served by an
+/// `Exit`-capable node. Selection therefore matches each position to a role-compatible node; getting
+/// this wrong silently black-holes the data plane (a non-egress node at the exit DROPs the traffic).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    Entry,
+    Middle,
+    Exit,
+}
+
+impl Role {
+    fn parse(s: &str) -> Option<Role> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "entry" => Some(Role::Entry),
+            "middle" => Some(Role::Middle),
+            "exit" => Some(Role::Exit),
+            _ => None,
+        }
+    }
+
+    /// The role required at position `i` of a `hops`-long path: first is the entry, last is the exit
+    /// (the only egress hop), the rest are middles. A 1-hop path is a lone exit (it must egress).
+    fn for_position(i: usize, hops: usize) -> Role {
+        if i + 1 == hops {
+            Role::Exit
+        } else if i == 0 {
+            Role::Entry
+        } else {
+            Role::Middle
+        }
+    }
+}
+
 /// On-disk node registry entry (`NW_NODE_REGISTRY` JSON). `tee` defaults to `sev-snp`.
 #[derive(Debug, Deserialize)]
 struct RegistryFileNode {
@@ -21,6 +58,13 @@ struct RegistryFileNode {
     jurisdiction: String,
     #[serde(default)]
     wg_pub: Option<String>,
+    /// The node's configured position capability (`"entry"`/`"middle"`/`"exit"`), matching its
+    /// `NW_NODE_ROLE`. Optional for back-compat: a node with no `role` is treated as universal (it
+    /// may fill any position). A registry that declares roles MUST give them honestly — only an
+    /// `exit`-role node has the open egress an exit position needs; placing a non-exit node there
+    /// black-holes the data plane.
+    #[serde(default)]
+    role: Option<String>,
 }
 
 fn default_tee() -> String {
@@ -39,9 +83,18 @@ pub struct RegistryNode {
     /// Jurisdiction (country / legal regime). Two hops must never share one.
     pub jurisdiction: String,
     pub wg_pub: Option<String>,
+    /// Position capability (see [`Role`]). `None` = universal (may fill any position) — the
+    /// back-compat default for registries that don't declare roles.
+    pub role: Option<Role>,
 }
 
 impl RegistryNode {
+    /// Whether this node may serve at a path position requiring `pos`. A node with no declared role
+    /// is universal (back-compat); a declared role must equal the position's required role.
+    fn fills(&self, pos: Role) -> bool {
+        self.role.map_or(true, |r| r == pos)
+    }
+
     fn to_hop(&self) -> Hop {
         Hop {
             host: self.host.clone(),
@@ -122,6 +175,23 @@ impl NodeRegistry {
                 operator: d.operator,
                 jurisdiction: d.jurisdiction,
                 wg_pub: d.wg_pub,
+                role: {
+                    let parsed = d.role.as_deref().and_then(Role::parse);
+                    // A PRESENT-but-unrecognized role (a typo like "exi"/"egress") would otherwise
+                    // degrade silently to universal (None) — which lets a non-egress node land at the
+                    // exit position and black-hole the data plane. Warn loudly so the misconfig is
+                    // visible. (Logs only the role string — a config value, no user-linkable data.)
+                    if parsed.is_none() {
+                        if let Some(r) = &d.role {
+                            tracing::warn!(
+                                "node registry: unrecognized role {r:?}; treating this node as \
+                                 universal (placeable at ANY position, including exit) — fix the role \
+                                 to entry/middle/exit"
+                            );
+                        }
+                    }
+                    parsed
+                },
             })
             .collect();
         Ok(Self {
@@ -134,7 +204,7 @@ impl NodeRegistry {
     /// trust-split 3-hop path. A real deployment loads this from the node registry.
     pub fn dev_default() -> Self {
         let m = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f";
-        let mk = |host: &str, op: &str, jur: &str| RegistryNode {
+        let mk = |host: &str, op: &str, jur: &str, role: Role| RegistryNode {
             host: host.into(),
             port: 443,
             tee: Tee::SevSnp,
@@ -142,13 +212,14 @@ impl NodeRegistry {
             operator: op.into(),
             jurisdiction: jur.into(),
             wg_pub: None,
+            role: Some(role),
         };
         Self {
             nodes: vec![
-                mk("entry.us.example", "op-anvil", "US"),
-                mk("middle.de.example", "op-borealis", "DE"),
-                mk("exit.ch.example", "op-cirrus", "CH"),
-                mk("alt.se.example", "op-dune", "SE"),
+                mk("entry.us.example", "op-anvil", "US", Role::Entry),
+                mk("middle.de.example", "op-borealis", "DE", Role::Middle),
+                mk("exit.ch.example", "op-cirrus", "CH", Role::Exit),
+                mk("alt.se.example", "op-dune", "SE", Role::Exit),
             ],
             dead: DeadHosts::default(),
         }
@@ -204,9 +275,10 @@ impl NodeRegistry {
         }
     }
 
-    /// Depth-first search with backtracking: try each remaining candidate that keeps operators and
-    /// jurisdictions all-distinct; recurse; undo on a dead end. Candidate order is already shuffled,
-    /// so the first complete path found is a random valid one.
+    /// Depth-first search with backtracking: try each remaining candidate that (a) is role-compatible
+    /// with the position being filled — crucially, the LAST hop (exit) only accepts an egress-capable
+    /// node — and (b) keeps operators and jurisdictions all-distinct; recurse; undo on a dead end.
+    /// Candidate order is already shuffled, so the first complete path found is a random valid one.
     fn extend_path<'a>(
         candidates: &[&'a RegistryNode],
         hops: usize,
@@ -215,7 +287,13 @@ impl NodeRegistry {
         if chosen.len() == hops {
             return true;
         }
+        let pos = Role::for_position(chosen.len(), hops);
         for node in candidates {
+            // The exit position needs open egress; entry/middle only relay QUIC. A node may only
+            // fill a position its configured role permits (an undeclared role is universal).
+            if !node.fills(pos) {
+                continue;
+            }
             let clash = chosen
                 .iter()
                 .any(|c| c.operator == node.operator || c.jurisdiction == node.jurisdiction);
@@ -344,6 +422,7 @@ mod tests {
                     operator: "op-x".into(),
                     jurisdiction: "US".into(),
                     wg_pub: None,
+                    role: None,
                 },
                 RegistryNode {
                     host: "b".into(),
@@ -353,6 +432,7 @@ mod tests {
                     operator: "op-x".into(),
                     jurisdiction: "DE".into(),
                     wg_pub: None,
+                    role: None,
                 },
             ],
             dead: Default::default(),
@@ -364,7 +444,8 @@ mod tests {
         assert!(reg.select_path(1).is_some(), "a single hop is always fine");
     }
 
-    /// Build a node with a distinct operator/jurisdiction (test helper).
+    /// Build a node with a distinct operator/jurisdiction (test helper). Role-less = universal, so
+    /// these exercise the pure operator/jurisdiction diversity logic independent of position roles.
     fn node(host: &str, op: &str, jur: &str) -> RegistryNode {
         RegistryNode {
             host: host.into(),
@@ -374,6 +455,7 @@ mod tests {
             operator: op.into(),
             jurisdiction: jur.into(),
             wg_pub: None,
+            role: None,
         }
     }
 
@@ -516,6 +598,64 @@ mod tests {
             operator: op,
             jurisdiction: jur,
             wg_pub: None,
+            role: None,
         }
+    }
+
+    /// Build a node with an explicit position role (test helper).
+    fn role_node(host: &str, op: &str, jur: &str, role: Role) -> RegistryNode {
+        RegistryNode { role: Some(role), ..node(host, op, jur) }
+    }
+
+    /// The regression guard for the trust-split data-plane bug: when nodes declare roles, the EXIT
+    /// position must always land on an egress-capable (`exit`-role) node — never an entry/middle node
+    /// (whose open-relay guard would silently DROP the user's real egress traffic, HTTP 000). Run many
+    /// times because selection is randomized; every valid path must still end at the exit node.
+    #[test]
+    fn exit_position_always_gets_an_egress_capable_node() {
+        let reg = NodeRegistry {
+            nodes: vec![
+                role_node("entry", "op-a", "US", Role::Entry),
+                role_node("middle", "op-b", "DE", Role::Middle),
+                role_node("exit", "op-c", "CH", Role::Exit),
+            ],
+            dead: Default::default(),
+        };
+        for _ in 0..200 {
+            let path = reg.select_path(3).expect("a 3-hop role-correct diverse path exists");
+            assert_eq!(path.len(), 3);
+            assert_eq!(path[0].host, "entry", "entry position → entry-role node");
+            assert_eq!(path[1].host, "middle", "middle position → middle-role node");
+            assert_eq!(path[2].host, "exit", "exit position → the only egress-capable node");
+        }
+    }
+
+    /// If no egress-capable node exists, selection must REFUSE (None) rather than hand back a path
+    /// that ends at a non-exit node — fail-closed beats a silently-black-holed data plane.
+    #[test]
+    fn refuses_when_no_exit_capable_node_exists() {
+        let reg = NodeRegistry {
+            nodes: vec![
+                role_node("entry", "op-a", "US", Role::Entry),
+                role_node("middle", "op-b", "DE", Role::Middle),
+            ],
+            dead: Default::default(),
+        };
+        assert!(reg.select_path(2).is_none(), "no exit-capable node → no path");
+    }
+
+    /// Back-compat: a registry with NO declared roles still selects (every node is universal), so
+    /// existing role-less deployments are unaffected by the position constraint.
+    #[test]
+    fn role_less_registry_is_universal() {
+        let reg = NodeRegistry {
+            nodes: vec![
+                node("a", "op-a", "US"),
+                node("b", "op-b", "DE"),
+                node("c", "op-c", "CH"),
+            ],
+            dead: Default::default(),
+        };
+        assert_eq!(reg.select_path(3).map(|p| p.len()), Some(3));
     }
 }

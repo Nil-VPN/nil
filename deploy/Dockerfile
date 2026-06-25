@@ -20,8 +20,8 @@ COPY . .
 # `--locked` pins the committed Cargo.lock (required for reproducibility).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked -p nil-node --features synthetic-attest && \
-    cargo build --release --locked -p nil-cli --features synthetic-attest && \
+    cargo build --release --locked -p nil-node --features synthetic-attest,dev-trace && \
+    cargo build --release --locked -p nil-cli --features synthetic-attest,dev-trace && \
     mkdir -p /out && \
     cp target/release/nil-node target/release/nil-cli /out/
 

@@ -19,6 +19,9 @@ synthetic-attest = ["launch", "nil-transport/synthetic-attest"]
 # Network-aware transport selection (NW_SELECTOR): probe-then-order the cascade fast/resistant.
 # Pulls the REALITY rung + the selector module so launch.rs can assemble both paths.
 selector = ["launch", "nil-transport/selector", "nil-transport/reality"]
+# DEV/STAGING ONLY: client-side data-plane diagnostic counters (TUN pump in/out) + the transport's
+# diagnostics. PII-free counts only; never in a release client.
+dev-trace = ["launch", "nil-transport/dev-trace"]
 
 [dependencies]
 nil-core = { workspace = true }

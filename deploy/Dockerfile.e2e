@@ -16,8 +16,8 @@ WORKDIR /build
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked -p nil-node --features synthetic-attest && \
-    cargo build --release --locked -p nil-cli --features synthetic-attest && \
+    cargo build --release --locked -p nil-node --features synthetic-attest,dev-trace && \
+    cargo build --release --locked -p nil-cli --features synthetic-attest,dev-trace && \
     cargo build --release --locked -p nil-portal && \
     cargo build --release --locked -p nil-coordinator && \
     cargo build --release --locked -p nil-provision && \

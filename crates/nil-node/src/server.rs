@@ -76,6 +76,10 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
     let mut tun_buf = vec![0u8; 65535];
     let mut out = vec![0u8; MAX_UDP_PAYLOAD];
 
+    // Dev/staging-only PII-free data-plane counters (feature `dev-trace`; compiled out of prod).
+    #[cfg(feature = "dev-trace")]
+    let mut diag = crate::devtrace::Diag::new(cfg.role);
+
     loop {
         let min_timeout = clients
             .values()
@@ -112,6 +116,8 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         // us a partial-checksum forwarded packet) → (PQ-WireGuard encapsulate, if
                         // enabled) → encapsulate to the client as a CONNECT-IP datagram.
                         nil_core::checksum::fix_l4_checksums(&mut tun_buf[..n]);
+                        #[cfg(feature = "dev-trace")]
+                        diag.record_tun_reply(n);
                         let dst = packet_dst_ip(&tun_buf[..n]);
                         if let Some(client_id) = dst.and_then(|ip| client_routes.get(&ip).cloned()) {
                             if let Some(client) = clients.get_mut(&client_id).filter(|c| c.tunnel_up) {
@@ -121,7 +127,15 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                                 };
                                 if let Some(pl) = payload {
                                     let dg = connectip::encode_datagram(client.flow_id, &pl);
-                                    let _ = client.conn.dgram_send(&dg);
+                                    let _send = client.conn.dgram_send(&dg);
+                                    #[cfg(feature = "dev-trace")]
+                                    match _send {
+                                        Ok(()) => diag.record_to_client(dg.len()),
+                                        Err(_) => {
+                                            let lim = client.conn.dgram_max_writable_len().unwrap_or(0);
+                                            diag.record_to_client_drop(dg.len(), dg.len() > lim);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -135,6 +149,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                 }
             }
         }
+
+        #[cfg(feature = "dev-trace")]
+        diag.tick();
 
         // Drive H3 + the control channel, then bring inbound client datagrams to the TUN
         // (PQ-WireGuard-decapsulating them first when that layer is active).
@@ -158,6 +175,8 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             while let Ok(n) = client.conn.dgram_recv(&mut buf) {
                 raw.push(buf[..n].to_vec());
             }
+            #[cfg(feature = "dev-trace")]
+            diag.record_from_client(raw.len(), raw.iter().map(Vec::len).sum());
             let mut net_replies: Vec<Vec<u8>> = Vec::new();
             for dg in raw {
                 let Ok((_fid, payload)) = connectip::decode_datagram(&dg) else {
@@ -193,9 +212,19 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             }
             for r in net_replies {
                 let dg = connectip::encode_datagram(client.flow_id, &r);
-                let _ = client.conn.dgram_send(&dg);
+                let _send = client.conn.dgram_send(&dg);
+                #[cfg(feature = "dev-trace")]
+                match _send {
+                    Ok(()) => diag.record_to_client(dg.len()),
+                    Err(_) => {
+                        let lim = client.conn.dgram_max_writable_len().unwrap_or(0);
+                        diag.record_to_client_drop(dg.len(), dg.len() > lim);
+                    }
+                }
             }
         }
+        #[cfg(feature = "dev-trace")]
+        diag.record_to_tun(to_tun.len(), to_tun.iter().map(Vec::len).sum());
         for pkt in &to_tun {
             let _ = tun.send(pkt).await;
         }

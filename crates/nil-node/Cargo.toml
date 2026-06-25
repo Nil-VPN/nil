@@ -13,6 +13,10 @@ synthetic-attest = ["nil-attest/synthetic"]
 # Production: fetch a real SEV-SNP/TDX report from the kernel (Linux configfs-TSM). No extra
 # deps (plain std fs). Compile-checked in CI; only EXERCISED on real TEE hardware.
 hw-attest = []
+# DEV/STAGING ONLY: compile in PII-free data-plane diagnostic counters (per-role forwarding
+# packet/byte counts) to localize where traffic dies in the onion. NEVER shipped to production —
+# `attest.rs` `compile_error!`s on `dev-trace + hw-attest`, and prod images build `hw-attest` only.
+dev-trace = ["nil-transport/dev-trace"]
 
 [dependencies]
 nil-core = { workspace = true }

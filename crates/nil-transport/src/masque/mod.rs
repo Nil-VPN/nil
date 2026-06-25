@@ -698,6 +698,19 @@ async fn driver_run(
                                                     assigned = assigned_ip.is_some(),
                                                     "MASQUE CONNECT-IP established"
                                                 );
+                                                // Dev/staging-only: the negotiated usable MTU for
+                                                // THIS hop. For a nested onion each hop shrinks it
+                                                // (~72 B/hop); the innermost value is the end-to-end
+                                                // tunnel MTU — a too-tight margin over the 1200 QUIC
+                                                // floor is a prime suspect for data-not-flowing.
+                                                #[cfg(feature = "dev-trace")]
+                                                tracing::info!(
+                                                    flow_id,
+                                                    max_dgram_payload = mdp,
+                                                    usable_mtu = mdp
+                                                        .saturating_sub(connectip::MAX_FRAMING_OVERHEAD),
+                                                    "dev-trace: negotiated tunnel MTU"
+                                                );
                                             }
                                         }
                                         Err(e) => {

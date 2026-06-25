@@ -35,6 +35,11 @@ selector = ["reality", "wstunnel"]
 # batching it measures is a Linux-runtime follow-up (Linux-only + unsafe-syscall-heavy — not built
 # blind on a non-Linux host, per PD-5).
 fast-path = ["pqwg"]
+# DEV/STAGING ONLY: PII-free data-plane diagnostic counters (client send/recv packet+byte counts,
+# negotiated per-hop MTU) to localize where onion traffic dies. Pure marker — diagnostics live
+# inside already-`masque`-gated code, log only counts/sizes/flow_id (never addresses/tokens, so
+# `no_pii_in_logs` stays green). Never enabled in a release/prod build.
+dev-trace = []
 
 [dependencies]
 nil-core = { workspace = true }

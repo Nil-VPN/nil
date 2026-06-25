@@ -135,6 +135,29 @@ jobs:
       - name: hw-attest compile-check (nil-node)
         run: cargo build -p nil-node --features hw-attest --locked
 
+      # Dev/staging data-plane diagnostics (`dev-trace`): build + test the node, client, transport,
+      # and datapath with it on, so the PII-free counters can't bitrot.
+      - name: dev-trace diagnostics (node + cli + transport + datapath)
+        run: |
+          cargo test -p nil-node --features synthetic-attest,dev-trace --locked
+          cargo test -p nil-cli --features synthetic-attest,dev-trace --locked
+          cargo test -p nil-transport --features masque,pqwg,dev-trace --locked
+          cargo test -p nil-datapath --features synthetic-attest,dev-trace --locked
+
+      # PROD-SAFETY TRIPWIRE: `dev-trace` must NEVER reach a production node. (1) compiling it with
+      # `hw-attest` must FAIL (the `attest.rs` compile_error); (2) the production Dockerfiles must not
+      # reference `dev-trace`. Both are asserted here so a prod build can never ship the diagnostics.
+      - name: dev-trace excluded from production
+        run: |
+          if cargo build -p nil-node --features hw-attest,dev-trace --locked 2>/dev/null; then
+            echo "FAIL: nil-node compiled with hw-attest + dev-trace (the compile_error guard is missing)"; exit 1
+          fi
+          echo "OK: hw-attest + dev-trace is a compile_error"
+          if grep -n "dev-trace" deploy/Dockerfile.node deploy/Dockerfile.repro; then
+            echo "FAIL: a production Dockerfile references dev-trace"; exit 1
+          fi
+          echo "OK: production Dockerfiles do not reference dev-trace"
+
   # The desktop client's React frontend: type-check (tsc), bundle (vite), and the vitest unit
   # tests (fail-closed token gate, buy/settings flows). The Rust side is covered by `check`.
   frontend:

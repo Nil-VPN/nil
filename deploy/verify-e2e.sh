@@ -38,11 +38,14 @@ fi
 echo "  issuer pubkey: ${PUBKEY:0:32}… (${#PUBKEY} hex chars)"
 
 echo "==> write the Coordinator node registry (3 operator/jurisdiction-diverse nodes, all pinned to \$M)"
+# Each node's `role` MUST match its NW_NODE_ROLE: only the exit node has open egress, so path
+# selection must place it at the exit (last) position — an entry/middle node there DROPs the user's
+# real egress traffic (the open-relay guard) and the data plane silently black-holes (HTTP 000).
 $DC exec -T coordinator sh -c 'cat > /tmp/registry.json' <<EOF
 [
-  {"host":"$ENTRY","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-a","jurisdiction":"jur-a"},
-  {"host":"$MIDDLE","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-b","jurisdiction":"jur-b"},
-  {"host":"$EXIT","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-c","jurisdiction":"jur-c"}
+  {"host":"$ENTRY","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-a","jurisdiction":"jur-a","role":"entry"},
+  {"host":"$MIDDLE","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-b","jurisdiction":"jur-b","role":"middle"},
+  {"host":"$EXIT","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-c","jurisdiction":"jur-c","role":"exit"}
 ]
 EOF
 
@@ -174,6 +177,16 @@ else
       done
       echo "---- client tunnel addr + routes ----"
       $DC exec -T client sh -c 'ip -br addr show nil0; ip route show' 2>/dev/null
+      # Per-hop reverse-path state: the dev-trace counters localize WHICH hop stops forwarding replies;
+      # these show WHY at the kernel level — the FORWARD/MASQUERADE packet counters (does the reply-path
+      # `-o nil0 ACCEPT` see the packets, or does the `-i nil0 DROP` fire?) and the NAT/conntrack table
+      # (is the next-hop reply being un-NATed back toward the tunnel, or black-holed at the host?).
+      for svc in entry middle exit; do
+        echo "---- $svc iptables FORWARD + nat POSTROUTING (-v counters) ----"
+        $DC exec -T "$svc" sh -c 'iptables -L FORWARD -v -n; echo; iptables -t nat -L POSTROUTING -v -n' 2>/dev/null
+        echo "---- $svc conntrack (count + sample) ----"
+        $DC exec -T "$svc" sh -c 'c=$(grep -c "" /proc/net/nf_conntrack 2>/dev/null || echo 0); echo "entries: $c"; head -8 /proc/net/nf_conntrack 2>/dev/null' 2>/dev/null
+      done
     fi
   fi
 fi

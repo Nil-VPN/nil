@@ -10,6 +10,9 @@ description = "NIL VPN headless client: brings up a MASQUE tunnel through a node
 # Test/dev only: accept the node's synthetic attestation report (Docker harness). A release
 # nil-cli never enables this, so synthetic reports are rejected as an unsupported TEE.
 synthetic-attest = ["nil-transport/synthetic-attest", "nil-datapath/synthetic-attest"]
+# DEV/STAGING ONLY: turn on the client-side PII-free data-plane diagnostic counters (via datapath +
+# transport). Never enabled in a release nil-cli.
+dev-trace = ["nil-datapath/dev-trace"]
 
 [dependencies]
 nil-core = { workspace = true }

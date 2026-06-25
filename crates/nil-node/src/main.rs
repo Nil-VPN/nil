@@ -12,6 +12,8 @@ mod amneziawg;
 mod attest;
 mod cert;
 mod config;
+#[cfg(feature = "dev-trace")]
+mod devtrace;
 mod exit;
 #[cfg(feature = "hw-attest")]
 mod hw;
