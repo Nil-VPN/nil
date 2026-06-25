@@ -46,6 +46,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let s = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "10.74.0.1")
         s.ipv4Settings = NEIPv4Settings(addresses: ["10.74.0.2"], subnetMasks: ["255.255.255.0"])
         s.ipv4Settings?.includedRoutes = [NEIPv4Route.default()]
+        // IPv6 leak fix (Epic 9): the engine is IPv4-only, so capture all IPv6 into the tunnel with a
+        // ULA address + a v6 default route. v6 packets entering the engine are dropped, preventing the
+        // device's ISP-assigned IPv6 from leaking around the tunnel. (IPv6 is disabled while connected.)
+        s.ipv6Settings = NEIPv6Settings(addresses: ["fd00:6e69:6c00::2"], networkPrefixLengths: [64])
+        s.ipv6Settings?.includedRoutes = [NEIPv6Route.default()]
         s.dnsSettings = NEDNSSettings(servers: ["1.1.1.1"])
         let mtu = nil_negotiated_mtu(tunnel)
         s.mtu = NSNumber(value: mtu == 0 ? 1280 : Int(mtu))

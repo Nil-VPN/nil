@@ -30,8 +30,10 @@ class NilVpnService : VpnService() {
         val grantNonce = intent.getStringExtra("grantNonceHex") ?: ""
         val allowUnattested = intent.getBooleanExtra("allowUnattested", false)
         val teeName = intent.getStringExtra("teeName") ?: "sev-snp"
-        // No grant/nonce VALUES in logs (they're a bearer credential + freshness nonce) — only lengths.
-        Log.i(TAG, "extras node=$nodeHost:$nodePort server=$serverName measLen=${measurement.length} tee=$teeName grantLen=${grant.length} allowUnattested=$allowUnattested")
+        // SOUL §3 / PD-2: the node address (host/port/SNI) is a "destination" and MUST NOT reach
+        // logcat (readable via adb / READ_LOGS apps / crash reporters) — it would link user→node→time.
+        // The grant/nonce are a bearer credential + freshness nonce; log only lengths, never values.
+        Log.i(TAG, "extras measLen=${measurement.length} tee=$teeName grantLen=${grant.length} allowUnattested=$allowUnattested")
 
         try {
             startForeground(NOTIF_ID, notification())
@@ -51,7 +53,13 @@ class NilVpnService : VpnService() {
                 .setSession("NIL VPN")
                 .setMtu(MTU)
                 .addAddress("10.74.0.2", 24)
-                .addRoute("0.0.0.0", 0)        // route everything through the tunnel (fail-closed)
+                .addRoute("0.0.0.0", 0)        // route all IPv4 through the tunnel (fail-closed)
+                // IPv6 leak fix (Epic 9): the Rust engine is IPv4-only, so give the TUN a ULA v6
+                // address + a v6 default route. All IPv6 is then captured into the TUN and DROPPED by
+                // the engine — preventing the device's ISP-assigned IPv6 from leaking AROUND the
+                // tunnel. (Honest tradeoff: IPv6 connectivity is disabled while connected.)
+                .addAddress("fd00:6e69:6c00::2", 64)
+                .addRoute("::", 0)
                 .addDnsServer("1.1.1.1")
                 .setBlocking(true)
                 .establish()

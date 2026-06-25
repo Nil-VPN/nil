@@ -410,13 +410,17 @@ impl Transport for MasqueTransport {
 
 /// Resolve a [`NodeEndpoint`] to a socket address.
 async fn resolve(target: &NodeEndpoint) -> Result<SocketAddr> {
+    // PII-free errors: never embed the node host/port in an error string. These errors propagate
+    // up and are logged on the client (e.g. into Android logcat via the nil-android FFI boundary),
+    // and the node address is routing metadata we deliberately keep out of logs (PD-2/PD-3). The
+    // resolver's `{e}` is an OS-level category ("Name or service not known"), not the host name.
     let host_port = format!("{}:{}", target.host, target.port);
-    let mut addrs = tokio::net::lookup_host(host_port.clone())
+    let mut addrs = tokio::net::lookup_host(host_port)
         .await
-        .map_err(|e| Error::Transport(format!("resolve {host_port}: {e}")))?;
+        .map_err(|e| Error::Transport(format!("resolve node endpoint: {e}")))?;
     addrs
         .next()
-        .ok_or_else(|| Error::Transport(format!("no address for {host_port}")))
+        .ok_or_else(|| Error::Transport("no address resolved for node endpoint".into()))
 }
 
 /// Build the appraisal policy from a node endpoint's pinned attestation expectation, if any.
