@@ -103,3 +103,15 @@ strip = true
 # for a stable nil-node measurement (deploy/reproducible-build.sh). Slower, but the reproducibly
 # built binary must match the one whose measurement is pinned + appraised.
 codegen-units = 1
+
+# Build the heavy post-quantum KEM crates OPTIMIZED even in the dev/test profile. Unoptimized
+# Classic McEliece keygen/encapsulation is ~100x slower (tens of seconds), which made the PQ
+# handshake tests (e.g. mismatched_pq_psk_fails_the_wstunnel_handshake) flake on their timeout under
+# CI parallel-test CPU contention — twice, even after widening the bounds. Optimizing just these two
+# dependency crates makes the crypto run at release speed in tests while our own crates stay
+# unoptimized (fast compile). This affects ONLY the dev profile; the `release` profile above — and
+# therefore the reproducible-build measurement — is unchanged.
+[profile.dev.package.classic-mceliece-rust]
+opt-level = 3
+[profile.dev.package.ml-kem]
+opt-level = 3
