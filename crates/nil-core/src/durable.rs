@@ -20,6 +20,27 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+/// Open `path` creating it owner-only (`0600`) on Unix. These files hold sensitive tokens — the
+/// Coordinator's spent-token nullifier messages and the Portal's payment references — which must not
+/// be world-readable: a local user could otherwise read them and enumerate redemption/checkout
+/// activity (PD-2). `append` selects append-vs-truncate. On non-Unix the OS default applies (Windows
+/// ACLs are inherited; the sensitive deployments are Linux nodes/Portal).
+fn open_private<P: AsRef<Path>>(path: P, append: bool) -> io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true);
+    if append {
+        opts.append(true);
+    } else {
+        opts.write(true).truncate(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
 struct Inner {
     seen: HashSet<String>,
     /// Append target; `None` ⇒ memory-only (volatile).
@@ -60,7 +81,7 @@ impl DurableSet {
                 }
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_private(&path, true)?;
         Ok(Self { inner: Mutex::new(Inner { seen, file: Some(file) }), path: Some(path) })
     }
 
@@ -176,7 +197,7 @@ impl EpochDurableSet {
                 }
             }
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = open_private(&path, true)?;
         // One-shot legacy fold-in (durable), then remove the legacy file.
         if let Some(lp) = legacy_path {
             if let Ok(f) = File::open(lp) {
@@ -282,7 +303,7 @@ impl EpochDurableSet {
             let compact = || -> io::Result<()> {
                 {
                     let mut f =
-                        OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+                        open_private(&tmp, false)?;
                     for (k, e) in &survivors {
                         f.write_all(format!("{e} {k}\n").as_bytes())?;
                     }
@@ -312,7 +333,7 @@ impl EpochDurableSet {
             // The reopen is then best-effort: on failure keep the previous handle (the next insert/
             // drop or a restart rebinds it). Done under the lock, so no insert can race the swap.
             inner.seen.retain(|_, e| retained.contains(e));
-            if let Ok(f) = OpenOptions::new().create(true).append(true).open(path) {
+            if let Ok(f) = open_private(path, true) {
                 inner.file = Some(f);
             }
             return Ok(to_drop);
@@ -381,7 +402,7 @@ impl TimedDurableSet {
                 }
             }
         }
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let file = open_private(&path, true)?;
         Ok(Self { inner: Mutex::new(TimedInner { seen, file: Some(file) }), path: Some(path) })
     }
 
@@ -446,7 +467,7 @@ impl TimedDurableSet {
             let compact = || -> io::Result<()> {
                 {
                     let mut f =
-                        OpenOptions::new().create(true).write(true).truncate(true).open(&tmp)?;
+                        open_private(&tmp, false)?;
                     for (k, t) in &survivors {
                         f.write_all(format!("{k} {t}\n").as_bytes())?;
                     }
@@ -477,7 +498,7 @@ impl TimedDurableSet {
             // next insert/prune or a restart rebinds it; memory already matches disk, so the only
             // effect of a stale handle is that a subsequent insert may fail to persist — which is
             // fail-closed for issuance (a non-durable pending ref is forgotten on restart).
-            if let Ok(f) = OpenOptions::new().create(true).append(true).open(path) {
+            if let Ok(f) = open_private(path, true) {
                 inner.file = Some(f);
             }
             return Ok(to_drop);
@@ -498,6 +519,29 @@ mod tests {
     fn temp_path() -> PathBuf {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("nil-durable-test-{}-{n}.log", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_backed_sets_are_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let p1 = temp_path();
+        let _ = std::fs::remove_file(&p1);
+        let s = DurableSet::open(&p1).expect("open");
+        s.insert("k").unwrap();
+        assert_eq!(mode(&p1), 0o600, "nullifier/issued log must be owner-only");
+        drop(s);
+        let _ = std::fs::remove_file(&p1);
+
+        let p2 = temp_path();
+        let _ = std::fs::remove_file(&p2);
+        let t = TimedDurableSet::open(&p2).expect("open");
+        t.insert("ref", 1).unwrap();
+        assert_eq!(mode(&p2), 0o600, "pending-reference set must be owner-only");
+        drop(t);
+        let _ = std::fs::remove_file(&p2);
     }
 
     #[test]

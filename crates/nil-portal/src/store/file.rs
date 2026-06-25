@@ -84,7 +84,17 @@ impl FileStore {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let tmp = self.path.with_extension("tmp");
         {
-            let mut f = std::fs::File::create(&tmp)?;
+            // Owner-only (0600) on Unix: the account store holds every account's H(secret) lookup
+            // key; a world-readable file would let any local process enumerate registered accounts.
+            // The rename preserves the temp's inode + mode, so the final file inherits 0600.
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&tmp)?;
             f.write_all(&json)?;
             f.flush()?;
             f.sync_all()?; // fsync the temp data BEFORE the rename, or a crash can leave it unflushed
@@ -139,6 +149,19 @@ mod tests {
 
     fn record(byte: u8, ent: Entitlement) -> AccountRecord {
         AccountRecord { account_number: [byte; 32], recovery_code_hash: [byte ^ 0xff; 32], entitlement: ent }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn account_store_file_is_owner_only_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let s = FileStore::open(&path).expect("open");
+        s.insert(record(7, Entitlement::None)).await.expect("insert");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "account store holds H(secret) keys — owner-only");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
