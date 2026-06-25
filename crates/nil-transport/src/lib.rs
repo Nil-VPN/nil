@@ -29,6 +29,11 @@ pub mod pqwg;
 pub mod wstunnel;
 #[cfg(feature = "reality")]
 pub mod reality;
+// Network-aware selector: probe the path, then order the cascade fast-first or resistant-first.
+// Pulls the resistant rungs (reality + wstunnel) so a consumer enabling `selector` gets the whole
+// resistant set compiled, not just the trait.
+#[cfg(feature = "selector")]
+pub mod selector;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]
@@ -46,3 +51,5 @@ pub use reality::{
     derive_auth_id, read_record_from, write_record_to, RealityConfig, RealityTransport,
     REALITY_AUTH_ID_LEN,
 };
+#[cfg(feature = "selector")]
+pub use selector::{NetworkProbe, PathClass, Selector, SelectorTransport, UdpReachabilityProbe};

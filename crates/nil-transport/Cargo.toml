@@ -26,6 +26,10 @@ wstunnel = ["pqwg", "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "
 # the TLS is the obfuscation envelope. See `src/reality.rs` for which REALITY properties are / are
 # not yet achieved (the TLS is genuine self-signed, not a borrowed foreign-site handshake).
 reality = ["pqwg", "dep:tokio-rustls", "dep:rustls", "dep:hkdf"]
+# Network-aware selector: probe the path (one identity-free UDP/QUIC reachability datagram) and order
+# the cascade fast-first (Clean) or resistant-first (Hostile). Pulls the full resistant rung set
+# (reality ⇒ pqwg/masque, plus wstunnel) so enabling `selector` gives the whole dual-path cascade.
+selector = ["reality", "wstunnel"]
 # Fast-path performance: the CI throughput gate over the per-packet data-plane hotpath (asserts
 # correctness + a coarse no-regression floor + no PII in bench output). The UDP GSO/GRO kernel
 # batching it measures is a Linux-runtime follow-up (Linux-only + unsafe-syscall-heavy — not built

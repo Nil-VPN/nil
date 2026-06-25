@@ -16,6 +16,9 @@ launch = [
 ]
 # Test/dev only: also accept the node's synthetic attestation report (Docker harness).
 synthetic-attest = ["launch", "nil-transport/synthetic-attest"]
+# Network-aware transport selection (NW_SELECTOR): probe-then-order the cascade fast/resistant.
+# Pulls the REALITY rung + the selector module so launch.rs can assemble both paths.
+selector = ["launch", "nil-transport/selector", "nil-transport/reality"]
 
 [dependencies]
 nil-core = { workspace = true }

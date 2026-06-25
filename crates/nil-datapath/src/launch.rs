@@ -20,6 +20,8 @@ use nil_transport::{
     connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport,
     Transport, WstunnelTransport,
 };
+#[cfg(feature = "selector")]
+use nil_transport::{RealityConfig, RealityTransport, Selector, SelectorTransport, UdpReachabilityProbe};
 
 use crate::TunnelConfig;
 
@@ -78,6 +80,58 @@ fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
         .map(|p| p.parse::<u16>().context("NW_NODE_WSTUNNEL_PORT"))
         .transpose()?;
     Ok(Some(WstunnelTransport::new(wg_pub, host, port)))
+}
+
+/// Parse a fallback rung's WG pubkey (`<pub_var>`, hex) + optional endpoint (`<host_var>` /
+/// `<port_var>`) — the shared shape used by the network-aware selector to build the AmneziaWG and
+/// wstunnel rungs. Unlike [`amneziawg_fallback_from_env`], this is NOT gated on `NW_CASCADE` (the
+/// selector is opt-in via `NW_SELECTOR` instead). `None` ⇒ `<pub_var>` unset (the rung is optional).
+/// A parsed fallback rung endpoint: WG static pubkey + optional host/port override.
+#[cfg(feature = "selector")]
+type WgEndpoint = ([u8; 32], Option<String>, Option<u16>);
+
+#[cfg(feature = "selector")]
+fn parse_wg_endpoint(
+    pub_var: &str,
+    host_var: &str,
+    port_var: &str,
+) -> Result<Option<WgEndpoint>> {
+    let Ok(h) = std::env::var(pub_var) else {
+        return Ok(None);
+    };
+    let bytes = connectip::from_hex(h.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("{pub_var} is not valid hex"))?;
+    let wg_pub: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{pub_var} must be 32 bytes"))?;
+    let host = std::env::var(host_var).ok();
+    let port = std::env::var(port_var)
+        .ok()
+        .map(|p| p.parse::<u16>().with_context(|| port_var.to_string()))
+        .transpose()?;
+    Ok(Some((wg_pub, host, port)))
+}
+
+/// The REALITY cascade rung for the selector's resistant path. Reads `NW_REALITY_WG_PUB` (hex),
+/// endpoint (`NW_REALITY_HOST` / `NW_REALITY_PORT`, defaulting to the primary host / 443), and the
+/// borrowed-site SNI (`NW_REALITY_SNI`). `None` ⇒ `NW_REALITY_WG_PUB` unset (the rung is optional).
+/// Returns the rung AND its except-host (captured from the SINGLE `NW_REALITY_HOST` read), so the
+/// caller's kill-switch exception matches the host the transport actually dials (no second env read
+/// that could TOCTOU-mismatch).
+#[cfg(feature = "selector")]
+fn reality_from_env() -> Result<Option<(RealityTransport, Option<String>)>> {
+    let Some((wg_pub, host, port)) =
+        parse_wg_endpoint("NW_REALITY_WG_PUB", "NW_REALITY_HOST", "NW_REALITY_PORT")?
+    else {
+        return Ok(None);
+    };
+    let sni = std::env::var("NW_REALITY_SNI").ok();
+    let except_host = host.clone();
+    Ok(Some((
+        RealityTransport::with_config(RealityConfig { node_wg_pub: wg_pub, host, port, sni }),
+        except_host,
+    )))
 }
 
 /// Whether the environment configures a real node/path (vs. nothing → the GUI uses loopback).
@@ -256,6 +310,89 @@ fn params_from_env() -> Result<TunnelParams> {
     })
 }
 
+/// Build a network-aware [`SelectorTransport`] + [`TunnelConfig`] for a single configured node
+/// (`NW_SELECTOR`). The selector probes the path then orders the cascade fast-first (Clean) or
+/// resistant-first (Hostile); the resistant rungs are always the tail (so a wrong "clean" guess
+/// steps down, never hard-fails). `primary` is the MASQUE / PQ-WG rung already built by [`assemble`].
+///
+/// `also_except` lists ONLY the hosts of rungs that were actually assembled — same kill-switch
+/// invariant as the static cascade: `NW_SELECTOR` alone never punches an all-ports firewall hole.
+#[cfg(feature = "selector")]
+fn finish_selector(
+    p: TunnelParams,
+    node: NodeEndpoint,
+    primary: Arc<dyn Transport>,
+    base_mtu: u16,
+) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    let mut fast: Vec<Arc<dyn Transport>> = vec![primary.clone()];
+    let mut resistant: Vec<Arc<dyn Transport>> = Vec::new();
+    let mut also_except: Vec<String> = Vec::new();
+    let note_except = |also_except: &mut Vec<String>, host: &Option<String>| {
+        let h = host.clone().unwrap_or_else(|| p.host.clone());
+        if !also_except.contains(&h) {
+            also_except.push(h);
+        }
+    };
+
+    // Fast path: AmneziaWG (UDP, speed-first) after the MASQUE/PQ-WG primary.
+    if let Some((wg, host, port)) =
+        parse_wg_endpoint("NW_NODE_AMNEZIA_WG_PUB", "NW_NODE_AMNEZIA_HOST", "NW_NODE_AMNEZIA_PORT")?
+    {
+        note_except(&mut also_except, &host);
+        fast.push(Arc::new(AmneziaWgTransport::new(wg, host, port)));
+    }
+
+    // Resistant path: REALITY first, then wstunnel.
+    let mut has_resistant = false;
+    if let Some((reality, reality_host)) = reality_from_env()? {
+        note_except(&mut also_except, &reality_host); // single NW_REALITY_HOST read (no TOCTOU)
+        resistant.push(Arc::new(reality));
+        has_resistant = true;
+    }
+    if let Some((wg, host, port)) =
+        parse_wg_endpoint("NW_NODE_WSTUNNEL_WG_PUB", "NW_NODE_WSTUNNEL_HOST", "NW_NODE_WSTUNNEL_PORT")?
+    {
+        note_except(&mut also_except, &host);
+        resistant.push(Arc::new(WstunnelTransport::new(wg, host, port)));
+        has_resistant = true;
+    }
+    // Fail-closed: NW_SELECTOR is for surviving a hostile network, where the fast rungs are skipped
+    // and ONLY the resistant tail runs. With no real resistant rung the tail would be just the
+    // MASQUE primary the probe already deemed unreachable → no connection. Refuse that config at
+    // startup rather than hand the user a silent connectivity hole on a hostile network.
+    if !has_resistant {
+        anyhow::bail!(
+            "NW_SELECTOR requires at least one resistant rung — set NW_REALITY_WG_PUB and/or \
+             NW_NODE_WSTUNNEL_WG_PUB (without one, a hostile network has no working transport)"
+        );
+    }
+    // MASQUE backstop on the resistant tail (the same primary instance — a cheap Arc clone): the
+    // last resort after the real resistant rungs (unreachable on a Clean path, where the fast
+    // primary already leads).
+    resistant.push(primary);
+
+    tracing::info!(
+        fast = fast.len(),
+        resistant = resistant.len(),
+        "network-aware selector enabled (probe → fast/resistant cascade)"
+    );
+    let selector = Selector::new(Arc::new(UdpReachabilityProbe::default()), fast, resistant);
+    let transport: Arc<dyn Transport> = Arc::new(SelectorTransport::new(selector));
+
+    let cfg = TunnelConfig {
+        node,
+        tun_name: p.tun_name,
+        client_ip: p.client_ip,
+        peer_ip: p.peer_ip,
+        prefix: 24,
+        mtu: base_mtu,
+        dns: p.dns,
+        kill_switch: p.kill_switch,
+        also_except,
+    };
+    Ok((transport, cfg))
+}
+
 /// Build the transport + a [`TunnelConfig`] from resolved params + a resolved path. `path` is
 /// `Some` for a trust-split / Coordinator-redeemed path (its first hop is the kill-switch
 /// exception), `None` for a single configured node (which may be wrapped in the obfuscation
@@ -314,6 +451,15 @@ fn assemble(
                 1280,
             )
         };
+        // Network-aware selector (opt-in via NW_SELECTOR): probe the path once, then order the
+        // cascade fast-first (Clean) or resistant-first (Hostile). Only for a single configured
+        // node — the multi-hop path branch above is unaffected. Behind the `selector` feature +
+        // NW_SELECTOR so the static cascade stays the default (back-compat).
+        #[cfg(feature = "selector")]
+        if nil_core::net::env_flag("NW_SELECTOR") {
+            return finish_selector(p, node, primary, base_mtu);
+        }
+
         // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
         // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
         // committing. Each fallback rung is independently optional (a deployment may run

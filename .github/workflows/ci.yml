@@ -98,6 +98,13 @@ jobs:
       - name: wstunnel round-trip (nil-transport wstunnel)
         run: cargo test -p nil-transport --features wstunnel --locked
 
+      # Network-aware selector: probe → fast/resistant rung ordering + step-down + the datapath
+      # NW_SELECTOR wiring (transitively enables reality + wstunnel + pqwg + masque).
+      - name: Selector (nil-transport + nil-datapath selector)
+        run: |
+          cargo test -p nil-transport --features selector --locked
+          cargo build -p nil-datapath --features selector --locked
+
       # Fast-path perf gate: per-packet hotpath throughput + correctness + no-regression floor +
       # no-PII bench output (the baseline the Linux GSO/GRO follow-up will be measured against).
       - name: Fast-path perf gate (nil-transport fast-path)
