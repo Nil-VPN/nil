@@ -12,9 +12,11 @@ regardless of any VPN, and a global passive adversary watching both ends is out 
 scope (that is a mixnet's job). We say so plainly, in the product and in the code.
 
 ## The four pillars
-1. **MASQUE/QUIC default transport** (RFC 9484 CONNECT-IP) — looks like ordinary
-   HTTPS/QUIC on UDP 443; never raw WireGuard. Everything sits behind the `Transport`
-   trait in `nil-transport`.
+1. **Resistance-first transport cascade** — MASQUE/QUIC (RFC 9484 CONNECT-IP) is the
+   primary transport: it looks like ordinary HTTPS/QUIC on UDP 443. If MASQUE is blocked,
+   the cascade falls back through AmneziaWG → wstunnel → REALITY in that order. Raw
+   WireGuard (the 148/92-byte handshake fingerprint) is never exposed directly; every
+   transport lives behind the `Transport` trait in `nil-transport`.
 2. **Verifiable trust via TEE attestation** — the client verifies a node's SEV-SNP/TDX
    report (RA-TLS) against a pinned measurement before any packet flows.
 3. **Trust-split multi-hop** across legally independent operators/jurisdictions.
@@ -53,6 +55,9 @@ an AmneziaWG → wstunnel obfuscation cascade backs up the primary MASQUE rung.
 - With no Coordinator configured, the client falls back to an in-memory loopback transport
   (no real tunnel) so the engine/state machine can be exercised in dev — the UI says so,
   so it never reads as protection it isn't providing.
+- **Automatic transport probing and cascade selection are not yet implemented.** The active
+  rung is operator-configured; the client does not yet probe the network and auto-select the
+  hardest-to-block transport that works.
 
 ## Build & verify
 ```bash
