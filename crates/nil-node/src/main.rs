@@ -33,6 +33,44 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = config::NodeConfig::from_env()?;
+
+    // Production attestation posture (hw-attest build): refuse the dev escape hatches that would let
+    // a real attested node be coerced into an open or fake-attested relay (PD-5/PD-6). These hold
+    // even if an operator sets the env vars by mistake — a hardware node fails closed at startup.
+    #[cfg(feature = "hw-attest")]
+    {
+        if cfg.allow_ungranted {
+            anyhow::bail!(
+                "hw-attest (production) build refuses NW_ALLOW_UNGRANTED — a real attested node must \
+                 require a Coordinator grant and never serve grantless CONNECT-IP (open-relay risk)"
+            );
+        }
+        if cfg.attest.is_none() {
+            anyhow::bail!(
+                "hw-attest (production) build refuses to start without NW_NODE_MEASUREMENT — a real \
+                 attested node must publish the measurement clients pin (else it serves unattested)"
+            );
+        }
+        // The node must be able to produce a COMPLETE attestation evidence blob at startup.
+        // Otherwise it passes the env checks above, accepts QUIC connections, but fails EVERY
+        // attestation silently (report_hex returns None → the client fails closed) while the node
+        // stays "up" — an operational fail-open that looks healthy. Run the whole evidence path once
+        // with throwaway inputs (configfs-TSM report fetch + VCEK/collateral load + encode) and bail
+        // if ANY step fails, surfacing the specific cause: whether configfs-TSM is unavailable
+        // (kernel < 6.7 / not mounted) OR the VCEK/DCAP collateral is unprovisioned, a node that
+        // cannot attest refuses to start rather than serve unattested. (Both are equally fatal — a
+        // missing VCEK makes every report unverifiable just as surely as a missing TSM interface.)
+        if let Some(att) = cfg.attest.as_ref() {
+            if let Err(e) = crate::hw::report_evidence(att.tee, &[0u8; 32], &[0u8; 32]) {
+                anyhow::bail!(
+                    "hw-attest: attestation self-check failed at startup — the node would serve \
+                     unattested (every connection's report would be missing): {e}"
+                );
+            }
+        }
+        tracing::info!("hw-attest production posture: attestation evidence path verified + Coordinator grant required + measurement pinned");
+    }
+
     // `bind`/`egress` are the node operator's own infra addresses (operational, not
     // user-linkable); the tunnel-internal addressing (node/client IPs) is deliberately
     // NOT logged — it reads as user data and the datapath must stay logless (SOUL §3 / PD-3).

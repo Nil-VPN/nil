@@ -6,6 +6,17 @@
 //! the `synthetic-attest` feature mints a report signed by `nil-attest`'s test CA so the
 //! Docker accept/reject harness works without hardware — never enabled in a shipped node.
 
+// A synthetic (test) report provider must NEVER be compiled into a hardware-attested production
+// node. `report_hex` below prefers the synthetic path under `#[cfg(feature = "synthetic-attest")]`,
+// so a build with BOTH features would silently emit test-CA-signed reports that a synthetic-enabled
+// client would accept — i.e. a "production" node that isn't really attested. Refuse the combination
+// at compile time (PD-5: prove, don't pretend).
+#[cfg(all(feature = "hw-attest", feature = "synthetic-attest"))]
+compile_error!(
+    "nil-node: `hw-attest` and `synthetic-attest` are mutually exclusive — never ship a production \
+     (hardware-attested) node with the synthetic test-report provider compiled in."
+);
+
 use nil_core::Tee;
 
 /// What this node attests to. Populated from the environment (the operator sets it from the

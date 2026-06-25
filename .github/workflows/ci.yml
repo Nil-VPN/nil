@@ -125,6 +125,11 @@ jobs:
           cargo test -p nil-datapath --features synthetic-attest --locked
           cargo test -p nil-cli --features synthetic-attest --locked
 
+      # The production hardware-attestation path (configfs-TSM) never RUNS in CI (needs a TEE), but
+      # it must keep compiling so it can't bitrot, and the hw-attest production guards must build.
+      - name: hw-attest compile-check (nil-node)
+        run: cargo build -p nil-node --features hw-attest --locked
+
   # The desktop client's React frontend: type-check (tsc), bundle (vite), and the vitest unit
   # tests (fail-closed token gate, buy/settings flows). The Rust side is covered by `check`.
   frontend:

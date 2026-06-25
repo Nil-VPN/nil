@@ -1,8 +1,13 @@
-//! Self-signed dev TLS cert (Phase 1). quiche loads cert/key from PEM file paths, so we
-//! generate in memory and write to a per-process temp dir (removed on drop).
+//! Self-signed TLS cert for the node's QUIC/MASQUE listener. quiche loads cert/key from PEM file
+//! paths, so we generate in memory and write to a per-process temp dir (removed on drop).
 //!
-//! This is a DEV placeholder — it proves no node identity. RA-TLS (an embedded SEV-SNP/TDX
-//! report appraised by `nil-attest`) replaces it in Phase 2 (spec §5).
+//! The cert is **intentionally self-signed and unverified by PKI**: RA-TLS does not trust a CA, it
+//! trusts the attestation report. The node's per-connection report (delivered over H3 — see
+//! [`crate::attest`]) binds *this cert's* SubjectPublicKeyInfo (SPKI) plus the client's fresh nonce,
+//! and that report — not any certificate chain — is the node's identity proof. So an ephemeral
+//! per-process key is fine: the report always binds the current SPKI. A build with a report provider
+//! (`hw-attest` in production, `synthetic-attest` for the test harness) is fully attested; a build
+//! with neither serves unattested and a pinning client refuses it.
 
 use std::path::PathBuf;
 
@@ -28,8 +33,17 @@ impl DevCert {
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, cert_pem)?;
         std::fs::write(&key_path, key_pem)?;
+        // The cert is self-signed by design (RA-TLS trusts the report, not a CA). It is "attested"
+        // exactly when a report provider is compiled in; say which, honestly (PD-8).
+        #[cfg(any(feature = "hw-attest", feature = "synthetic-attest"))]
+        tracing::info!(
+            "RA-TLS: self-signed TLS cert generated; its SPKI is bound into the per-connection \
+             attestation report (intentionally self-signed — RA-TLS trusts the report, not a CA)"
+        );
+        #[cfg(not(any(feature = "hw-attest", feature = "synthetic-attest")))]
         tracing::warn!(
-            "DEV TLS: self-signed cert generated — NOT attested (Phase 1 dev only; RA-TLS is Phase 2)"
+            "DEV TLS: self-signed cert with NO attestation report provider — a pinning client will \
+             refuse this node; build with `hw-attest` for production"
         );
         Ok(DevCert { cert_path, key_path, spki, dir })
     }
