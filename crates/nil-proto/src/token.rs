@@ -39,6 +39,25 @@ pub struct IssueResponse {
     pub blind_sig: String,
 }
 
+/// `POST /v1/billing/webhook` (Portal): a Merchant-of-Record payment event. The MoR knows the
+/// payer's card identity; NIL receives only the OPAQUE processor transaction id (for the
+/// processor's own replay idempotency) and the server-minted `payment_reference` (the same opaque
+/// value the buyer got from `/v1/billing/checkout`). No card number, email, name, or amount ever
+/// crosses this DTO — the MoR validates the amount on its side; NIL needs only "this reference is
+/// paid / refunded" (PD-3/PD-4: who-pays stays at the MoR, never linked to traffic).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookEvent {
+    /// The processor event class. A confirmed-payment class marks the reference paid; a
+    /// refund/chargeback class revokes it. Unrecognised values are acknowledged and ignored.
+    pub event_type: String,
+    /// The processor's opaque transaction id — only for the processor's idempotent retries.
+    pub transaction_id: String,
+    /// The server-minted checkout reference this payment is for (the buyer passed it as MoR custom
+    /// data). Same opaque 256-bit value `/v1/billing/checkout` returned; indexes a payment, never a
+    /// person.
+    pub payment_reference: String,
+}
+
 /// `POST /v1/redeem` (Coordinator): redeem an unblinded token for a trust-split path. The
 /// Coordinator verifies the token (public key), checks it against the spent-token nullifier
 /// set, and — only on success — returns the path. It learns *that* a valid token was redeemed,
@@ -67,5 +86,25 @@ mod tests {
         assert!(back.contains("payment_reference"));
         // Privacy tripwire: nothing identity- or payment-amount-linkable rides on this DTO.
         assert!(!back.contains("account") && !back.contains("email") && !back.contains("amount"));
+    }
+
+    #[test]
+    fn webhook_event_carries_no_identity_or_amount() {
+        // The MoR webhook DTO must surface ONLY the event class + opaque ids — never card/email/
+        // name/amount, so a hostile/curious Portal log or store can't learn who-pays from it.
+        let ev = WebhookEvent {
+            event_type: "confirmed".into(),
+            transaction_id: "txn_opaque_123".into(),
+            payment_reference: "deadbeef".into(),
+        };
+        let json = serde_json::to_string(&ev).expect("serialize");
+        for forbidden in ["card", "email", "name", "amount", "cardholder", "billing"] {
+            assert!(!json.contains(forbidden), "WebhookEvent must not carry {forbidden:?}");
+        }
+        // And it round-trips by field name from a processor body.
+        let back: WebhookEvent =
+            serde_json::from_str(r#"{"event_type":"refund","transaction_id":"t","payment_reference":"r"}"#)
+                .expect("parse");
+        assert_eq!(back.event_type, "refund");
     }
 }

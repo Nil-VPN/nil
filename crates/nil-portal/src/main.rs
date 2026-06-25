@@ -9,6 +9,8 @@
 mod account;
 mod app;
 mod billing;
+#[cfg(feature = "card-payments")]
+mod cards;
 mod monero;
 mod ratelimit;
 mod state;
@@ -29,6 +31,11 @@ use crate::monero::{MockWatcher, MoneroRpcWatcher, PaymentWatcher};
 use crate::state::AppState;
 use crate::store::{file::FileStore, memory::InMemoryStore, Store};
 use crate::tokens::{token_router, TokenState};
+
+/// (composed payment watcher, optional card rail = (card watcher shared with the composite, the
+/// MoR signing secret)). Aliased so the dual-rail wiring below isn't a clippy::type_complexity wall.
+#[cfg(feature = "card-payments")]
+type WatcherAndCardRail = (Arc<dyn PaymentWatcher>, Option<(Arc<cards::CardWatcher>, Vec<u8>)>);
 
 /// The non-Postgres account-store selection: durable JSON file (`NW_PORTAL_STORE`) or volatile
 /// in-memory (dev only). Shared by both `postgres`-feature configurations.
@@ -140,6 +147,39 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Card (Merchant-of-Record) rail: a signed webhook marks a checkout reference paid/revoked,
+    // mirroring the Monero watcher. DUAL-RAIL — runs alongside Monero so a freeze on one rail can't
+    // down the service. Enabled by NW_CARD_WEBHOOK_SECRET (the MoR's signing secret); unset ⇒
+    // Monero-only. The card watcher only confirms references that `/v1/billing/checkout` minted, and
+    // never sees a card/email/name/account (PD-3/PD-4) — see `cards`.
+    #[cfg(feature = "card-payments")]
+    let (watcher, card_rail): WatcherAndCardRail =
+        match std::env::var("NW_CARD_WEBHOOK_SECRET") {
+            Ok(secret) if !secret.trim().is_empty() => {
+                let revoked = match std::env::var("NW_CARD_REVOKED_PATH") {
+                    Ok(p) => Arc::new(
+                        DurableSet::open(&p)
+                            .map_err(|e| anyhow::anyhow!("open card revoked store {p}: {e}"))?,
+                    ),
+                    // Fail-closed: a volatile revoked set would let a refunded payment be re-issued
+                    // after a restart (the processor retries the confirm; the lost revocation no
+                    // longer blocks it). Refuse to enable the card rail without durable revocation.
+                    Err(_) => anyhow::bail!(
+                        "NW_CARD_REVOKED_PATH must be set when the card-payments rail is enabled \
+                         (NW_CARD_WEBHOOK_SECRET) — card revocations MUST survive restarts"
+                    ),
+                };
+                let card = Arc::new(cards::CardWatcher::new(pending.clone(), revoked));
+                tracing::info!("card (Merchant-of-Record) webhook rail enabled (dual-rail with Monero)");
+                let composite: Arc<dyn PaymentWatcher> = Arc::new(cards::CompositeWatcher::new(vec![
+                    watcher,
+                    card.clone() as Arc<dyn PaymentWatcher>,
+                ]));
+                (composite, Some((card, secret.into_bytes())))
+            }
+            _ => (watcher, None),
+        };
+
     // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning
     // (a restart with a volatile set could re-issue a token for an already-spent payment).
     let token_state = match std::env::var("NW_ISSUED_PATH") {
@@ -194,14 +234,19 @@ async fn main() -> Result<()> {
         }
     });
 
-    let app = app::router(AppState::new(store))
+    #[allow(unused_mut)] // `mut` is only needed when the card-payments feature merges its router.
+    let mut app = app::router(AppState::new(store))
         .merge(token_router(token_state.clone()))
-        .merge(billing::billing_router(token_state))
-        .layer(TraceLayer::new_for_http());
+        .merge(billing::billing_router(token_state));
+    #[cfg(feature = "card-payments")]
+    if let Some((card, secret)) = card_rail {
+        app = app.merge(cards::cards_router(card, secret));
+    }
+    let app = app.layer(TraceLayer::new_for_http());
 
     let addr = std::env::var("NW_PORTAL_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(%addr, "nil-portal listening (Business plane: accounts + Privacy Pass issuer)");
+    tracing::info!(%addr, "nil-portal listening (Business plane: accounts + Privacy Pass issuer)"); // soul-allow: the Portal's own bind address (operational), not a user-linkable value
     // ConnectInfo so the issuer endpoint can rate-limit by client IP (the IP is used transiently
     // for the limiter only — never stored or tied to an account).
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;

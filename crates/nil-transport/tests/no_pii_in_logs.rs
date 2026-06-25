@@ -20,13 +20,21 @@ const SCANNED_DIRS: &[&str] = &[
     "crates/nil-datapath/src",
     "crates/nil-cli/src",
     "client/src-tauri/src",
+    // The business plane mints billing identity (accounts, payment refs, the card webhook) — the
+    // highest-PII-risk crate, so it gets the same automated log scan (its own bind address is the
+    // one legitimate exception, annotated `// soul-allow:`).
+    "crates/nil-portal/src",
 ];
 
-/// Substrings that, inside a log-macro invocation, indicate a user-linkable network value.
+/// Substrings that, inside a log-macro invocation, indicate a user-linkable network value or a
+/// payment identifier that could link who-pays to what-flows (PD-4).
 const FORBIDDEN: &[&str] = &[
     "%peer", "%from", "%addr", "%node_ip", "%src", "%dst", // formatted address fields
     "node_ip", "client_ip", "peer_addr", "remote_addr", "src_addr", "dst_addr",
     "socketaddr", ".host", ".port",
+    // Payment identifiers (the card/Monero rails) — must never reach a log (PD-4).
+    "transaction_id", "txn_id", "payment_reference", "payment_id", "customer_id", "card_",
+    "refund_id", "checkout_id",
 ];
 
 const LOG_MACROS: &[&str] = &["info!", "warn!", "error!", "debug!", "trace!"];

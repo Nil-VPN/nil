@@ -11,6 +11,10 @@ default = []
 # Clustered, durable Postgres-backed account store (PgStore). Off by default — the default
 # build ships the file-backed durable store and pulls no database driver.
 postgres = ["dep:tokio-postgres"]
+# Card payments via a Merchant-of-Record (Paddle / Lemon Squeezy): a signed webhook marks a
+# checkout reference paid/revoked, mirroring the Monero watcher. Off by default — Monero-only build
+# pulls no HMAC deps. Sell strictly as a "VPN software subscription" (MoR AUP forbids "donation").
+card-payments = ["dep:hmac", "dep:sha2", "dep:subtle"]
 
 [dependencies]
 nil-core = { workspace = true }     # durable one-token-per-payment + account stores
@@ -31,6 +35,10 @@ tracing-subscriber = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Clustered account store (PgStore), behind the `postgres` feature.
 tokio-postgres = { workspace = true, optional = true }
+# Card (Merchant-of-Record) webhook signature verification, behind the `card-payments` feature.
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

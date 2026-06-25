@@ -118,6 +118,11 @@ jobs:
       - name: Portal store (nil-portal postgres)
         run: cargo test -p nil-portal --features postgres --locked
 
+      # Card (Merchant-of-Record) webhook rail: HMAC verify, confirm/revoke idempotency, dual-rail
+      # composite, and the no-PII WebhookEvent DTO tripwire.
+      - name: Card payments (nil-portal card-payments)
+        run: cargo test -p nil-portal --features card-payments --locked
+
       # Synthetic RA-TLS datapath wiring (node report + client/datapath appraisal acceptance).
       - name: Synthetic-attest datapath (node + datapath + cli)
         run: |
