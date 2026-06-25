@@ -196,3 +196,160 @@ mod tests {
         assert!(ensure_loopback_for_notls("postgres://u@10.0.0.5/db").is_err(), "remote IP refused");
     }
 }
+
+#[cfg(test)]
+mod schema_audit {
+    //! Runtime-schema PII tripwire — the storage-audit check (Epic 10). It complements the
+    //! compile-time `AccountRecord` tripwire in `account/model.rs`: that guards the in-code struct,
+    //! this guards the DDL that actually creates the table. The accounts table must hold ONLY the
+    //! documented non-identifying columns; adding one fails this test until it is documented in
+    //! `RETAINED_DATA.md` — so no persisted field goes undocumented (PD-1/PD-5).
+    use super::SCHEMA;
+
+    /// The exact accounts columns, mirrored in RETAINED_DATA.md. Keep the two in sync.
+    const DOCUMENTED_COLUMNS: &[&str] = &["account_number", "recovery_code_hash", "entitlement"];
+
+    /// Substrings that betray a personally-identifying column.
+    const PII_TOKENS: &[&str] = &[
+        "email", "ip", "name", "phone", "addr", "timestamp", "user_id", "account_id", "payment",
+        "session", "identity", "device",
+    ];
+
+    /// Every column the SCHEMA creates on `table`: the `CREATE TABLE … ( … )` list AND any later
+    /// `ALTER TABLE … ADD COLUMN [IF NOT EXISTS] <name>`. The CREATE-TABLE scan alone is blind to
+    /// migration-added columns, so a column added only via ALTER would escape the tripwire — fixed
+    /// by also scanning ADD COLUMN clauses.
+    fn schema_columns(ddl: &str, table: &str) -> Vec<String> {
+        // SQL keywords + identifiers are case-insensitive in Postgres; fold to uppercase for
+        // matching and lowercase the parsed names for a stable compare against the documented
+        // (lowercase) set (ASCII DDL ⇒ uppercasing preserves byte offsets). Parse PER STATEMENT
+        // (split on `;`) so the result is independent of statement order and an index/constraint DDL
+        // that names the table (e.g. `CREATE INDEX … ON accounts (…)`) can't be mistaken for the
+        // column list. Handles `ALTER … ADD COLUMN <name>` AND bare `ALTER … ADD <name>` (COLUMN is
+        // optional in Postgres), skipping constraint clauses. Assumes simple column defs (no
+        // parenthesised types like `NUMERIC(10,2)`) — true for these schemas; documented so a future
+        // type change updates the parser too.
+        fn is_constraint(t: &str) -> bool {
+            matches!(
+                t,
+                "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "EXCLUDE" | "COLUMN"
+            )
+        }
+        fn push_col(cols: &mut Vec<String>, name: &str) {
+            let name = name.to_ascii_lowercase();
+            if !name.is_empty() && !cols.contains(&name) {
+                cols.push(name);
+            }
+        }
+        let upper = ddl.to_ascii_uppercase();
+        let table = table.to_ascii_uppercase();
+        let mut cols: Vec<String> = Vec::new();
+        for stmt in upper.split(';') {
+            let stmt = stmt.trim_start();
+            if let Some(rest) = stmt.strip_prefix("CREATE TABLE") {
+                // THIS table's definition: its name must precede the column-list `(`.
+                let Some(open) = rest.find('(') else { continue };
+                if !rest[..open].contains(&table) {
+                    continue;
+                }
+                let close = rest[open + 1..].find(')').map(|i| open + 1 + i).unwrap_or(rest.len());
+                for seg in rest[open + 1..close].split(',') {
+                    if let Some(tok) = seg.split_whitespace().next() {
+                        if !is_constraint(tok) {
+                            push_col(&mut cols, tok);
+                        }
+                    }
+                }
+            } else if let Some(rest) = stmt.strip_prefix("ALTER TABLE") {
+                let rest = rest.trim_start();
+                // Only this table (its name is the first token after ALTER TABLE).
+                if rest.split_whitespace().next() != Some(table.as_str()) {
+                    continue;
+                }
+                for piece in rest.split(" ADD ").skip(1) {
+                    let mut toks = piece.split_whitespace();
+                    let mut tok = toks.next();
+                    if tok == Some("COLUMN") {
+                        tok = toks.next();
+                    }
+                    if tok == Some("IF") {
+                        let _ = toks.next(); // NOT
+                        let _ = toks.next(); // EXISTS
+                        tok = toks.next();
+                    }
+                    if let Some(name) = tok {
+                        if !is_constraint(name) {
+                            push_col(&mut cols, name);
+                        }
+                    }
+                }
+            }
+        }
+        cols
+    }
+
+    #[test]
+    fn accounts_table_has_exactly_the_documented_columns() {
+        let cols = schema_columns(SCHEMA, "accounts");
+        assert_eq!(
+            cols, DOCUMENTED_COLUMNS,
+            "accounts schema drifted — document any new/removed column in RETAINED_DATA.md and update DOCUMENTED_COLUMNS"
+        );
+    }
+
+    #[test]
+    fn accounts_schema_has_no_pii_column_names() {
+        for col in schema_columns(SCHEMA, "accounts") {
+            for tok in PII_TOKENS {
+                assert!(
+                    !col.contains(tok),
+                    "column '{col}' looks like PII (matched '{tok}') — must not be persisted (PD-1)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parser_catches_lowercase_and_mixed_case_add_column() {
+        // Regression: SQL keywords are case-insensitive, so a column added with lowercase or
+        // mixed-case DDL must still be seen by the audit (else an undocumented column would
+        // silently pass `assert_eq!(cols, DOCUMENTED_COLUMNS)`).
+        let ddl = "CREATE TABLE t (account_number TEXT PRIMARY KEY); \
+                   alter table t add column Sneaky_Ip TEXT; \
+                   ALTER TABLE t Add Column another_one INT;";
+        let cols = schema_columns(ddl, "t");
+        assert!(cols.contains(&"sneaky_ip".to_string()), "lowercase `add column` must parse");
+        assert!(cols.contains(&"another_one".to_string()), "mixed-case `Add Column` must parse");
+    }
+
+    #[test]
+    fn parser_catches_bare_add_without_column_keyword() {
+        // Regression: Postgres `ALTER TABLE … ADD <name>` (COLUMN omitted) is valid; the audit must
+        // catch it too, or a tool-generated migration could slip an undocumented column past.
+        let cols = schema_columns(
+            "CREATE TABLE t (account_number TEXT PRIMARY KEY); ALTER TABLE t ADD leaked_ip TEXT;",
+            "t",
+        );
+        assert!(cols.contains(&"leaked_ip".to_string()), "bare `ADD <col>` must parse");
+    }
+
+    #[test]
+    fn parser_ignores_index_ddl_and_is_order_independent() {
+        // Regression: a `CREATE INDEX … ON t (…)` mentions the table + a `(`, but is NOT a column
+        // source; and the result must not depend on statement order.
+        let cols = schema_columns(
+            "CREATE INDEX t_idx ON t (entitlement); CREATE TABLE t (account_number TEXT, entitlement TEXT);",
+            "t",
+        );
+        assert_eq!(cols, vec!["account_number".to_string(), "entitlement".to_string()]);
+    }
+
+    #[test]
+    fn parser_does_not_count_add_constraint_as_a_column() {
+        let cols = schema_columns(
+            "CREATE TABLE t (account_number TEXT); ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (account_number);",
+            "t",
+        );
+        assert_eq!(cols, vec!["account_number".to_string()]);
+    }
+}

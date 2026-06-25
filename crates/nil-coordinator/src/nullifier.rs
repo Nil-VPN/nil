@@ -235,6 +235,162 @@ mod pg {
             true
         }
     }
+
+    #[cfg(test)]
+    mod schema_audit {
+        //! Runtime-schema PII tripwire — the storage-audit check (Epic 10). The nullifiers table
+        //! holds ONLY an opaque token message + an epoch partition tag; both are non-identifying.
+        //! Adding a column fails this test until it is documented in `RETAINED_DATA.md` (PD-2/PD-5).
+        use super::SCHEMA;
+
+        const DOCUMENTED_COLUMNS: &[&str] = &["msg", "epoch"];
+        const PII_TOKENS: &[&str] = &[
+            "email", "ip", "name", "phone", "addr", "timestamp", "user_id", "account_id",
+            "payment", "session", "identity", "device",
+        ];
+
+        // Every column the SCHEMA creates: the CREATE TABLE list AND any later `ALTER TABLE …
+        // ADD COLUMN [IF NOT EXISTS] <name>`. The nullifier SCHEMA migrates `epoch` in via ALTER, so
+        // a CREATE-only scan would be blind to migration-added columns — scan ADD COLUMN too.
+        fn schema_columns(ddl: &str, table: &str) -> Vec<String> {
+            // SQL keywords + identifiers are case-insensitive in Postgres; fold to uppercase for
+            // matching and lowercase the parsed names for a stable compare against the documented
+            // (lowercase) set (ASCII DDL ⇒ uppercasing preserves byte offsets). Parse PER STATEMENT
+            // (split on `;`) so the result is independent of statement order and an index/constraint
+            // DDL that names the table (e.g. `CREATE INDEX … ON nullifiers (epoch)`) can't be
+            // mistaken for the column list. Handles `ALTER … ADD COLUMN <name>` AND bare
+            // `ALTER … ADD <name>` (COLUMN is optional in Postgres), skipping constraint clauses.
+            // Assumes simple column defs (no parenthesised types like `NUMERIC(10,2)`) — true for
+            // these schemas; documented so a future type change updates the parser too.
+            fn is_constraint(t: &str) -> bool {
+                matches!(
+                    t,
+                    "CONSTRAINT" | "PRIMARY" | "UNIQUE" | "CHECK" | "FOREIGN" | "EXCLUDE" | "COLUMN"
+                )
+            }
+            fn push_col(cols: &mut Vec<String>, name: &str) {
+                let name = name.to_ascii_lowercase();
+                if !name.is_empty() && !cols.contains(&name) {
+                    cols.push(name);
+                }
+            }
+            let upper = ddl.to_ascii_uppercase();
+            let table = table.to_ascii_uppercase();
+            let mut cols: Vec<String> = Vec::new();
+            for stmt in upper.split(';') {
+                let stmt = stmt.trim_start();
+                if let Some(rest) = stmt.strip_prefix("CREATE TABLE") {
+                    // THIS table's definition: its name must precede the column-list `(`.
+                    let Some(open) = rest.find('(') else { continue };
+                    if !rest[..open].contains(&table) {
+                        continue;
+                    }
+                    let close = rest[open + 1..].find(')').map(|i| open + 1 + i).unwrap_or(rest.len());
+                    for seg in rest[open + 1..close].split(',') {
+                        if let Some(tok) = seg.split_whitespace().next() {
+                            if !is_constraint(tok) {
+                                push_col(&mut cols, tok);
+                            }
+                        }
+                    }
+                } else if let Some(rest) = stmt.strip_prefix("ALTER TABLE") {
+                    let rest = rest.trim_start();
+                    // Only this table (its name is the first token after ALTER TABLE).
+                    if rest.split_whitespace().next() != Some(table.as_str()) {
+                        continue;
+                    }
+                    for piece in rest.split(" ADD ").skip(1) {
+                        let mut toks = piece.split_whitespace();
+                        let mut tok = toks.next();
+                        if tok == Some("COLUMN") {
+                            tok = toks.next();
+                        }
+                        if tok == Some("IF") {
+                            let _ = toks.next(); // NOT
+                            let _ = toks.next(); // EXISTS
+                            tok = toks.next();
+                        }
+                        if let Some(name) = tok {
+                            if !is_constraint(name) {
+                                push_col(&mut cols, name);
+                            }
+                        }
+                    }
+                }
+            }
+            cols
+        }
+
+        #[test]
+        fn nullifiers_table_has_exactly_the_documented_columns() {
+            // CREATE TABLE columns + the ALTER-migrated `epoch` (deduped); the later `nullifiers (`
+            // in the index DDL is not a column source.
+            let cols = schema_columns(SCHEMA, "nullifiers");
+            assert_eq!(
+                cols, DOCUMENTED_COLUMNS,
+                "nullifiers schema drifted — document any new/removed column in RETAINED_DATA.md"
+            );
+        }
+
+        #[test]
+        fn nullifiers_schema_has_no_pii_column_names() {
+            for col in schema_columns(SCHEMA, "nullifiers") {
+                for tok in PII_TOKENS {
+                    assert!(
+                        !col.contains(tok),
+                        "column '{col}' looks like PII (matched '{tok}') — must not be persisted"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn parser_catches_lowercase_and_mixed_case_add_column() {
+            // Regression: SQL keywords are case-insensitive, so a column added with lowercase or
+            // mixed-case DDL must still be seen by the audit (else an undocumented column would
+            // silently pass `assert_eq!(cols, DOCUMENTED_COLUMNS)`).
+            let ddl = "CREATE TABLE t (msg TEXT PRIMARY KEY); \
+                       alter table t add column Sneaky_Ip TEXT; \
+                       ALTER TABLE t Add Column another_one INT;";
+            let cols = schema_columns(ddl, "t");
+            assert!(cols.contains(&"sneaky_ip".to_string()), "lowercase `add column` must parse");
+            assert!(cols.contains(&"another_one".to_string()), "mixed-case `Add Column` must parse");
+        }
+
+        #[test]
+        fn parser_catches_bare_add_without_column_keyword() {
+            // Regression: Postgres `ALTER TABLE … ADD <name>` (COLUMN omitted) is valid; the audit
+            // must catch it too, or a tool-generated migration could slip an undocumented column past.
+            let cols = schema_columns(
+                "CREATE TABLE t (msg TEXT PRIMARY KEY); ALTER TABLE t ADD leaked_ip TEXT;",
+                "t",
+            );
+            assert!(cols.contains(&"leaked_ip".to_string()), "bare `ADD <col>` must parse");
+        }
+
+        #[test]
+        fn parser_ignores_index_ddl_and_is_order_independent() {
+            // Regression: a `CREATE INDEX … ON t (epoch)` mentions the table + a `(`, but is NOT a
+            // column source; and the result must not depend on statement order. With the index
+            // listed FIRST, the parser must still return the CREATE TABLE columns, not `[epoch]`.
+            let cols = schema_columns(
+                "CREATE INDEX t_idx ON t (epoch); CREATE TABLE t (msg TEXT PRIMARY KEY, epoch INT);",
+                "t",
+            );
+            assert_eq!(cols, vec!["msg".to_string(), "epoch".to_string()]);
+        }
+
+        #[test]
+        fn parser_does_not_count_add_constraint_as_a_column() {
+            // `ALTER TABLE … ADD CONSTRAINT/PRIMARY/UNIQUE …` is not a column — it must not inflate
+            // the column set (which would mask a real drift or trip a false positive).
+            let cols = schema_columns(
+                "CREATE TABLE t (msg TEXT); ALTER TABLE t ADD CONSTRAINT pk PRIMARY KEY (msg);",
+                "t",
+            );
+            assert_eq!(cols, vec!["msg".to_string()]);
+        }
+    }
 }
 
 #[cfg(test)]
