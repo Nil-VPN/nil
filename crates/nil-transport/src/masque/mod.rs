@@ -55,6 +55,11 @@ const UDPIP_OVERHEAD: usize = 28;
 /// whose computed inner payload drops below this is rejected — the path is too deep to carry
 /// QUIC within the available MTU.
 const MIN_QUIC_UDP_PAYLOAD: usize = 1200;
+/// Largest control-stream frame (the PQ-WireGuard handshake messages) the client will reassemble.
+/// The legitimate response (ML-KEM-1024 ct ~1568 B + Classic McEliece ct ~128 B + framing) is well
+/// under this; 8 KiB caps `ctrl_in` so a hostile node's oversized length prefix can't drive
+/// unbounded buffering. Matches the node responder's cap (`nil-node` pqwg).
+const MAX_CTRL_FRAME: usize = 8 * 1024;
 /// Source address stamped on a nested hop's inner QUIC packets (the udpip wrap). It must lie
 /// inside every relaying node's tunnel CIDR so the node's NAT (`MASQUERADE -s <cidr>`) rewrites
 /// it on egress and the un-NAT'd reply routes back through the node's TUN. The harness uses
@@ -730,6 +735,16 @@ async fn driver_run(
                                 let len = u32::from_be_bytes([
                                     ctrl_in[0], ctrl_in[1], ctrl_in[2], ctrl_in[3],
                                 ]) as usize;
+                                if len > MAX_CTRL_FRAME {
+                                    // A hostile/buggy node claiming an oversized control frame must
+                                    // not drive unbounded client-side buffering (a `0xFFFFFFFF`
+                                    // prefix would make the loop wait for ~4 GiB). Drop reassembly —
+                                    // the PQ handshake then fails → the tunnel never comes up → the
+                                    // kill-switch holds (fail-closed).
+                                    tracing::warn!("masque control frame length exceeds cap — dropping reassembly buffer");
+                                    ctrl_in.clear();
+                                    break;
+                                }
                                 if ctrl_in.len() < 4 + len {
                                     break;
                                 }

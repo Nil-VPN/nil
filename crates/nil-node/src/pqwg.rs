@@ -11,8 +11,18 @@
 use std::collections::VecDeque;
 
 use boringtun::x25519::{PublicKey, StaticSecret};
-use nil_crypto::psk::{responder_encapsulate, PqOffer};
+use nil_crypto::psk::{responder_encapsulate, PqOffer, MCELIECE_PK_LEN, MLKEM_EK_LEN};
 use nil_transport::pqwg::{decode_parts, encode_parts, PqWgCore};
+
+/// Largest control frame the node will reassemble. The client's PQ OFFER carries the Classic
+/// McEliece-460896 PUBLIC KEY (~512 KiB) + the ML-KEM-1024 ek (1568 B) + the WG pub (32 B), each
+/// length-prefixed by `encode_parts` — so the cap MUST exceed ~513 KiB or legitimate offers are
+/// silently dropped and the handshake breaks. Derived from the KEM constants (+ slack for the
+/// per-part framing) so it tracks the parameters automatically. Still bounds reassembly memory:
+/// without it a `0xFFFFFFFF` length prefix would grow `ctrl_in` to ~4 GiB (single-client OOM DoS).
+const MAX_CTRL_FRAME: usize = MCELIECE_PK_LEN + MLKEM_EK_LEN + 4096;
+/// Compile-time guard: the cap MUST fit a full PQ offer, or the node would reject real offers.
+const _: () = assert!(MAX_CTRL_FRAME >= MCELIECE_PK_LEN + MLKEM_EK_LEN + 32);
 
 /// Per-client PQ-WireGuard responder state.
 #[derive(Default)]
@@ -33,6 +43,14 @@ impl ClientPqWg {
         while self.ctrl_in.len() >= 4 {
             let len =
                 u32::from_be_bytes([self.ctrl_in[0], self.ctrl_in[1], self.ctrl_in[2], self.ctrl_in[3]]) as usize;
+            if len > MAX_CTRL_FRAME {
+                // A length prefix above any legitimate offer is hostile/corrupt. Without this cap a
+                // `0xFFFFFFFF` prefix makes the loop wait for ~4 GiB and `ctrl_in` grows unbounded as
+                // more bytes arrive — a single-client OOM DoS. Abandon reassembly (no PII logged).
+                tracing::warn!("PQ-WG control frame length exceeds cap — dropping reassembly buffer");
+                self.ctrl_in.clear();
+                break;
+            }
             if self.ctrl_in.len() < 4 + len {
                 break;
             }
@@ -60,5 +78,28 @@ impl ClientPqWg {
         self.tunn = Some(PqWgCore::new(node_secret.clone(), PublicKey::from(client_wg_pub), &psk, 2));
         tracing::info!("PQ-WireGuard responder: hybrid PSK derived, Tunn built");
         Some(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_control_frame_header_is_dropped_not_buffered() {
+        // Without the MAX_CTRL_FRAME cap, a `0xFFFFFFFF` length prefix makes the framing loop wait
+        // for ~4 GiB and `ctrl_in` grows unboundedly as more bytes arrive — a single-client OOM DoS.
+        let secret = StaticSecret::from([7u8; 32]);
+        let mut pq = ClientPqWg::default();
+        pq.on_control_bytes(&secret, &[0xFF, 0xFF, 0xFF, 0xFF]);
+        assert!(pq.ctrl_in.is_empty(), "an oversized frame header must drop the reassembly buffer");
+        // A subsequent byte flood (whose leading 4 bytes also exceed the cap) stays bounded.
+        pq.on_control_bytes(&secret, &vec![0xABu8; 100_000]);
+        assert!(
+            pq.ctrl_in.len() <= MAX_CTRL_FRAME,
+            "ctrl_in must stay bounded under a flood (was {})",
+            pq.ctrl_in.len()
+        );
+        assert!(pq.tunn.is_none(), "no responder is built from garbage control bytes");
     }
 }

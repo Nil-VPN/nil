@@ -146,6 +146,13 @@ pub fn encode_parts(parts: &[&[u8]]) -> Vec<u8> {
     out
 }
 
+/// Largest single part `decode_parts` will allocate. The biggest legitimate part is the Classic
+/// McEliece-460896 public key (~512 KiB) carried in a PQ offer; cap at that + slack so a hostile
+/// length prefix can't drive a huge per-part allocation. This matters because `decode_parts` runs
+/// directly on raw WebSocket frames in the wstunnel rung, where the (large default) frame size is
+/// otherwise the only bound. Derived from the KEM constant so it tracks the parameters.
+const MAX_PART: usize = nil_crypto::psk::MCELIECE_PK_LEN + 4096;
+
 pub fn decode_parts(mut b: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut parts = Vec::new();
     while !b.is_empty() {
@@ -153,6 +160,10 @@ pub fn decode_parts(mut b: &[u8]) -> Option<Vec<Vec<u8>>> {
             return None;
         }
         let len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
+        // Reject an over-large part before allocating it (fail-closed on a hostile length prefix).
+        if len > MAX_PART {
+            return None;
+        }
         b = &b[4..];
         if b.len() < len {
             return None;

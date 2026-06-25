@@ -227,17 +227,42 @@ impl Transport for PathTransport {
         // has >= 1 hop and every iteration pushes exactly one handle.)
         let exit = *hops.last().expect("non-empty path established at least one hop");
         let pq_hops = hops.iter().filter(|h| h.is_pq()).count();
-        if exit.is_pq() {
-            self.pq_exits
-                .lock()
-                .map_err(|_| Error::Transport("path pq set poisoned".into()))?
-                .insert(exit.session().id);
+        // Register the path for teardown. If a registration lock is poisoned, tear the freshly-dialed
+        // hops down BEFORE returning — otherwise every hop's QUIC session leaks (stays open on each
+        // node until idle timeout, holding an address-pool slot), exactly like the dial/wrap error
+        // paths above. (A failure here is fail-closed: the caller gets no session, so the kill-switch
+        // holds; we only need to avoid the orphaned sessions + a half-registered pq_exits/onion pair.)
+        // Each lock is taken, used, and dropped inside its own expression so no MutexGuard is held
+        // across the `teardown().await` (that would make this future `!Send`).
+        let pq_registered = if exit.is_pq() {
+            match self.pq_exits.lock() {
+                Ok(mut set) => {
+                    set.insert(exit.session().id);
+                    true
+                }
+                Err(_) => false,
+            }
+        } else {
+            true
+        };
+        if !pq_registered {
+            let _ = self.teardown(hops).await;
+            return Err(Error::Transport("path pq set poisoned".into()));
         }
-        // Record the full ordered hop list for teardown, keyed by the exit session id.
-        self.onion
-            .lock()
-            .map_err(|_| Error::Transport("path map poisoned".into()))?
-            .insert(exit.session().id, hops);
+        // Record the full ordered hop list for teardown, keyed by the exit session id. On poison,
+        // hand `hops` back out of the match so we can tear it down after the guard is dropped.
+        let exit_id = exit.session().id;
+        let orphaned = match self.onion.lock() {
+            Ok(mut map) => {
+                map.insert(exit_id, hops);
+                None
+            }
+            Err(_) => Some(hops),
+        };
+        if let Some(hops) = orphaned {
+            let _ = self.teardown(hops).await;
+            return Err(Error::Transport("path map poisoned".into()));
+        }
         tracing::info!(
             hops = self.hops.len(),
             pq_hops,
