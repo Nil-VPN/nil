@@ -147,7 +147,17 @@ else
     echo "  FAIL: onion did not come up from the coordinator-granted path (with the matching pin)"; fail=1
   else
     echo "  PASS: the matching client pin is accepted — datapath built the granted 3-hop onion"
-    code=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$DEST/cdn-cgi/trace" 2>/dev/null)
+    # Retry the through-onion probe. Even after "tunnel up", a freshly-built 3-hop nested onion
+    # needs a moment for routes to settle and the FIRST request to warm each hop's QUIC handshake,
+    # so a single immediate curl can transiently time out on a slow CI runner — a flake confirmed
+    # by identical trees both passing and failing here. Retrying absorbs that first-packet warmup;
+    # a genuine no-traffic condition still fails after every attempt (the assertion isn't weakened).
+    code=""
+    for _ in $(seq 1 6); do
+      code=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$DEST/cdn-cgi/trace" 2>/dev/null)
+      { [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; } 2>/dev/null && break
+      sleep 2
+    done
     echo "  tunneled HTTP ${code:-none}"
     if { [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; } 2>/dev/null; then
       echo "  PASS: real traffic flows Portal-issued → Coordinator-granted → onion → $DEST"
