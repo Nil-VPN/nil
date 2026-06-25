@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -96,10 +96,17 @@ impl TokenState {
     }
 }
 
+/// Hard cap on `/v1/tokens/issue` request bodies. A blind message for RSA-2048 is 256 bytes
+/// hex-encoded (512 chars) and a payment_id is 64 hex chars; 16 KiB is generous. Without it, Axum's
+/// 2 MiB default lets a caller (even one at the rate-limit ceiling) force MiB-scale buffering before
+/// the rate-limit check and the RSA blind-sign run. Mirrors the Coordinator's `/v1/redeem` cap.
+const TOKEN_BODY_LIMIT: usize = 16 * 1024;
+
 pub fn token_router(state: TokenState) -> Router {
     Router::new()
         .route("/v1/tokens/pubkey", get(pubkey))
         .route("/v1/tokens/issue", post(issue))
+        .layer(DefaultBodyLimit::max(TOKEN_BODY_LIMIT))
         .with_state(state)
 }
 

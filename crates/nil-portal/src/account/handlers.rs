@@ -60,20 +60,31 @@ pub async fn create_account(
 
 /// `POST /v1/account/recover` — recover via the 7-word phrase + one-time code.
 pub async fn recover_account(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
     Json(req): Json<RecoverRequest>,
 ) -> Result<Json<RecoverResponse>, ApiError> {
+    // Rate-limit per client IP — recovery checks an 8-char one-time code against a known account,
+    // so an unthrottled endpoint is a brute-force oracle. The IP is used transiently for the
+    // counter only — never stored, logged, or tied to an account (PD-3). Mirrors `create_account`.
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(ApiError::TooManyRequests);
+    }
     let phrase =
         Phrase::parse(&req.recovery_phrase).map_err(|e| ApiError::BadPhrase(e.to_string()))?;
     let account_number = account::account_number_from_phrase(&phrase)
         .map_err(|e| ApiError::BadPhrase(e.to_string()))?;
 
+    // No existence oracle: a well-formed phrase that maps to NO account returns the SAME
+    // Unauthorized as a real account with a wrong recovery code (PD-3 — don't confirm whether a
+    // given phrase is a registered account; the phrase is itself a bearer credential). A malformed
+    // phrase still 400s (BadPhrase) — that's structural validation, not an existence signal.
     let record = state
         .store
         .get(account_number.as_bytes())
         .await
         .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::NotFound)?;
+        .ok_or(ApiError::Unauthorized)?;
 
     let submitted = RecoveryCode::parse(&req.recovery_code);
     if !account::verify_recovery_code(&submitted, &record.recovery_code_hash) {
