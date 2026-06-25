@@ -93,15 +93,48 @@ else
 fi
 
 echo
+echo "================ ATTESTATION CROSS-CHECK: client-side measurement pin (audit #13) ================"
+# Pillar 2, client side: when the client pins a measurement (NW_EXPECTED_MEASUREMENT), the datapath
+# must REFUSE a Coordinator-granted path whose per-hop measurement isn't in that pin set
+# (redeem::cross_check_pins, fail-closed). The automated, CI-guarded analogue of the live macOS
+# reject test (here against synthetic attestation; the nil-attest KATs cover the real vendor-root
+# path). Runs BEFORE the positive tunnel: cross_check_pins refuses during redeem, before the
+# datapath arms the kill-switch, so NO tunnel/kill-switch lingers to block the Portal afterward.
+WRONG=$(printf 'ee%.0s' $(seq 1 48)) # 96 hex chars, guaranteed != $M
+prov=$(acquire); MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
+TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
+if [ -z "$TOK" ]; then echo "  FAIL: token acquisition (reject test) failed"; fail=1; else
+  $DC exec -e NW_COORDINATOR_URL="http://$COORD:9000" -e NW_EXPECTED_MEASUREMENT="$WRONG" \
+    -e NW_TOKEN_MSG="$MSG" -e NW_TOKEN="$TOK" -d client sh -c 'nil-cli > /tmp/reject.log 2>&1'
+  rup=0
+  for _ in $(seq 1 30); do
+    $DC exec -T client grep -q "tunnel up" /tmp/reject.log 2>/dev/null && { rup=1; break; }
+    $DC exec -T client grep -qiE "pinned set|cross.?check|refus|measurement" /tmp/reject.log 2>/dev/null && break
+    sleep 1
+  done
+  if [ "$rup" = 1 ]; then
+    echo "  FAIL: onion came up despite a WRONG client pin — cross-check did NOT fail closed"; fail=1
+    $DC exec -T client sed 's/\x1b\[[0-9;]*m//g' /tmp/reject.log 2>/dev/null | tail -n 8
+  else
+    echo "  PASS: a wrong client measurement pin is refused — no tunnel (cross-check holds, fail-closed)"
+  fi
+  $DC exec -T client pkill -f nil-cli 2>/dev/null; sleep 1 # ensure nothing lingers (it shouldn't)
+fi
+
+echo
 echo "================ DATA PLANE: token → coordinator-granted onion → real traffic ================"
+# Positive runs LAST (it leaves the tunnel + kill-switch up). NW_EXPECTED_MEASUREMENT=\$M doubles as
+# the ACCEPT half of the cross-check: the CORRECT pin must still bring the onion up (cross-check
+# allows the genuine Coordinator-granted measurement, not just refuse a wrong one).
 prov=$(acquire)
 MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
 TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
 if [ -z "$TOK" ]; then
   echo "  FAIL: token acquisition (tunnel) failed"; fail=1
 else
-  echo "==> nil-cli redeems the token at the Coordinator and brings up the GRANTED 3-hop onion"
-  $DC exec -e NW_COORDINATOR_URL="http://$COORD:9000" -e NW_TOKEN_MSG="$MSG" -e NW_TOKEN="$TOK" -d client \
+  echo "==> nil-cli redeems the token (pinned to \$M) and brings up the GRANTED 3-hop onion"
+  $DC exec -e NW_COORDINATOR_URL="http://$COORD:9000" -e NW_EXPECTED_MEASUREMENT="$M" \
+    -e NW_TOKEN_MSG="$MSG" -e NW_TOKEN="$TOK" -d client \
     sh -c 'nil-cli > /tmp/e2e.log 2>&1'
   up=0
   for _ in $(seq 1 50); do
@@ -111,9 +144,9 @@ else
   done
   echo "---- client log ----"; $DC exec -T client sed 's/\x1b\[[0-9;]*m//g' /tmp/e2e.log 2>/dev/null | tail -n 20
   if [ "$up" != 1 ]; then
-    echo "  FAIL: onion did not come up from the coordinator-granted path"; fail=1
+    echo "  FAIL: onion did not come up from the coordinator-granted path (with the matching pin)"; fail=1
   else
-    echo "  PASS: datapath redeemed the token and built the granted 3-hop onion"
+    echo "  PASS: the matching client pin is accepted — datapath built the granted 3-hop onion"
     code=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 25 "https://$DEST/cdn-cgi/trace" 2>/dev/null)
     echo "  tunneled HTTP ${code:-none}"
     if { [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; } 2>/dev/null; then
