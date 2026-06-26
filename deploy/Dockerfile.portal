@@ -1,0 +1,51 @@
+# Builds nil-portal (Business plane: Privacy Pass issuer + PII-free accounts) as a PUBLIC,
+# signed, digest-pinned production image (ghcr.io/nil-vpn/nil-portal).
+#
+# Default build: file-backed durable account store, rustls TLS for the Monero wallet client,
+# NO database driver, no card-payments HMAC deps. To opt in later, add the matching feature to
+# the cargo build below:
+#   --features postgres        clustered Postgres account store; set NW_PORTAL_PG_URL
+#                              (loopback / TLS-connected only — see crates/nil-portal/src/store/postgres.rs)
+#   --features card-payments   Merchant-of-Record webhook rail (Monero stays the unlinkable one)
+#
+# Bases are digest-pinned + --platform=linux/amd64 to match deploy/Dockerfile.node /
+# deploy/Dockerfile.repro, so the whole service fleet shares ONE attestable base and a floating-tag
+# re-tag or host-arch change can't alter the artifact. No secrets are baked in: every key, endpoint,
+# and measurement is injected at runtime via env / mounted files (PD-3).
+FROM --platform=linux/amd64 rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
+# Determinism knobs — copied verbatim from deploy/Dockerfile.node (keep in sync).
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CARGO_INCREMENTAL=0 \
+    LC_ALL=C \
+    TZ=UTC \
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
+WORKDIR /build
+COPY . .
+# `--locked` pins the committed Cargo.lock. Default features only (see header to opt in).
+RUN cargo build --release --locked -p nil-portal \
+ && cp target/release/nil-portal /nil-portal
+
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+# ca-certificates: the rustls Monero client verifies an https wallet/daemon endpoint.
+# curl: the HEALTHCHECK probe below.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# Non-root (PD-7: even we cannot betray you — no admin/shell path inside). Fixed uid/gid so a
+# mounted state volume keeps stable ownership across rebuilds.
+RUN groupadd --gid 10001 nil \
+ && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin nil \
+ && mkdir -p /var/lib/nil-portal \
+ && chown nil:nil /var/lib/nil-portal
+COPY --from=builder /nil-portal /usr/local/bin/nil-portal
+USER nil:nil
+# Plain HTTP — the Caddy proxy terminates TLS in front of this. Default bind 127.0.0.1:8080
+# (NW_PORTAL_ADDR); set 0.0.0.0:8080 when fronted by a proxy in a separate pod.
+EXPOSE 8080
+# Health = the issuer public-key endpoint: leaks nothing user-linkable (PD-3) and is served once
+# the issuer keypair is loaded. nil-portal has no /healthz.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:8080/v1/tokens/pubkey || exit 1
+ENTRYPOINT ["nil-portal"]

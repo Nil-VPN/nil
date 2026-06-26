@@ -1,0 +1,44 @@
+# Builds nil-coordinator (Control plane: Privacy Pass VERIFIER + trust-split path selection +
+# per-operator measurement registry) as a PUBLIC, signed, digest-pinned production image
+# (ghcr.io/nil-vpn/nil-coordinator). Mirrors deploy/Dockerfile.portal.
+#
+# The Coordinator holds only the issuer PUBLIC key (NW_TOKEN_PUBKEY) — it can verify a spent token
+# but can never mint one. It never sees identity, payment, or a packet (PD-3/PD-4). No secrets are
+# baked in: all config is injected at runtime via env / mounted files.
+#
+# Bases are digest-pinned + --platform=linux/amd64 to match deploy/Dockerfile.node so the whole
+# service fleet shares ONE attestable base.
+FROM --platform=linux/amd64 rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
+# Determinism knobs — copied verbatim from deploy/Dockerfile.node (keep in sync).
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CARGO_INCREMENTAL=0 \
+    LC_ALL=C \
+    TZ=UTC \
+    RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
+WORKDIR /build
+COPY . .
+# `--locked` pins the committed Cargo.lock.
+RUN cargo build --release --locked -p nil-coordinator \
+ && cp target/release/nil-coordinator /nil-coordinator
+
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+# curl for the HEALTHCHECK probe; ca-certificates for any outbound TLS.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl && rm -rf /var/lib/apt/lists/*
+# Non-root (PD-7). Fixed uid/gid so a mounted nullifier-set volume keeps stable ownership.
+RUN groupadd --gid 10002 nil \
+ && useradd --uid 10002 --gid 10002 --no-create-home --shell /usr/sbin/nologin nil \
+ && mkdir -p /var/lib/nil-coordinator \
+ && chown nil:nil /var/lib/nil-coordinator
+COPY --from=builder /nil-coordinator /usr/local/bin/nil-coordinator
+USER nil:nil
+# Plain HTTP — the Caddy proxy terminates TLS in front of this. Default bind 0.0.0.0:9090
+# (NW_COORDINATOR_ADDR). Durable nullifier set (NW_NULLIFIER_DIR / NW_NULLIFIER_PATH) lives under
+# /var/lib/nil-coordinator; compose mounts a volume there.
+EXPOSE 9090
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:9090/healthz || exit 1
+ENTRYPOINT ["nil-coordinator"]
