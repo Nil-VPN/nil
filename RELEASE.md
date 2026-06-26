@@ -56,3 +56,13 @@ warnings`; `cargo deny check`; the feature-gated security suites (attestation ac
 wstunnel round-trip, network selector, Postgres stores + storage audit, synthetic-attest datapath,
 `hw-attest` compile-check); and the reproducible `nil-node` build published to a transparency log
 (Rekor) — must pass before a release.
+
+## Supply chain (signed service images)
+The three service images — `nil-node`, `nil-portal`, `nil-coordinator` — are built from a `v*` tag
+and published to GHCR (`ghcr.io/nil-vpn/*`) by
+[`release-images.yml`](.github/workflows/release-images.yml): each is Trivy-scanned (a fixable
+HIGH/CRITICAL fails the release), then **signed by digest** with cosign keyless, and carries a
+CycloneDX SBOM attestation plus SLSA build provenance. Operators verify a digest before deploy with
+[`deploy/verify-image.sh`](deploy/verify-image.sh) and pin the `@sha256:` digest (never a mutable
+tag) — see [deploy/IMAGES.md](deploy/IMAGES.md). This closes the chain from reproducible source to
+the exact running binary (PD-5).
