@@ -34,7 +34,11 @@ printf '%s' "$digest" | grep -qE '^[0-9a-f]{64}$' \
 
 command -v cosign >/dev/null 2>&1 || die "cosign not found — install sigstore/cosign (>= v2.4)"
 
-IDENTITY_RE="^https://github.com/${NIL_REPO}/${NIL_WORKFLOW}@refs/"
+# Escape regex dots so the identity matches LITERALLY (a bare '.' is a regex wildcard — a
+# security verifier must not widen the trusted identity). The trailing @refs/ stays open so any
+# release ref (refs/tags/v*) matches.
+esc(){ printf '%s' "$1" | sed 's/\./\\./g'; }
+IDENTITY_RE="^https://github\.com/$(esc "$NIL_REPO")/$(esc "$NIL_WORKFLOW")@refs/"
 echo "== verify-image :: $IMG =="
 echo "   identity ~ $IDENTITY_RE"
 echo "   issuer     $COSIGN_OIDC_ISSUER"
