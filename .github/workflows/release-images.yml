@@ -1,0 +1,190 @@
+# Build, scan, push, sign, and attest the three NIL service images to GHCR.
+#
+# On a v* tag: publishes images pushed + signed BY DIGEST (cosign keyless), each with a CycloneDX
+# SBOM attestation and SLSA build provenance, gated behind a Trivy scan that fails the release on a
+# fixable HIGH/CRITICAL vuln. A manual run defaults to a build+scan DRY-RUN (no push, no signing).
+# This closes the PD-5 chain: reproducible source -> the exact running binary an operator can verify
+# with deploy/verify-image.sh (see deploy/IMAGES.md). Mirrors the keyless-OIDC style of
+# release-attest.yml. Does NOT run on pull_request — nothing is pushed during review.
+#
+# Security note: this workflow consumes no untrusted free-text (no issue/PR/comment/head_ref). Every
+# expression used in a run: block is still passed via env: (never inlined) per GitHub's injection
+# guidance.
+name: release-images
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push + sign + attest to GHCR (false = build & Trivy-scan only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write       # push to GHCR
+  id-token: write       # keyless cosign + provenance (Fulcio/Rekor OIDC) — as in release-attest.yml
+  attestations: write   # actions/attest-build-provenance
+
+jobs:
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: nil-portal
+            dockerfile: deploy/Dockerfile.portal
+          - image: nil-coordinator
+            dockerfile: deploy/Dockerfile.coordinator
+          - image: nil-node
+            dockerfile: deploy/Dockerfile.node
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Decide push mode
+        id: mode
+        # Push on a v* tag always; on a manual run only when the input says so.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PUSH: ${{ inputs.push }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_PUSH" = "true" ]; then
+            echo "push=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "push=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute lowercase image ref
+        id: ref
+        # GHCR requires a lowercase owner (org is "Nil-VPN").
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "repo=ghcr.io/${owner}/${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: SOURCE_DATE_EPOCH (HEAD commit time)
+        id: sde
+        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.mode.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (tags + OCI labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ref.outputs.repo }}
+          tags: |
+            type=ref,event=tag
+            type=sha,format=long
+            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+
+      - name: Build (push only when enabled)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: ${{ steps.mode.outputs.push == 'true' }}
+          load: ${{ steps.mode.outputs.push != 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.value }}
+          provenance: false   # SLSA provenance is attached explicitly below (attest-build-provenance)
+
+      - name: Resolve scan/sign target
+        id: target
+        # Immutable digest ref when pushed; first local tag in dry-run.
+        env:
+          PUSH: ${{ steps.mode.outputs.push }}
+          REPO: ${{ steps.ref.outputs.repo }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          if [ "$PUSH" = "true" ]; then
+            echo "ref=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=$(printf '%s\n' "$TAGS" | head -n1)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Trivy scan (fail on fixable HIGH/CRITICAL — before signing)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.target.outputs.ref }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          vuln-type: os,library
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: cosign sign (keyless, by digest)
+        if: steps.mode.outputs.push == 'true'
+        env:
+          COSIGN_YES: "true"
+          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+        run: cosign sign "$REF"
+
+      - name: Generate CycloneDX SBOM
+        if: steps.mode.outputs.push == 'true'
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom-${{ matrix.image }}.cdx.json
+          artifact-name: sbom-${{ matrix.image }}.cdx.json
+
+      - name: cosign attest SBOM (CycloneDX, by digest)
+        if: steps.mode.outputs.push == 'true'
+        env:
+          COSIGN_YES: "true"
+          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          cosign attest --type cyclonedx --predicate "sbom-${IMAGE}.cdx.json" "$REF"
+
+      - name: SLSA build provenance attestation
+        if: steps.mode.outputs.push == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.ref.outputs.repo }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Job summary
+        env:
+          IMAGE: ${{ matrix.image }}
+          PUSH: ${{ steps.mode.outputs.push }}
+          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### ${IMAGE}"
+            if [ "$PUSH" = "true" ]; then
+              echo "- Pushed + signed + attested (SBOM + SLSA) by digest:"
+              echo "  \`${REF}\`"
+              echo "- Verify before deploy:"
+              echo "  \`./deploy/verify-image.sh ${REF}\`"
+            else
+              echo "- Dry-run: built + Trivy-scanned, not pushed (re-run with push=true, or push a v* tag)."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
