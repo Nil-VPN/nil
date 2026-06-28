@@ -1,10 +1,10 @@
 [package]
-name = "nil-ios"
+name = "nil-apple"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "NIL VPN iOS engine (C-ABI staticlib) for the NEPacketTunnelProvider Network Extension."
+description = "NIL VPN Apple engine (C-ABI staticlib) for the NEPacketTunnelProvider Network Extension — shared by the iOS app extension and the macOS system extension."
 
 [lib]
 crate-type = ["staticlib"]

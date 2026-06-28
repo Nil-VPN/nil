@@ -1,7 +1,9 @@
-// Reference NEPacketTunnelProvider for NIL VPN iOS. Drives the C-ABI engine in this crate
-// (nil_start / nil_ingest_packets / nil_negotiated_mtu / nil_stop from nil_ios.h, imported via the
-// extension's bridging header). The container app redeems the unlinkable token and passes ONLY the
-// node endpoint + pinned measurement in providerConfiguration — no identity reaches the extension.
+// Reference NEPacketTunnelProvider for NIL VPN (iOS app extension + macOS system extension — same
+// provider). Drives the C-ABI engine in this crate (nil_start / nil_ingest_packets /
+// nil_negotiated_mtu / nil_stop from nil_apple.h, imported via the extension's bridging header). The
+// container app redeems the unlinkable token and passes ONLY the node endpoint + pinned measurement
+// + the per-connection grant (token + freshness nonce) in providerConfiguration — no identity reaches
+// the extension.
 //
 // NOTE: this is integration reference code. It cannot run in the Simulator (packet tunnels are
 // device-only) and needs the `packet-tunnel-provider` entitlement (Apple org approval) — see
@@ -21,6 +23,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let measurement = (cfg["measurementHex"] as? String) ?? ""
         let teeName = (cfg["teeName"] as? String) ?? "sev-snp"
         let allow = (cfg["allowUnattested"] as? Bool) ?? false
+        // Per-connection Privacy Pass grant (redeemed in the container app), passed as hex. Empty when
+        // unauthenticated; the engine falls back to a fresh random freshness nonce.
+        let grantHex = (cfg["grantHex"] as? String) ?? ""
+        let grantNonceHex = (cfg["grantNonceHex"] as? String) ?? ""
         startCompletion = completionHandler
 
         let writeCb: NilWriteCb = { ctx, pkt, len, af in
@@ -35,10 +41,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in teeName.withCString { tp in
-            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, tee_name: tp, allow_unattested: allow)
+        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in teeName.withCString { tp in grantHex.withCString { gp in grantNonceHex.withCString { np in
+            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, tee_name: tp, allow_unattested: allow, grant_hex: gp, grant_nonce_hex: np)
             tunnel = nil_start(&c, ctx, writeCb, statusCb)
-        }}}}
+        }}}}}}
         if tunnel == nil { completionHandler(NEVPNError(.configurationInvalid)); startCompletion = nil }
     }
 

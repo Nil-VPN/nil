@@ -1,6 +1,6 @@
 # iOS — on-device verification (Epic 9)
 
-> **Status: authored, NOT verified on a device.** The `nil-ios` engine (Rust C-ABI) and
+> **Status: authored, NOT verified on a device.** The `nil-apple` engine (Rust C-ABI) and
 > `apple/PacketTunnelProvider.swift` are in-tree, but a NEPacketTunnelProvider cannot run in the
 > Simulator and the Swift cannot be compiled here (no Xcode on the dev host). Everything below must
 > be done on a Mac with Xcode + an enrolled Apple org + a physical device before iOS ships. Until
@@ -15,11 +15,11 @@
 ## Build
 ```
 rustup target add aarch64-apple-ios
-cargo build -p nil-ios --target aarch64-apple-ios --release   # HIGHEST-RISK step: quiche/BoringSSL
+cargo build -p nil-apple --target aarch64-apple-ios --release   # HIGHEST-RISK step: quiche/BoringSSL
                                                               # must cross-compile for the iOS sysroot
 ```
-The crate's `build.rs` runs cbindgen → `include/nil_ios.h`; wire that as the appex's bridging header.
-Add the **PacketTunnel appex** target in Xcode, link `libnil_ios.a` + `NetworkExtension.framework`
+The crate's `build.rs` runs cbindgen → `include/nil_apple.h`; wire that as the appex's bridging header.
+Add the **PacketTunnel appex** target in Xcode, link `libnil_apple.a` + `NetworkExtension.framework`
 (+ `Security`, `libc++`, `libresolv`). The container app does **not** link the staticlib.
 
 ## Kill-switch on iOS (honest)
