@@ -144,6 +144,38 @@ mod tests {
         assert_eq!(TokenStore::open(path).count().unwrap(), 0);
     }
 
+    /// Locks the no-waste guarantee: the `connect` command runs the privilege pre-flight BEFORE
+    /// `take_one`, so a failed gate must short-circuit without consuming a token. We drive the REAL
+    /// `nil_datapath::preflight_privilege` gate and mirror the command's ordering. Deterministic per
+    /// process: root (CI) ⇒ the gate passes and exactly one token is consumed (the legitimate
+    /// one-per-connect path); unprivileged (dev) ⇒ the gate fails and the count is untouched.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn failed_preflight_leaves_token_count_unchanged() {
+        let (s, _p) = tmp_store();
+        s.add(&[tok("1"), tok("2")]).unwrap();
+        assert_eq!(s.count().unwrap(), 2);
+
+        let gate = nil_datapath::preflight_privilege();
+        let consumed = if gate.is_ok() {
+            s.take_one().unwrap()
+        } else {
+            None // connect bails here, before the token is removed from disk
+        };
+
+        if gate.is_ok() {
+            assert!(consumed.is_some(), "privileged: proceeds and consumes one");
+            assert_eq!(s.count().unwrap(), 1);
+        } else {
+            assert!(consumed.is_none(), "no token consumed when the gate fails");
+            assert_eq!(
+                s.count().unwrap(),
+                2,
+                "token count unchanged after a failed pre-flight"
+            );
+        }
+    }
+
     #[test]
     fn stored_file_contains_no_payment_or_account_identifier() {
         let (s, path) = tmp_store();

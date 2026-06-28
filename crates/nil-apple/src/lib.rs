@@ -1,12 +1,14 @@
-//! NIL VPN iOS engine — a C-ABI staticlib linked into the `NEPacketTunnelProvider` Network
-//! Extension. iOS has no TUN fd: packets flow over the extension's `NEPacketTunnelFlow`, so the
-//! pump is callback-driven (not `tun-rs`). The MASQUE transport is reused unchanged; the extension
-//! reads packets and calls [`nil_ingest_packets`], and the engine injects decapsulated packets via
-//! the `write` callback. Routing/DNS/MTU are the extension's `NEPacketTunnelNetworkSettings`, and
-//! the extension's own sockets bypass the tunnel by default — so there is no `protect()`/NetControl.
+//! NIL VPN Apple engine — a C-ABI staticlib linked into the `NEPacketTunnelProvider` Network
+//! Extension, shared by the iOS app extension and the macOS system extension. Neither has a TUN fd:
+//! packets flow over the extension's `NEPacketTunnelFlow`, so the pump is callback-driven (not
+//! `tun-rs`). The MASQUE transport is reused unchanged; the extension reads packets and calls
+//! [`nil_ingest_packets`], and the engine injects decapsulated packets via the `write` callback.
+//! Routing/DNS/MTU are the extension's `NEPacketTunnelNetworkSettings`, and the extension's own
+//! sockets bypass the tunnel by default — so there is no `protect()`/NetControl.
 //!
-//! Identity never reaches the extension — only a node endpoint + optional pinned measurement; the
-//! unlinkable token is redeemed in the container app.
+//! Identity never reaches the extension — only a node endpoint, optional pinned measurement, and the
+//! per-connection Privacy Pass grant (token + attestation nonce). The unlinkable token is redeemed in
+//! the container app; the account/payment identity never crosses this boundary.
 
 use std::ffi::{c_char, c_void, CStr};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -32,6 +34,12 @@ pub struct NilConfig {
     pub measurement_hex: *const c_char, // nullable / empty
     pub tee_name: *const c_char,        // nullable / empty => sev-snp
     pub allow_unattested: bool,
+    /// Privacy Pass grant for this connection, redeemed in the container app and passed as hex.
+    /// `grant_hex` is the unblinded token bytes; `grant_nonce_hex` is the 32-byte RA-TLS freshness
+    /// nonce the node must bind into its attestation report. Both nullable/empty: when absent the
+    /// engine falls back to an empty token + a fresh random nonce (unauthenticated/Phase-1 path).
+    pub grant_hex: *const c_char,
+    pub grant_nonce_hex: *const c_char,
 }
 
 /// Opaque tunnel handle returned to Swift.
@@ -115,6 +123,17 @@ pub unsafe extern "C" fn nil_start(
             None => None,
         }
     };
+    // Privacy Pass grant redeemed in the container app: token bytes + the 32-byte RA-TLS freshness
+    // nonce, both as hex (either may be absent). An empty/absent token is fine (Phase-1 path); a
+    // malformed nonce is a hard config error so we never silently connect with a bad freshness value.
+    let grant_token = cstr(cfg.grant_hex).and_then(|h| hex(&h)).unwrap_or_default();
+    let grant_nonce: Option<[u8; 32]> = match cstr(cfg.grant_nonce_hex) {
+        Some(h) => match hex(&h).and_then(|b| <[u8; 32]>::try_from(b).ok()) {
+            Some(n) => Some(n),
+            None => return std::ptr::null_mut(),
+        },
+        None => None,
+    };
 
     let (ingest_tx, mut ingest_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let cancel = CancellationToken::new();
@@ -142,30 +161,34 @@ pub unsafe extern "C" fn nil_start(
                 ..Default::default()
             };
             let transport: Arc<dyn Transport> = Arc::new(MasqueTransport::with_config(mcfg));
+
+            // Use the redeemed grant's freshness nonce when present; otherwise a fresh random one
+            // (unauthenticated/Phase-1 path). MASQUE only emits the token header when non-empty.
+            let nonce = match grant_nonce {
+                Some(n) => n,
+                None => {
+                    let mut n = [0u8; 32];
+                    if getrandom::getrandom(&mut n).is_err() {
+                        cbs.status(2);
+                        return;
+                    }
+                    n
+                }
+            };
+            let grant = Grant {
+                token: grant_token,
+                nonce,
+            };
             let node = NodeEndpoint {
                 host,
                 port,
                 kind: TransportKind::Masque,
                 wg_pub: None,
                 expected,
-                grant: None,
+                grant: Some(grant.clone()),
             };
 
-            let mut nonce = [0u8; 32];
-            if getrandom::getrandom(&mut nonce).is_err() {
-                cbs.status(2);
-                return;
-            }
-            let session = match transport
-                .connect(
-                    node,
-                    Grant {
-                        token: Vec::new(),
-                        nonce,
-                    },
-                )
-                .await
-            {
+            let session = match transport.connect(node, grant).await {
                 Ok(s) => s,
                 Err(_) => {
                     cbs.status(2);
@@ -272,5 +295,60 @@ fn parse_tee(s: &str) -> Tee {
         Tee::Tdx
     } else {
         Tee::SevSnp
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    extern "C" fn noop_write(_: *mut c_void, _: *const u8, _: usize, _: i32) {}
+    extern "C" fn noop_status(_: *mut c_void, _: i32, _: *const c_char) {}
+
+    #[test]
+    fn hex_parses_even_and_rejects_odd() {
+        assert_eq!(hex("11aaff"), Some(vec![0x11, 0xaa, 0xff]));
+        assert_eq!(hex("  11aa  "), Some(vec![0x11, 0xaa])); // trimmed
+        assert_eq!(hex("abc"), None); // odd length
+        assert_eq!(hex("zz"), None); // non-hex
+    }
+
+    /// A malformed grant nonce (not 32 bytes) is a hard config error: `nil_start` must return null
+    /// BEFORE spawning the engine thread or touching the network — so a bad freshness value can
+    /// never reach the node. `allow_unattested` here isolates the grant path from measurement parsing.
+    #[test]
+    fn rejects_grant_nonce_of_wrong_length() {
+        let host = CString::new("node.example").unwrap();
+        let short_nonce = CString::new("aa").unwrap(); // 1 byte, not 32
+        let cfg = NilConfig {
+            node_host: host.as_ptr(),
+            node_port: 443,
+            server_name: std::ptr::null(),
+            measurement_hex: std::ptr::null(),
+            tee_name: std::ptr::null(),
+            allow_unattested: true,
+            grant_hex: std::ptr::null(),
+            grant_nonce_hex: short_nonce.as_ptr(),
+        };
+        let t = unsafe { nil_start(&cfg, std::ptr::null_mut(), noop_write, noop_status) };
+        assert!(t.is_null(), "a wrong-length grant nonce must be rejected");
+    }
+
+    /// A null node host is a config error → null, no thread spawned.
+    #[test]
+    fn rejects_missing_node_host() {
+        let cfg = NilConfig {
+            node_host: std::ptr::null(),
+            node_port: 443,
+            server_name: std::ptr::null(),
+            measurement_hex: std::ptr::null(),
+            tee_name: std::ptr::null(),
+            allow_unattested: true,
+            grant_hex: std::ptr::null(),
+            grant_nonce_hex: std::ptr::null(),
+        };
+        let t = unsafe { nil_start(&cfg, std::ptr::null_mut(), noop_write, noop_status) };
+        assert!(t.is_null(), "a null node host must be rejected");
     }
 }

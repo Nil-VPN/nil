@@ -3367,6 +3367,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nil-apple"
+version = "0.1.0"
+dependencies = [
+ "cbindgen",
+ "getrandom 0.2.17",
+ "nil-core",
+ "nil-transport",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "nil-attest"
 version = "0.1.0"
 dependencies = [
@@ -3481,23 +3494,11 @@ dependencies = [
  "nil-transport",
  "reqwest 0.12.28",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
  "tokio-util",
  "tracing",
  "tun-rs",
-]
-
-[[package]]
-name = "nil-ios"
-version = "0.1.0"
-dependencies = [
- "cbindgen",
- "getrandom 0.2.17",
- "nil-core",
- "nil-transport",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

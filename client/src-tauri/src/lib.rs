@@ -13,10 +13,15 @@ pub mod config;
 pub mod engine;
 mod killswitch;
 mod leakguard;
-// The mobile connect path (redeem → attested node endpoint + grant for the native datapath). Only
-// built on Android/iOS, where the OS datapath runs in a separate process (VpnService / PacketTunnel).
-#[cfg(any(target_os = "android", target_os = "ios"))]
-pub mod mobile;
+// The network-extension connect path (redeem → attested node endpoint + grant for the native
+// datapath). Built where the OS datapath runs in a separate process: Android/iOS, and macOS behind
+// the `macos-system-extension` feature (the NEPacketTunnelProvider system extension).
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    feature = "macos-system-extension"
+))]
+pub mod extension;
 mod splittunnel;
 pub mod tokens;
 pub mod tokenstore;
@@ -82,6 +87,19 @@ async fn connect(
     // Sync the datapath env to the latest configured endpoints/toggles, then arm leak protection
     // before the tunnel comes up.
     config.reapply_env();
+    // Fail fast BEFORE consuming a token: opening a TUN device needs root on macOS/Linux, and the
+    // single-use token is removed from disk + redeemed at the Coordinator below — so without this
+    // gate an unprivileged connect (e.g. `pnpm tauri dev`) would burn a token on a connect that
+    // cannot succeed. Only gate the real-datapath path (`is_configured()`); the loopback/dev mock
+    // needs no privilege. No token is touched on this branch.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if nil_datapath::launch::is_configured() {
+        nil_datapath::preflight_privilege().map_err(|_| {
+            "NIL VPN needs to run with administrator/root privileges to open the network tunnel. \
+             No token was used — quit and relaunch with elevated privileges."
+                .to_string()
+        })?;
+    }
     leakguard::arm().map_err(|e| e.to_string())?;
     // Consume one token (removed from disk before use, so a crash never replays a spent token).
     // None is fine for the loopback/dev path; the engine returns NoTokens if a Coordinator is
@@ -95,27 +113,32 @@ async fn disconnect(engine: State<'_, AppEngine>) -> Result<ConnState, String> {
     engine.disconnect().await.map_err(|e| e.to_string())
 }
 
-/// Mobile-only: redeem one on-device token at the Coordinator and return the attested start args
-/// (node endpoint + pinned measurement + opaque grant) for the native datapath. The frontend then
-/// hands these to the `nil-vpn` plugin, which starts the OS `VpnService`/`PacketTunnel` — the real
-/// attested MASQUE tunnel, NOT the loopback mock. Identity never leaves this app process; only the
-/// node endpoint, measurement, and grant cross into the datapath process.
+/// Network-extension path (mobile + macOS system extension): redeem one on-device token at the
+/// Coordinator and return the attested start args (node endpoint + pinned measurement + opaque
+/// grant) for the native datapath. The frontend then hands these to the `nil-vpn` plugin, which
+/// starts the OS `VpnService`/`PacketTunnel` — the real attested MASQUE tunnel, NOT the loopback
+/// mock. Identity never leaves this app process; only the node endpoint, measurement, and grant
+/// cross into the datapath process.
 ///
 /// Fail-closed: the token is removed from disk BEFORE redemption (a crash never replays a spent
 /// token), and a missing token / Coordinator / bad path all error so the native tunnel never comes
 /// up unattested or unpaid.
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    feature = "macos-system-extension"
+))]
 #[tauri::command]
-async fn mobile_connect(
+async fn extension_connect(
     store: State<'_, TokenStore>,
     config: State<'_, ConfigState>,
-) -> Result<mobile::StartArgs, String> {
+) -> Result<extension::StartArgs, String> {
     let cfg = config.get();
     let token = store
         .take_one()
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| mobile::MobileError::NoTokens.to_string())?;
-    mobile::resolve_start_args(&cfg.coordinator_url, &token)
+        .ok_or_else(|| extension::ExtensionError::NoTokens.to_string())?;
+    extension::resolve_start_args(&cfg.coordinator_url, &token)
         .await
         .map_err(|e| e.to_string())
 }
@@ -275,8 +298,12 @@ pub fn run() {
         .expect("error while running tauri application");
 }
 
-// Desktop handler set.
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+// Desktop handler set (in-process datapath; no network-extension redeem command).
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "ios",
+    feature = "macos-system-extension"
+)))]
 fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
 {
     tauri::generate_handler![
@@ -298,8 +325,13 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
     ]
 }
 
-// Mobile handler set: adds `mobile_connect` (redeem → native datapath start args).
-#[cfg(any(target_os = "android", target_os = "ios"))]
+// Network-extension handler set (mobile + macOS system extension): adds `extension_connect`
+// (redeem → native datapath start args).
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    feature = "macos-system-extension"
+))]
 fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool + Send + Sync + 'static
 {
     tauri::generate_handler![
@@ -318,6 +350,6 @@ fn invoke_handler<R: tauri::Runtime>() -> impl Fn(tauri::ipc::Invoke<R>) -> bool
         toggle_kill_switch,
         buy_tokens,
         token_balance,
-        mobile_connect,
+        extension_connect,
     ]
 }

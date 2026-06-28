@@ -18,7 +18,7 @@ members = [
     "crates/nil-cli",
     "crates/nil-provision",
     "crates/nil-android",
-    "crates/nil-ios",
+    "crates/nil-apple",
     "client/src-tauri",
 ]
 

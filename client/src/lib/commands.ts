@@ -51,9 +51,11 @@ interface NativeStartArgs extends Record<string, unknown> {
 // Either way the Connect button calls one function and gets back a connection state.
 export const connect = async (): Promise<ConnState> => {
   if (await isMobile()) {
-    // `mobile_connect` removes one token from disk, redeems it at the Coordinator, and returns the
-    // attested start args (fails closed on no token / no Coordinator / bad path).
-    const args = await invoke<NativeStartArgs>("mobile_connect");
+    // `extension_connect` removes one token from disk, redeems it at the Coordinator, and returns
+    // the attested start args (fails closed on no token / no Coordinator / bad path). The same
+    // command backs the macOS system-extension build; routing macOS Connect through it lands with
+    // the SE control plugin (see the macOS-SE milestones).
+    const args = await invoke<NativeStartArgs>("extension_connect");
     await invoke<void>("plugin:nil-vpn|startVPN", args);
     // The OS service runs out-of-process; report connected once it has been started.
     return "connected";

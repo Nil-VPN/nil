@@ -20,6 +20,14 @@ typedef struct NilConfig {
   const char *measurement_hex;
   const char *tee_name;
   bool allow_unattested;
+  /**
+   * Privacy Pass grant for this connection, redeemed in the container app and passed as hex.
+   * `grant_hex` is the unblinded token bytes; `grant_nonce_hex` is the 32-byte RA-TLS freshness
+   * nonce the node must bind into its attestation report. Both nullable/empty: when absent the
+   * engine falls back to an empty token + a fresh random nonce (unauthenticated/Phase-1 path).
+   */
+  const char *grant_hex;
+  const char *grant_nonce_hex;
 } NilConfig;
 
 /**

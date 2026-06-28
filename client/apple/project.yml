@@ -1,0 +1,162 @@
+# NIL VPN — XcodeGen project spec for the macOS System Extension (packet tunnel).
+#
+# HOW TO USE
+#   brew install xcodegen
+#   cd client/apple && xcodegen generate     # -> NilVPNSystemExtension.xcodeproj
+#
+# The generated .xcodeproj is NOT checked in (XcodeGen regenerates it deterministically
+# from this spec; see client/apple/.gitignore). This project CANNOT be built in this
+# environment: building it needs Xcode, an Apple Developer org with the
+# `packet-tunnel-provider` (system extension) entitlement approved, a Developer ID /
+# provisioning profile, and Developer Mode enabled on the Mac. None of that exists here.
+# This spec is integration scaffolding only.
+#
+# WHAT IT BUILDS
+#   - PacketTunnel  (.systemextension, com.nilvpn.client.PacketTunnel): the actual
+#     NEPacketTunnelProvider, sources = crates/nil-apple/apple/PacketTunnelProvider.swift,
+#     linking NilApple.xcframework + NetworkExtension + Security. A pre-build run-script
+#     phase cross-compiles nil-apple for aarch64+x86_64-apple-darwin, lipos the two
+#     static libs, and packs NilApple.xcframework so the SE has something to link.
+#   - NilVPNHost  (.app, com.nilvpn.client): a minimal SwiftUI dev wrapper whose only job
+#     is to exercise OSSystemExtensionRequest.activationRequest(...) (one-time approval in
+#     System Settings > General > Login Items & Extensions) and then drive the SE through
+#     NETunnelProviderManager. The host does NOT link the xcframework (only the SE does).
+#
+# PRIVACY (NIL SOUL): the SE config carries only node endpoint + pinned measurement +
+# per-connection grant — never identity. Never log node address, token, grant, or
+# measurement. UX copy must be honest about what "block traffic when VPN is down"
+# (includeAllNetworks / OS Always-on) does and does not guarantee. No "100% anonymous".
+
+name: NilVPNSystemExtension
+
+options:
+  bundleIdPrefix: com.nilvpn
+  deploymentTarget:
+    macOS: "13.0"
+  createIntermediateGroups: true
+  # Xcode build phases run with a stripped PATH (no ~/.cargo/bin, often no /usr/local/bin),
+  # so the cargo build-phase below uses ABSOLUTE tool paths. Do not rely on PATH there.
+
+# Paths in this spec are relative to client/apple/. The Rust workspace root is two levels
+# up (../../), the cargo target dir is ../../target, the Swift provider + FFI headers live
+# under ../../crates/nil-apple/.
+
+settings:
+  base:
+    # Org/team-specific values are intentionally left as build settings you override at
+    # `xcodegen generate` time or in a local xcconfig — nothing identifying is committed.
+    DEVELOPMENT_TEAM: ""                 # set to your Apple Developer Team ID
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ALWAYS_SEARCH_USER_PATHS: NO
+    ENABLE_HARDENED_RUNTIME: YES         # required for system extensions
+    CLANG_ENABLE_MODULES: YES
+
+targets:
+
+  # ---------------------------------------------------------------------------
+  # The System Extension: the real NEPacketTunnelProvider.
+  # ---------------------------------------------------------------------------
+  PacketTunnel:
+    type: system-extension            # produces a .systemextension bundle
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      # The single Swift provider (shared with the iOS appex). Kept in the crate so the
+      # Swift and the Rust C-ABI it calls live together; referenced here, not copied.
+      - path: ../../crates/nil-apple/apple/PacketTunnelProvider.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nilvpn.client.PacketTunnel
+        PRODUCT_NAME: com.nilvpn.client.PacketTunnel
+        # Canonical SE artifacts live with the engine crate (next to the provider Swift), so the
+        # XcodeGen project and the embed/sign script reference one source of truth — no duplicates.
+        INFOPLIST_FILE: ../../crates/nil-apple/apple/PacketTunnel-Info.plist
+        CODE_SIGN_ENTITLEMENTS: ../../crates/nil-apple/apple/PacketTunnel.entitlements
+        SWIFT_OBJC_BRIDGING_HEADER: ../../crates/nil-apple/apple/PacketTunnel-Bridging-Header.h
+        # The xcframework is produced by the run-script phase below into the SRCROOT
+        # (client/apple/). Search for it there and link it.
+        FRAMEWORK_SEARCH_PATHS:
+          - $(SRCROOT)
+          - $(inherited)
+        # nil-apple links libc++ and uses BSD resolver + Security/NetworkExtension.
+        OTHER_LDFLAGS:
+          - -lc++
+          - -lresolv
+    dependencies:
+      - framework: NilApple.xcframework
+        embed: false                  # static lib inside the xcframework; nothing to embed
+        codeSign: false
+      - sdk: NetworkExtension.framework
+      - sdk: Security.framework
+    preBuildScripts:
+      - name: "Build nil-apple + pack NilApple.xcframework (cargo, absolute paths)"
+        # Xcode strips PATH for run-script phases, so every tool is an absolute path.
+        # CARGO is rustup's shim under $HOME/.cargo/bin; lipo/xcodebuild/xcrun from the
+        # active Xcode toolchain. WORKSPACE/TARGETDIR derive from SRCROOT (client/apple).
+        basedOnDependencyAnalysis: false
+        script: |
+          set -euo pipefail
+
+          CARGO="$HOME/.cargo/bin/cargo"
+          RUSTUP="$HOME/.cargo/bin/rustup"
+          LIPO="/usr/bin/lipo"
+          XCODEBUILD="/usr/bin/xcodebuild"
+
+          WORKSPACE="$SRCROOT/../.."          # repo root (the Cargo workspace)
+          TARGETDIR="$WORKSPACE/target"        # workspace cargo target dir
+          OUTDIR="$SRCROOT"                    # NilApple.xcframework lands here (linked above)
+
+          PROFILE="release"
+          PROFILE_FLAG="--release"
+          if [ "${CONFIGURATION:-Release}" = "Debug" ]; then PROFILE="debug"; PROFILE_FLAG=""; fi
+
+          # Make sure both desktop slices' std libs are present (idempotent).
+          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
+
+          # Build the C-ABI staticlib for both macOS arches.
+          "$CARGO" build -p nil-apple $PROFILE_FLAG \
+            --target aarch64-apple-darwin --target-dir "$TARGETDIR"
+          "$CARGO" build -p nil-apple $PROFILE_FLAG \
+            --target x86_64-apple-darwin  --target-dir "$TARGETDIR"
+
+          LIB_ARM="$TARGETDIR/aarch64-apple-darwin/$PROFILE/libnil_apple.a"
+          LIB_X86="$TARGETDIR/x86_64-apple-darwin/$PROFILE/libnil_apple.a"
+          HEADERS="$WORKSPACE/crates/nil-apple/include"
+
+          # Fuse the two macOS slices into one fat static lib, then wrap in an xcframework.
+          FAT="$DERIVED_FILE_DIR/libnil_apple-macos-universal.a"
+          mkdir -p "$DERIVED_FILE_DIR"
+          "$LIPO" -create "$LIB_ARM" "$LIB_X86" -output "$FAT"
+
+          rm -rf "$OUTDIR/NilApple.xcframework"
+          "$XCODEBUILD" -create-xcframework \
+            -library "$FAT" -headers "$HEADERS" \
+            -output "$OUTDIR/NilApple.xcframework"
+        inputFiles:
+          - $(SRCROOT)/../../crates/nil-apple/src/lib.rs
+          - $(SRCROOT)/../../crates/nil-apple/Cargo.toml
+        outputFiles:
+          - $(SRCROOT)/NilApple.xcframework/Info.plist
+
+  # ---------------------------------------------------------------------------
+  # Minimal host/dev wrapper: installs + drives the SE. Does NOT link the engine.
+  # ---------------------------------------------------------------------------
+  NilVPNHost:
+    type: application
+    platform: macOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: Host
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nilvpn.client
+        PRODUCT_NAME: NilVPNHost
+        INFOPLIST_FILE: Host-Info.plist
+        CODE_SIGN_ENTITLEMENTS: Host.entitlements
+    dependencies:
+      - target: PacketTunnel
+        embed: true                   # the .app embeds the .systemextension in Contents/Library/SystemExtensions
+      - sdk: NetworkExtension.framework
+      - sdk: SystemExtensions.framework

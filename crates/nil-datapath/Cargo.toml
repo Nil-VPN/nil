@@ -32,6 +32,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 getrandom = { workspace = true }       # per-connection attestation freshness nonce
 anyhow = { workspace = true }
+thiserror = { workspace = true }   # typed PreflightError for the pre-connect privilege gate
 tracing = { workspace = true }
 # Redeem a Privacy Pass token at the Coordinator. rustls (not OpenSSL) to match the project TLS.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }

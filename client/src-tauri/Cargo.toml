@@ -1,5 +1,6 @@
 [package]
 name = "nil-client"
+default-run = "nil-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -11,6 +12,14 @@ description = "NIL VPN client (Tauri v2) — User plane: drives account, control
 # (see https://github.com/rust-lang/cargo/issues/8519).
 name = "nil_client_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[features]
+# macOS no-sudo tunnel via a NetworkExtension System Extension (NEPacketTunnelProvider, shared with
+# iOS through the `nil-apple` engine). OFF by default: the default macOS build keeps the in-process
+# datapath so a half-finished system extension never regresses the working tunnel. When on, the
+# client builds the `extension` module + the `extension_connect` redeem command on macOS, mirroring
+# mobile (the redeem stays in the app; only node endpoint + measurement + grant cross to the SE).
+macos-system-extension = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
