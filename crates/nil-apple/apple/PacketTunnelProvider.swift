@@ -32,7 +32,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let writeCb: NilWriteCb = { ctx, pkt, len, af in
             let me = Unmanaged<PacketTunnelProvider>.fromOpaque(ctx!).takeUnretainedValue()
             let proto = NSNumber(value: af == 30 ? AF_INET6 : AF_INET)
-            me.packetFlow.writePackets([Data(bytes: pkt!, count: len)], withProtocols: [proto])
+            me.packetFlow.writePackets([Data(bytes: pkt!, count: Int(len))], withProtocols: [proto])
         }
         let statusCb: NilStatusCb = { ctx, state, _ in
             let me = Unmanaged<PacketTunnelProvider>.fromOpaque(ctx!).takeUnretainedValue()
@@ -72,7 +72,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             for d in datas {
                 d.withUnsafeBytes { raw in
                     var p = raw.bindMemory(to: UInt8.self).baseAddress
-                    var len = d.count
+                    var len = UInt(d.count)   // FFI lens is *const usize → UInt
                     var af: Int32 = 0
                     nil_ingest_packets(t, &p, &len, &af, 1)   // engine copies synchronously
                 }
