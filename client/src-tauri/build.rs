@@ -8,7 +8,7 @@ fn main() {
     let attributes = tauri_build::Attributes::new().plugin(
         "nil-vpn",
         tauri_build::InlinedPlugin::new()
-            .commands(&["startVPN", "stopVPN"])
+            .commands(&["startVPN", "stopVPN", "statusVPN", "prepareVPN", "openVpnSettings"])
             .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
     );
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
@@ -36,9 +36,18 @@ fn sync_android_sources() {
         std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
     );
     let src = manifest.join("../../crates/nil-android/android");
-    let dst = manifest.join("gen/android/app/src/main/java/com/nilvpn");
-    if !src.is_dir() || !dst.is_dir() {
+    // The gen tree exists iff Tauri's java root is present (`tauri android init` has been run). We
+    // key on that, not on the `com/nilvpn` package dir — a FRESH init has no `com/nilvpn/*.kt` yet,
+    // so we must CREATE them, not only refresh existing ones. (A plain desktop build has no gen tree
+    // at all → no-op.)
+    let java_root = manifest.join("gen/android/app/src/main/java");
+    if !src.is_dir() || !java_root.is_dir() {
         return; // No Android gen tree (e.g. a desktop build) — nothing to mirror.
+    }
+    let dst = java_root.join("com/nilvpn");
+    if let Err(e) = std::fs::create_dir_all(&dst) {
+        println!("cargo:warning=cannot create gen com/nilvpn dir: {e}");
+        return;
     }
     let entries = match std::fs::read_dir(&src) {
         Ok(e) => e,
@@ -59,14 +68,13 @@ fn sync_android_sources() {
         // Re-run this build script whenever a canonical Kotlin source changes, so the gen copy is
         // refreshed on the next build instead of being skipped by cargo's freshness cache.
         println!("cargo:rerun-if-changed={}", path.display());
-        let target = dst.join(name);
-        if target.exists() {
-            if let Err(e) = std::fs::copy(&path, &target) {
-                println!(
-                    "cargo:warning=failed to sync canonical Android source {} into gen/: {e}",
-                    name.to_string_lossy()
-                );
-            }
+        // Create-or-overwrite: a fresh `tauri android init` has none of these yet, and a later build
+        // must refresh them (anti-stale). Either way the canonical source wins.
+        if let Err(e) = std::fs::copy(&path, dst.join(name)) {
+            println!(
+                "cargo:warning=failed to sync canonical Android source {} into gen/: {e}",
+                name.to_string_lossy()
+            );
         }
     }
 }
@@ -212,14 +220,22 @@ fn patch_android_manifest() {
         "        </service>\n",
     );
 
-    // Inject perms after the opening <manifest ...> tag, and the app children before </application>.
-    let with_perms = match contents.find('>') {
-        // The first '>' closes the <manifest …> opening tag.
+    // Inject perms after the opening <manifest …> tag, and the app children before </application>.
+    // The end of the <manifest> opening tag is the first '>' AFTER the literal "<manifest" — NOT the
+    // first '>' in the file, which closes the `<?xml …?>` declaration (inserting there would put the
+    // <uses-permission> elements outside the root and break the manifest merger).
+    let manifest_open_end = contents
+        .find("<manifest")
+        .and_then(|s| contents[s..].find('>').map(|e| s + e + 1));
+    let with_perms = match manifest_open_end {
         Some(i) => {
-            let (head, tail) = contents.split_at(i + 1);
+            let (head, tail) = contents.split_at(i);
             format!("{head}{PERMS}{tail}")
         }
-        None => contents,
+        None => {
+            println!("cargo:warning=AndroidManifest.xml has no <manifest> tag; VPN posture not injected");
+            return;
+        }
     };
     let patched = match with_perms.rfind("</application>") {
         Some(i) => {

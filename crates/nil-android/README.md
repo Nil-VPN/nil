@@ -54,14 +54,20 @@ cargo ndk -t arm64-v8a -t x86_64 -P 21 \
      </service>
    </application>
    ```
-4. Wire the cargo-ndk jniLibs build (above) into the Gradle build; ensure `libc++_shared.so` ships.
-5. `pnpm tauri android build --apk`, then emulator e2e (VERIFIED on an arm64 AVD):
-   `adb install` → launch `VpnConsentActivity` (the app's Connect routes here) → consent handshake
-   → `NilVpnService` → `establish()` (tun0 up) → `nativeStart` → attested MASQUE connect to the live
-   node → real traffic egresses. Headless consent: `adb shell appops set <pkg> ACTIVATE_VPN allow`
-   makes `prepare()` return null (no dialog); otherwise auto-tap the system dialog via `uiautomator`.
-   With `allowUnattested=false` + a pinned measurement, a non-zero `nativeStart` handle proves the
-   attestation gate ran and passed (the engine returns 0 on any connect/attestation failure).
+Steps 2–4 are now **automated by `client/src-tauri/build.rs`** (it mirrors `android/*.kt`, applies
+`nil-android.gradle.kts` so `cargo-ndk` builds `libnil_android.so` + ships `libc++_shared.so` on every
+assemble, injects the manifest fragment, and pins the ABI list) — no manual copy/edit needed.
+
+5. `pnpm tauri android dev` (or `build --apk`), then the emulator e2e. **Verified on an `arm64-v8a`
+   AVD (2026-06-28) against a LOCAL node:** `adb install` → launch `VpnConsentActivity` (the app's
+   Connect routes here) → consent → `NilVpnService` → `establish()` → `detachFd` → `nativeStart` →
+   `nil-android tunnel up` → real traffic egresses (ICMP/DNS, 0% loss, node egress TTL); IPv6
+   blackholed. Headless consent: `adb shell appops set <pkg> ACTIVATE_VPN allow` makes `prepare()`
+   return null. With `allowUnattested=false` + a pinned measurement, the engine returns a 0 handle on
+   any attestation failure (proven: a synthetic node is rejected with `unsupported TEE tag: 0xff`).
+   **Live real-SEV-SNP accept run also verified** (2026-06-28): with `allowUnattested=false` + the
+   pinned live measurement, the engine attested the live node and brought the tunnel up with egress —
+   see `DEVICE_VERIFY.md`.
 
 Real-device behaviors (Doze, Wi-Fi↔LTE handoff, carrier MTU, boot always-on) and the Play-Store
 VpnService policy form are device/account-bound and out of scope for headless CI.
