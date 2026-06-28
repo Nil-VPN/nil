@@ -20,7 +20,7 @@ import java.io.File
 class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
-    fun startVPN(invoke: Invoke) {
+    fun startVpn(invoke: Invoke) {
         // OS consent: returns an Intent the first time; null once granted.
         VpnService.prepare(activity)?.let {
             activity.startActivityForResult(it, VPN_CONSENT)
@@ -56,7 +56,7 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * a permission the user may still deny); the user approves, then taps Connect again.
      */
     @Command
-    fun prepareVPN(invoke: Invoke) {
+    fun prepareVpn(invoke: Invoke) {
         val consent = VpnService.prepare(activity)
         if (consent == null) {
             invoke.resolve(JSObject().apply { put("authorized", true) })
@@ -89,7 +89,7 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
     }
 
     @Command
-    fun stopVPN(invoke: Invoke) {
+    fun stopVpn(invoke: Invoke) {
         activity.stopService(Intent(activity, NilVpnService::class.java))
         invoke.resolve()
     }
@@ -102,7 +102,7 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
      * to "down" when no status has been published yet. Carries only a state word — no node/identity.
      */
     @Command
-    fun statusVPN(invoke: Invoke) {
+    fun statusVpn(invoke: Invoke) {
         val state = try {
             File(activity.filesDir, NilVpnService.STATUS_FILE).readText().trim().ifEmpty { "down" }
         } catch (e: Throwable) {
