@@ -47,6 +47,7 @@ cargo ndk -t arm64-v8a -t x86_64 -P 21 \
                android:theme="@android:style/Theme.Translucent.NoTitleBar"
                android:exported="true"/>
      <service android:name="com.nilvpn.NilVpnService"
+              android:process=":vpn"
               android:permission="android.permission.BIND_VPN_SERVICE"
               android:foregroundServiceType="specialUse" android:exported="false">
        <intent-filter><action android:name="android.net.VpnService"/></intent-filter>
