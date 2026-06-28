@@ -1,9 +1,10 @@
-//! Mobile (Android/iOS) connect path. The OS datapath lives in a separate process — Android's
-//! `VpnService` (`:vpn`, via the `nil-android` JNI engine) or iOS's `NEPacketTunnelProvider` — so
-//! the engine's loopback mock is NOT a real tunnel on mobile. This module is the User-plane half:
-//! it redeems the unlinkable Privacy Pass token at the Coordinator (exactly as the desktop engine
-//! does) and hands the resulting **attested node endpoint + short-lived grant** to the platform
-//! plugin, which starts the native datapath.
+//! Network-extension connect path (Android/iOS, and macOS behind the `macos-system-extension`
+//! feature). The OS datapath lives in a separate process — Android's `VpnService` (`:vpn`, via the
+//! `nil-android` JNI engine), iOS's `NEPacketTunnelProvider`, or the macOS system extension (both
+//! via the shared `nil-apple` engine) — so the in-process loopback mock is NOT a real tunnel there.
+//! This module is the User-plane half: it redeems the unlinkable Privacy Pass token at the
+//! Coordinator (exactly as the desktop engine does) and hands the resulting **attested node endpoint
+//! + short-lived grant** to the platform plugin, which starts the native datapath.
 //!
 //! Identity never crosses into the datapath process: only a node host/port, the pinned
 //! measurement, and an opaque grant are passed out of here. The token redemption (and the bearer
@@ -60,10 +61,10 @@ pub struct StartArgs {
 // enable; the UI must be honest about that. See the Android/iOS DEVICE_VERIFY notes.
 
 #[derive(Debug, thiserror::Error)]
-pub enum MobileError {
+pub enum ExtensionError {
     #[error("no connection token — buy one before connecting")]
     NoTokens,
-    #[error("no Coordinator configured — set one in Settings before connecting on mobile")]
+    #[error("no Coordinator configured — set one in Settings before connecting")]
     NoCoordinator,
     #[error("{0}")]
     UnsafeUrl(String),
@@ -81,14 +82,14 @@ pub enum MobileError {
 pub async fn resolve_start_args(
     coord_url: &str,
     token: &StoredToken,
-) -> Result<StartArgs, MobileError> {
+) -> Result<StartArgs, ExtensionError> {
     if coord_url.trim().is_empty() {
-        return Err(MobileError::NoCoordinator);
+        return Err(ExtensionError::NoCoordinator);
     }
     // The token is a bearer credential — never POST it in cleartext to a non-loopback host (a
     // plaintext link also lets a MITM rewrite the per-hop measurement). Same gate as the datapath.
     if !nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
-        nil_core::net::require_tls_or_loopback(coord_url).map_err(MobileError::UnsafeUrl)?;
+        nil_core::net::require_tls_or_loopback(coord_url).map_err(ExtensionError::UnsafeUrl)?;
     }
 
     let req = RedeemRequest {
@@ -100,34 +101,34 @@ pub async fn resolve_start_args(
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .build()
-        .map_err(|e| MobileError::Unreachable(e.to_string()))?;
+        .map_err(|e| ExtensionError::Unreachable(e.to_string()))?;
 
     let resp = http
         .post(&url)
         .json(&req)
         .send()
         .await
-        .map_err(|e| MobileError::Unreachable(e.to_string()))?;
+        .map_err(|e| ExtensionError::Unreachable(e.to_string()))?;
     if !resp.status().is_success() {
         // No token/identifier in the log — only the status (PD-2).
-        return Err(MobileError::Rejected(resp.status().as_u16()));
+        return Err(ExtensionError::Rejected(resp.status().as_u16()));
     }
     let body = resp
         .bytes()
         .await
-        .map_err(|e| MobileError::Unreachable(e.to_string()))?;
+        .map_err(|e| ExtensionError::Unreachable(e.to_string()))?;
     if body.len() > MAX_BODY {
-        return Err(MobileError::BadPath);
+        return Err(ExtensionError::BadPath);
     }
     start_args_from_response(&body)
 }
 
 /// Pure: parse a `/v1/redeem` body into the native start args (first hop). Unit-tested without a
 /// network. Fails closed on an empty/oversized/unattested/malformed path.
-fn start_args_from_response(body: &[u8]) -> Result<StartArgs, MobileError> {
-    let resp: PathResponse = serde_json::from_slice(body).map_err(|_| MobileError::BadPath)?;
+fn start_args_from_response(body: &[u8]) -> Result<StartArgs, ExtensionError> {
+    let resp: PathResponse = serde_json::from_slice(body).map_err(|_| ExtensionError::BadPath)?;
     if resp.hops.len() < MIN_HOPS || resp.hops.len() > MAX_HOPS {
-        return Err(MobileError::BadPath);
+        return Err(ExtensionError::BadPath);
     }
     if resp.hops.len() > 1 {
         // The native single-hop datapath uses only the first hop today; warn that multi-hop
@@ -138,7 +139,7 @@ fn start_args_from_response(body: &[u8]) -> Result<StartArgs, MobileError> {
         );
     }
     // Take the directly-reachable hop (entry). The native gate attests it before any packet flows.
-    let hop = resp.hops.into_iter().next().ok_or(MobileError::BadPath)?;
+    let hop = resp.hops.into_iter().next().ok_or(ExtensionError::BadPath)?;
 
     // Every redeemed hop MUST carry a measurement — the native attestation gate has nothing to
     // check otherwise. An empty/invalid measurement fails closed here rather than silently
@@ -147,7 +148,7 @@ fn start_args_from_response(body: &[u8]) -> Result<StartArgs, MobileError> {
     if measurement_hex.is_empty()
         || connectip::from_hex(measurement_hex.as_bytes()).is_none()
     {
-        return Err(MobileError::BadPath);
+        return Err(ExtensionError::BadPath);
     }
     let tee_name = match hop.tee {
         WireTee::SevSnp => "sev-snp",
@@ -162,16 +163,16 @@ fn start_args_from_response(body: &[u8]) -> Result<StartArgs, MobileError> {
             let g = g.trim().to_string();
             let n = n.trim().to_string();
             if connectip::from_hex(g.as_bytes()).is_none() {
-                return Err(MobileError::BadPath);
+                return Err(ExtensionError::BadPath);
             }
             match connectip::from_hex(n.as_bytes()) {
                 Some(b) if b.len() == 32 => {}
-                _ => return Err(MobileError::BadPath),
+                _ => return Err(ExtensionError::BadPath),
             }
             (g, n)
         }
         (None, None) => (String::new(), String::new()),
-        _ => return Err(MobileError::BadPath),
+        _ => return Err(ExtensionError::BadPath),
     };
 
     Ok(StartArgs {
@@ -227,7 +228,7 @@ mod tests {
         let body = br#"{"hops":[]}"#;
         assert!(matches!(
             start_args_from_response(body),
-            Err(MobileError::BadPath)
+            Err(ExtensionError::BadPath)
         ));
     }
 
@@ -237,7 +238,7 @@ mod tests {
         let body = br#"{"hops":[{"host":"e.example","port":443,"tee":"sev-snp","measurement":""}]}"#;
         assert!(matches!(
             start_args_from_response(body),
-            Err(MobileError::BadPath)
+            Err(ExtensionError::BadPath)
         ));
     }
 
@@ -250,7 +251,7 @@ mod tests {
         );
         assert!(matches!(
             start_args_from_response(body.as_bytes()),
-            Err(MobileError::BadPath)
+            Err(ExtensionError::BadPath)
         ));
     }
 
@@ -264,7 +265,7 @@ mod tests {
         );
         assert!(matches!(
             start_args_from_response(body.as_bytes()),
-            Err(MobileError::BadPath)
+            Err(ExtensionError::BadPath)
         ));
     }
 }

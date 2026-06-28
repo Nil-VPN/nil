@@ -253,6 +253,43 @@ impl Tunnel {
     }
 }
 
+/// Error from [`preflight_privilege`] — the local, pre-token capability check.
+#[derive(Debug, thiserror::Error)]
+pub enum PreflightError {
+    /// The process lacks the privilege needed to create a TUN device (root on macOS/Linux).
+    #[error("opening a network tunnel device requires root/administrator privileges")]
+    NeedsPrivilege,
+}
+
+/// Cheap, side-effect-free check that this process *can* open a TUN device, meant to run BEFORE
+/// any single-use token is consumed. On macOS/Linux, creating a `utun` / `/dev/net/tun` device is
+/// privileged and fails with `EPERM` for a non-root process — so we model exactly that cause with
+/// an effective-uid check, rather than probe-opening (and tearing down) a real interface, which is
+/// exactly the kind of side effect a pre-flight must avoid.
+///
+/// `Ok` here is necessary but not sufficient: the real [`open_tun`] remains the authority and still
+/// fails closed. This only lets the caller refuse a doomed connect *before* spending a token.
+/// Windows (wintun, a different admin model) and any non-desktop target return `Ok` and rely on the
+/// later open to fail closed.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn preflight_privilege() -> Result<(), PreflightError> {
+    // `libc`/`nix` aren't workspace deps; a one-line extern adds no supply-chain surface.
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    // SAFETY: POSIX `geteuid` is infallible — no args, no errno, no memory access.
+    if unsafe { geteuid() } != 0 {
+        return Err(PreflightError::NeedsPrivilege);
+    }
+    Ok(())
+}
+
+/// Non-(macOS/Linux) targets: no cheap pre-check; the later [`open_tun`] is the fail-closed gate.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn preflight_privilege() -> Result<(), PreflightError> {
+    Ok(())
+}
+
 #[cfg(not(target_os = "android"))]
 fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
     #[allow(unused_mut)]
@@ -376,6 +413,29 @@ mod tests {
     use super::*;
     use nil_core::Grant;
     use nil_transport::loopback::LoopbackTransport;
+
+    /// The pre-token privilege gate must be deterministic and side-effect-free (it runs before a
+    /// single-use token is spent, so it can't churn state), and its verdict must track root exactly:
+    /// `Ok` iff effective-uid 0. Holds both as root (CI containers) and unprivileged (dev).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn preflight_tracks_euid_and_is_repeatable() {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        let is_root = unsafe { geteuid() } == 0;
+        let first = preflight_privilege();
+        let second = preflight_privilege();
+        assert_eq!(
+            first.is_ok(),
+            second.is_ok(),
+            "deterministic: same verdict every call"
+        );
+        assert_eq!(first.is_ok(), is_root, "Ok iff running as root");
+        if !is_root {
+            assert!(matches!(first, Err(PreflightError::NeedsPrivilege)));
+        }
+    }
 
     #[test]
     fn assigned_ip_replaces_only_a_distinct_node_assignment() {
