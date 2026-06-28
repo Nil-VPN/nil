@@ -14,6 +14,8 @@ fn main() {
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 
     sync_android_sources();
+    sync_android_build_wiring();
+    patch_android_manifest();
     sync_apple_sources();
 }
 
@@ -66,6 +68,171 @@ fn sync_android_sources() {
                 );
             }
         }
+    }
+}
+
+/// Keep the `nil-android` native-build Gradle wiring fresh in the gitignored `gen/android/` tree.
+///
+/// Tauri's own `rust` Gradle plugin builds only the app WebView lib (`libnil_client_lib.so`). The VPN
+/// datapath engine `libnil_android.so` is a SEPARATE cdylib (the `:vpn` process) that must also be
+/// built from source — never shipped as a committed prebuilt binary, which could silently carry a
+/// stale engine that omits a fixed attestation/privacy fix (a PD-5 violation). The canonical
+/// `nil-android.gradle.kts` (git-tracked) runs `cargo ndk -p nil-android` per shipped ABI and stages
+/// the result into `jniLibs/`. This mirror copies it into `gen/` and ensures `app/build.gradle.kts`
+/// applies it — so a clean `tauri android init` (which regenerates `gen/`) cannot drop the wiring.
+///
+/// Best-effort and never fatal, exactly like [`sync_android_sources`]: no-ops when there is no
+/// `gen/android` tree (a desktop build), and any IO error only emits a `cargo:warning`.
+fn sync_android_build_wiring() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let src = manifest.join("../../crates/nil-android/android/nil-android.gradle.kts");
+    let app_dir = manifest.join("gen/android/app");
+    if !src.is_file() || !app_dir.is_dir() {
+        return; // No Android gen tree (e.g. a desktop build) — nothing to wire.
+    }
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    // 1. Mirror the canonical Gradle script into the generated app module.
+    let dst = app_dir.join("nil-android.gradle.kts");
+    if let Err(e) = std::fs::copy(&src, &dst) {
+        println!("cargo:warning=failed to sync nil-android.gradle.kts into gen/: {e}");
+        return;
+    }
+
+    // 2. Ensure `app/build.gradle.kts` applies it (idempotent — append once if missing). Tauri's
+    //    generated build.gradle.kts ends with its own `apply(from = "tauri.build.gradle.kts")`, so a
+    //    trailing apply line is safe to add and survives until the next `tauri android init`.
+    let build_gradle = app_dir.join("build.gradle.kts");
+    let apply_line = "apply(from = \"nil-android.gradle.kts\")";
+    match std::fs::read_to_string(&build_gradle) {
+        Ok(contents) => {
+            if !contents.contains("nil-android.gradle.kts") {
+                let appended = format!("{contents}\n{apply_line}\n");
+                if let Err(e) = std::fs::write(&build_gradle, appended) {
+                    println!("cargo:warning=failed to add nil-android apply() to build.gradle.kts: {e}");
+                }
+            }
+        }
+        Err(e) => println!("cargo:warning=cannot read gen build.gradle.kts: {e}"),
+    }
+
+    // 3. Pin the shipped ABI set. `RustPlugin.kt` reads `abiList`/`archList`/`targetList` gradle
+    //    properties (index-aligned) and otherwise defaults to all four ABIs. We ship only the two
+    //    that matter — arm64-v8a (real phones) and x86_64 (emulators) — and `nil-android.gradle.kts`
+    //    builds exactly those, so declaring all four would package an `armeabi-v7a`/`x86` slice that
+    //    has `libnil_client_lib.so` but NO `libnil_android.so` → UnsatisfiedLinkError in the :vpn
+    //    process on those ABIs. Keeping declared == produced is the fix. Maintained here so a clean
+    //    `tauri android init` (which regenerates gradle.properties) can't reintroduce the mismatch.
+    let gradle_props = match app_dir.parent() {
+        Some(root) => root.join("gradle.properties"),
+        None => return,
+    };
+    const ABI_PINS: &[&str] = &[
+        "abiList=arm64-v8a,x86_64",
+        "archList=arm64,x86_64",
+        "targetList=aarch64,x86_64",
+    ];
+    if let Ok(props) = std::fs::read_to_string(&gradle_props) {
+        let mut out = props.clone();
+        for pin in ABI_PINS {
+            let key = pin.split('=').next().unwrap_or("");
+            // Only add if the key is absent (don't fight an explicit user override).
+            let already = out.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with('#') && t.split('=').next().map(str::trim) == Some(key)
+            });
+            if !already {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(pin);
+                out.push('\n');
+            }
+        }
+        if out != props {
+            if let Err(e) = std::fs::write(&gradle_props, out) {
+                println!("cargo:warning=failed to pin ABI list in gradle.properties: {e}");
+            }
+        }
+    }
+}
+
+/// Ensure the VPN posture (FGS permissions, `VpnConsentActivity`, `NilVpnService`) is present in the
+/// generated `AndroidManifest.xml`. `tauri android init` regenerates the manifest from Tauri's
+/// template WITHOUT these, so a regeneration would silently strip the VpnService declaration and the
+/// app would become a no-op VPN. This idempotently re-injects them on every build.
+///
+/// Idempotent via a marker (`com.nilvpn.NilVpnService`): if the service is already declared, do
+/// nothing. Best-effort and never fatal — no-ops without a `gen/android` tree, warns on IO error.
+fn patch_android_manifest() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let path = manifest.join("gen/android/app/src/main/AndroidManifest.xml");
+    if !path.is_file() {
+        return; // No Android gen tree — nothing to patch.
+    }
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("cargo:warning=cannot read gen AndroidManifest.xml: {e}");
+            return;
+        }
+    };
+    if contents.contains("com.nilvpn.NilVpnService") {
+        return; // Already patched.
+    }
+
+    // Foreground-service + notification permissions the VpnService needs (INTERNET is already in the
+    // Tauri template). Inserted right after the opening <manifest …> tag.
+    const PERMS: &str = "\n    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE\" />\n    <uses-permission android:name=\"android.permission.FOREGROUND_SERVICE_SPECIAL_USE\" />\n    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />\n";
+    // The VPN consent activity + the datapath VpnService. Inserted just before </application>.
+    const APP_CHILDREN: &str = concat!(
+        "\n        <!-- VPN consent handshake: VpnService.prepare() + system dialog, then starts the service.\n",
+        "             exported so the app's Connect action (and the e2e harness) can launch it; carries only\n",
+        "             a node endpoint, never identity. Invisible (translucent) — it just routes consent. -->\n",
+        "        <activity\n",
+        "            android:name=\"com.nilvpn.VpnConsentActivity\"\n",
+        "            android:theme=\"@android:style/Theme.Translucent.NoTitleBar\"\n",
+        "            android:exported=\"true\" />\n\n",
+        "        <!-- NIL VPN datapath: the MASQUE tunnel runs in this VpnService (nil-android JNI engine). -->\n",
+        "        <service\n",
+        "            android:name=\"com.nilvpn.NilVpnService\"\n",
+        "            android:permission=\"android.permission.BIND_VPN_SERVICE\"\n",
+        "            android:foregroundServiceType=\"specialUse\"\n",
+        "            android:exported=\"false\">\n",
+        "            <intent-filter>\n",
+        "                <action android:name=\"android.net.VpnService\" />\n",
+        "            </intent-filter>\n",
+        "            <property\n",
+        "                android:name=\"android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE\"\n",
+        "                android:value=\"vpn\" />\n",
+        "        </service>\n",
+    );
+
+    // Inject perms after the opening <manifest ...> tag, and the app children before </application>.
+    let with_perms = match contents.find('>') {
+        // The first '>' closes the <manifest …> opening tag.
+        Some(i) => {
+            let (head, tail) = contents.split_at(i + 1);
+            format!("{head}{PERMS}{tail}")
+        }
+        None => contents,
+    };
+    let patched = match with_perms.rfind("</application>") {
+        Some(i) => {
+            let (head, tail) = with_perms.split_at(i);
+            format!("{head}{APP_CHILDREN}    {tail}")
+        }
+        None => {
+            println!("cargo:warning=AndroidManifest.xml has no </application>; VPN posture not injected");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&path, patched) {
+        println!("cargo:warning=failed to write patched AndroidManifest.xml: {e}");
     }
 }
 
