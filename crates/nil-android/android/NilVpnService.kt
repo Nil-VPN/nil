@@ -24,10 +24,31 @@ class NilVpnService : VpnService() {
     private var handle: Long = 0
     private var pfd: ParcelFileDescriptor? = null
     @Volatile private var running = false
+    // Set the instant teardown begins. Once true, the poll thread stops writing status, so the
+    // authoritative terminal "down" can't be clobbered by a late "dead"/"up" from an in-flight poll.
+    @Volatile private var stopping = false
+    // Guards teardown() against running twice (ACTION_STOP path → stopSelf → onDestroy both call it).
+    @Volatile private var torndown = false
     private var poller: Thread? = null
     private var lastState: String = ""
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Disconnect path. `stopService` does NOT destroy a foreground VpnService (the system binds it
+        // while the TUN fd is open), so the app sends an explicit STOP command instead: we tear the
+        // tunnel down from inside (closing the fd unbinds the system), drop the foreground state, and
+        // stopSelf — which finally triggers onDestroy. Without this, Disconnect left a zombie FGS with
+        // a dead tunnel and the status stuck at "dead" (onDestroy never ran to write "down").
+        if (intent?.action == ACTION_STOP) {
+            Log.i(TAG, "ACTION_STOP — tearing down")
+            teardown()
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return onStart(intent, flags, startId)
+    }
+
+    private fun onStart(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand flags=$flags startId=$startId hasIntent=${intent != null}")
         val nodeHost = intent?.getStringExtra("nodeHost") ?: run {
             Log.e(TAG, "no nodeHost extra — abort"); writeStatus(DOWN); return START_NOT_STICKY
@@ -125,7 +146,7 @@ class NilVpnService : VpnService() {
         poller = Thread {
             while (running) {
                 val state = engineState()
-                if (state != lastState) {
+                if (!stopping && state != lastState) {
                     lastState = state
                     writeStatus(state)
                     when (state) {
@@ -168,17 +189,42 @@ class NilVpnService : VpnService() {
         }
     }
 
-    override fun onDestroy() {
-        Log.i(TAG, "onDestroy handle=$handle")
-        // Stop the poller and JOIN it before freeing the engine: nativeStatus borrows the engine
-        // pointer, so nativeStop must not free it out from under an in-flight poll (use-after-free).
+    /**
+     * Idempotent teardown — safe to call from ACTION_STOP, onRevoke, and onDestroy. Stops the poller
+     * and JOINs it before freeing the engine (nativeStatus borrows the engine pointer, so nativeStop
+     * must not free it under an in-flight poll — use-after-free). Writes the terminal "down" AFTER the
+     * join (nothing overwrites it) and BEFORE the potentially-slow nativeStop (rt.block_on(down())),
+     * so the status is correct even if the process is killed mid-teardown.
+     */
+    private fun teardown() {
+        if (torndown) return
+        torndown = true
+        stopping = true
         running = false
         poller?.interrupt()
         try { poller?.join(1000) } catch (e: InterruptedException) { /* ignore */ }
         poller = null
-        if (handle != 0L) { NilNative.nativeStop(handle); handle = 0 }
-        pfd?.close(); pfd = null
         writeStatus(DOWN)
+        if (handle != 0L) {
+            try { NilNative.nativeStop(handle) } catch (e: Throwable) { Log.e(TAG, "nativeStop failed", e) }
+            handle = 0
+        }
+        try { pfd?.close() } catch (e: Throwable) { /* ignore */ }
+        pfd = null
+    }
+
+    override fun onRevoke() {
+        // The OS revoked the VPN (user disabled it in Settings, or another VPN took over).
+        Log.i(TAG, "onRevoke — tearing down")
+        teardown()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        super.onRevoke()
+    }
+
+    override fun onDestroy() {
+        Log.i(TAG, "onDestroy handle=$handle")
+        teardown()
         super.onDestroy()
     }
 
@@ -218,5 +264,7 @@ class NilVpnService : VpnService() {
         const val UP = "up"
         const val DEAD = "dead"
         const val DOWN = "down"
+        /** Intent action the app sends (via startService) to cleanly stop the foreground VpnService. */
+        const val ACTION_STOP = "com.nilvpn.action.STOP"
     }
 }
