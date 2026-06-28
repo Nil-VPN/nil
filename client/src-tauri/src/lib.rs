@@ -138,7 +138,10 @@ async fn extension_connect(
         .take_one()
         .map_err(|e| e.to_string())?
         .ok_or_else(|| extension::ExtensionError::NoTokens.to_string())?;
-    extension::resolve_start_args(&cfg.coordinator_url, &token)
+    // Cross-check the redeemed hop's measurement against the client's INDEPENDENT pin (audit B1):
+    // with a configured pin, a compromised Coordinator can't substitute a rogue node's measurement.
+    let client_pins = extension::client_pins_from_env();
+    extension::resolve_start_args(&cfg.coordinator_url, &token, &client_pins)
         .await
         .map_err(|e| e.to_string())
 }

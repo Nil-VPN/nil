@@ -74,6 +74,34 @@ pub enum ExtensionError {
     Rejected(u16),
     #[error("path service returned an unusable path")]
     BadPath,
+    #[error("the path's node measurement is not in the client's pinned set (possible substitution)")]
+    PinMismatch,
+}
+
+/// The client-side, Coordinator-INDEPENDENT measurement pins the mobile client will accept for the
+/// redeemed hop. Mirrors the desktop `nil_datapath::launch::pinned_measurements_from_env` so the
+/// mobile attestation cross-check uses the SAME operator-controlled anchor, not whatever the
+/// Coordinator claims (audit B1). Sourced from `NW_EXPECTED_MEASUREMENT` (single) and
+/// `NW_PINNED_MEASUREMENTS` (comma-separated). Empty = no independent anchor (Coordinator-trusted,
+/// warned). A mobile build can also seed these from app config before connecting; env keeps parity
+/// with the desktop/CI path and makes the cross-check unit-testable.
+pub fn client_pins_from_env() -> Vec<Vec<u8>> {
+    let mut pins: Vec<Vec<u8>> = Vec::new();
+    if let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") {
+        if let Some(bytes) = connectip::from_hex(hex.trim().as_bytes()) {
+            pins.push(bytes);
+        }
+    }
+    if let Ok(list) = std::env::var("NW_PINNED_MEASUREMENTS") {
+        for item in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(bytes) = connectip::from_hex(item.as_bytes()) {
+                if !pins.contains(&bytes) {
+                    pins.push(bytes);
+                }
+            }
+        }
+    }
+    pins
 }
 
 /// Redeem `token` at `coord_url` and resolve the (single-hop, alpha) attested start args for the
@@ -82,6 +110,7 @@ pub enum ExtensionError {
 pub async fn resolve_start_args(
     coord_url: &str,
     token: &StoredToken,
+    client_pins: &[Vec<u8>],
 ) -> Result<StartArgs, ExtensionError> {
     if coord_url.trim().is_empty() {
         return Err(ExtensionError::NoCoordinator);
@@ -120,12 +149,15 @@ pub async fn resolve_start_args(
     if body.len() > MAX_BODY {
         return Err(ExtensionError::BadPath);
     }
-    start_args_from_response(&body)
+    start_args_from_response(&body, client_pins)
 }
 
 /// Pure: parse a `/v1/redeem` body into the native start args (first hop). Unit-tested without a
 /// network. Fails closed on an empty/oversized/unattested/malformed path.
-fn start_args_from_response(body: &[u8]) -> Result<StartArgs, ExtensionError> {
+fn start_args_from_response(
+    body: &[u8],
+    client_pins: &[Vec<u8>],
+) -> Result<StartArgs, ExtensionError> {
     let resp: PathResponse = serde_json::from_slice(body).map_err(|_| ExtensionError::BadPath)?;
     if resp.hops.len() < MIN_HOPS || resp.hops.len() > MAX_HOPS {
         return Err(ExtensionError::BadPath);
@@ -145,10 +177,28 @@ fn start_args_from_response(body: &[u8]) -> Result<StartArgs, ExtensionError> {
     // check otherwise. An empty/invalid measurement fails closed here rather than silently
     // connecting unattested.
     let measurement_hex = hop.measurement.trim().to_string();
-    if measurement_hex.is_empty()
-        || connectip::from_hex(measurement_hex.as_bytes()).is_none()
-    {
-        return Err(ExtensionError::BadPath);
+    let measurement = match connectip::from_hex(measurement_hex.as_bytes()) {
+        Some(b) if !b.is_empty() => b,
+        _ => return Err(ExtensionError::BadPath),
+    };
+
+    // Audit B1 (substitution defense): cross-check the Coordinator-provided measurement against the
+    // client's INDEPENDENT pin set before trusting it. If the client has any pin configured, the
+    // redeemed measurement MUST be in it or the path is refused (fail-closed) — so a compromised
+    // Coordinator can't point a mobile client at a rogue node within policy. With no pin we fall
+    // back to Coordinator-trust but say so loudly (mirrors the desktop `cross_check_pins`).
+    if client_pins.is_empty() {
+        tracing::warn!(
+            "no client-side measurement pin (NW_EXPECTED_MEASUREMENT / NW_PINNED_MEASUREMENTS unset): \
+             the redeemed hop is COORDINATOR-TRUSTED — pin from an independent source to cross-check"
+        );
+    } else if !client_pins.iter().any(|pin| pin == &measurement) {
+        // No measurement bytes or host in the log (PD-2): the mismatch alone is the signal.
+        tracing::error!(
+            "redeemed hop measurement is not in the client's pinned set — refusing the path \
+             (possible measurement substitution by the Coordinator)"
+        );
+        return Err(ExtensionError::PinMismatch);
     }
     let tee_name = match hop.tee {
         WireTee::SevSnp => "sev-snp",
@@ -200,7 +250,7 @@ mod tests {
         let body = format!(
             r#"{{"hops":[{{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
         );
-        let a = start_args_from_response(body.as_bytes()).expect("parse");
+        let a = start_args_from_response(body.as_bytes(), &[]).expect("parse");
         assert_eq!(a.node_host, "entry.example");
         assert_eq!(a.node_port, 443);
         assert_eq!(a.server_name, "entry.example");
@@ -217,7 +267,7 @@ mod tests {
         let body = format!(
             r#"{{"hops":[{{"host":"e.example","port":443,"tee":"tdx","measurement":"{m}","grant":"{grant}","grant_nonce":"{nonce}"}}]}}"#
         );
-        let a = start_args_from_response(body.as_bytes()).expect("parse");
+        let a = start_args_from_response(body.as_bytes(), &[]).expect("parse");
         assert_eq!(a.tee_name, "tdx");
         assert_eq!(a.grant_hex, grant);
         assert_eq!(a.grant_nonce_hex, nonce);
@@ -227,7 +277,7 @@ mod tests {
     fn rejects_empty_path() {
         let body = br#"{"hops":[]}"#;
         assert!(matches!(
-            start_args_from_response(body),
+            start_args_from_response(body, &[]),
             Err(ExtensionError::BadPath)
         ));
     }
@@ -237,7 +287,7 @@ mod tests {
         // No/empty measurement → fail closed (the native gate would have nothing to check).
         let body = br#"{"hops":[{"host":"e.example","port":443,"tee":"sev-snp","measurement":""}]}"#;
         assert!(matches!(
-            start_args_from_response(body),
+            start_args_from_response(body, &[]),
             Err(ExtensionError::BadPath)
         ));
     }
@@ -250,7 +300,7 @@ mod tests {
             r#"{{"hops":[{{"host":"e.example","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}"}}]}}"#
         );
         assert!(matches!(
-            start_args_from_response(body.as_bytes()),
+            start_args_from_response(body.as_bytes(), &[]),
             Err(ExtensionError::BadPath)
         ));
     }
@@ -264,8 +314,35 @@ mod tests {
             r#"{{"hops":[{{"host":"e.example","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{nonce}"}}]}}"#
         );
         assert!(matches!(
-            start_args_from_response(body.as_bytes()),
+            start_args_from_response(body.as_bytes(), &[]),
             Err(ExtensionError::BadPath)
+        ));
+    }
+
+    #[test]
+    fn accepts_measurement_in_the_client_pin() {
+        // Audit B1: a redeemed measurement that IS in the client's independent pin set passes.
+        let m = meas();
+        let pin = connectip::from_hex(m.as_bytes()).expect("hex");
+        let body = format!(
+            r#"{{"hops":[{{"host":"e.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+        );
+        let a = start_args_from_response(body.as_bytes(), &[pin]).expect("pinned measurement accepted");
+        assert_eq!(a.measurement_hex, m);
+    }
+
+    #[test]
+    fn rejects_measurement_not_in_the_client_pin() {
+        // Audit B1: a Coordinator-substituted measurement NOT in the client's pin is refused
+        // fail-closed (the native tunnel never comes up), even though it is well-formed hex.
+        let m = meas(); // "ab" * 48 — the (substituted) measurement the Coordinator returned
+        let other_pin = connectip::from_hex("cd".repeat(48).as_bytes()).expect("hex"); // the client's real pin
+        let body = format!(
+            r#"{{"hops":[{{"host":"e.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+        );
+        assert!(matches!(
+            start_args_from_response(body.as_bytes(), &[other_pin]),
+            Err(ExtensionError::PinMismatch)
         ));
     }
 }

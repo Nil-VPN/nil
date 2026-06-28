@@ -49,16 +49,42 @@ interface NativeStartArgs extends Record<string, unknown> {
 // Coordinator is set). Mobile: redeem the token in the app process, then hand the resulting
 // attested endpoint + grant to the native plugin, which starts the OS VpnService/PacketTunnel.
 // Either way the Connect button calls one function and gets back a connection state.
+/** How long to wait for the native tunnel to confirm `up` before giving up (ms). */
+const MOBILE_CONNECT_TIMEOUT_MS = 20000;
+
 export const connect = async (): Promise<ConnState> => {
   if (await isMobile()) {
+    // Preflight the OS VPN consent BEFORE redeeming: a single-use token must not be burned if the
+    // user hasn't granted (or denies) the VPN permission. prepareVPN launches the system dialog when
+    // needed and reports authorized=false so we stop here without touching the token store.
+    const { authorized } = await invoke<{ authorized: boolean }>("plugin:nil-vpn|prepareVPN");
+    if (!authorized) {
+      throw new Error("Grant the VPN permission in the system dialog, then tap Connect again.");
+    }
     // `extension_connect` removes one token from disk, redeems it at the Coordinator, and returns
     // the attested start args (fails closed on no token / no Coordinator / bad path). The same
     // command backs the macOS system-extension build; routing macOS Connect through it lands with
     // the SE control plugin (see the macOS-SE milestones).
     const args = await invoke<NativeStartArgs>("extension_connect");
     await invoke<void>("plugin:nil-vpn|startVPN", args);
-    // The OS service runs out-of-process; report connected once it has been started.
-    return "connected";
+    // startVPN only KICKS OFF the out-of-process VpnService; the MASQUE handshake + the attestation
+    // gate run there. Poll the engine's REAL status and report connected ONLY once it confirms the
+    // tunnel is up — never optimistically, so the UI can't claim protection the gate hasn't granted.
+    const deadline = Date.now() + MOBILE_CONNECT_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 500));
+      const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVPN");
+      if (state === "up") return "connected";
+      if (state === "down" || state === "dead") {
+        // The service wrote a terminal state: attestation refused, consent denied, or a dead tunnel.
+        // Tear down so no half-state lingers, then surface the failure honestly.
+        await invoke<void>("plugin:nil-vpn|stopVPN").catch(() => {});
+        throw new Error("Tunnel did not come up — attestation or connection failed.");
+      }
+      // state === "connecting" → keep waiting
+    }
+    await invoke<void>("plugin:nil-vpn|stopVPN").catch(() => {});
+    throw new Error("Tunnel connect timed out.");
   }
   return invoke<ConnState>("connect");
 };
@@ -71,7 +97,30 @@ export const disconnect = async (): Promise<ConnState> => {
   return invoke<ConnState>("disconnect");
 };
 
-export const status = () => invoke<ConnState>("status");
+/**
+ * Deep-link to the OS VPN settings so the user can enable "Always-on VPN" + "Block connections
+ * without VPN" — the PERSISTENT kill-switch that holds even if the NIL process dies. The app cannot
+ * enable it programmatically (an honest limit), so it can only take the user there. Mobile only.
+ */
+export const openAlwaysOnSettings = async (): Promise<void> => {
+  if (await isMobile()) {
+    await invoke<void>("plugin:nil-vpn|openVpnSettings");
+  }
+};
+
+export const status = async (): Promise<ConnState> => {
+  if (await isMobile()) {
+    // Mirror the out-of-process VpnService's real health (written by the engine poll) so the UI
+    // reflects a dropped tunnel instead of staying stuck on "connected".
+    const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVPN");
+    return state === "up"
+      ? "connected"
+      : state === "connecting"
+        ? "connecting"
+        : "disconnected";
+  }
+  return invoke<ConnState>("status");
+};
 
 export const listLocations = () => invoke<Location[]>("list_locations");
 export const setTransportMode = (mode: string) =>

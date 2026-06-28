@@ -222,14 +222,33 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(
     log::info!("nil-android tunnel down");
 }
 
-/// Tiny status JSON for the app↔service IPC.
+/// Real tunnel health for the app↔service IPC, as tiny JSON `{"state":"up|dead|down"}`:
+/// - `down`  — no engine (handle 0): never started, or already stopped.
+/// - `up`    — the pumps are live (`Tunnel::is_up()`), traffic flows.
+/// - `dead`  — the engine exists but a pump exited (hung/dead tunnel/TUN error): the full-route TUN
+///   still blackholes (fail-closed), but traffic is NOT flowing — the caller must surface this, not
+///   keep claiming "connected". This is what makes the status honest instead of optimistic.
 #[no_mangle]
 pub extern "system" fn Java_com_nilvpn_NilNative_nativeStatus(
     env: JNIEnv,
     _class: JClass,
     handle: jlong,
 ) -> jstring {
-    let state = if handle == 0 { "down" } else { "up" };
+    let state = if handle == 0 {
+        "down"
+    } else {
+        // SAFETY: `handle` is the Box<Engine> pointer returned by nativeStart and remains valid
+        // until nativeStop frees it; the Kotlin side only polls between start and stop. We BORROW
+        // (never `Box::from_raw`, which would free it).
+        let engine = unsafe { &*(handle as *const Engine) };
+        match engine.tunnel.lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(tunnel) if tunnel.is_up() => "up",
+                _ => "dead",
+            },
+            Err(_) => "dead",
+        }
+    };
     let json = format!("{{\"state\":\"{state}\"}}");
     env.new_string(json)
         .map(|s| s.into_raw())
