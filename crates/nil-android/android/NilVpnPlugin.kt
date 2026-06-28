@@ -90,7 +90,11 @@ class NilVpnPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun stopVpn(invoke: Invoke) {
-        activity.stopService(Intent(activity, NilVpnService::class.java))
+        // stopService does NOT destroy a foreground VpnService (the system binds it while the TUN fd
+        // is open), so deliver an explicit STOP command instead — the service tears the tunnel down
+        // from inside (closing the fd unbinds the system) and stopSelf()s. startService just routes
+        // the action to the already-running service's onStartCommand.
+        activity.startService(Intent(activity, NilVpnService::class.java).setAction(NilVpnService.ACTION_STOP))
         invoke.resolve()
     }
 
