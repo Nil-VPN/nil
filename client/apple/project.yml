@@ -63,9 +63,12 @@ targets:
     platform: macOS
     deploymentTarget: "13.0"
     sources:
-      # The single Swift provider (shared with the iOS appex). Kept in the crate so the
-      # Swift and the Rust C-ABI it calls live together; referenced here, not copied.
+      # The Swift provider (shared with the iOS appex) + the macOS-only system-extension entry
+      # point. Kept in the crate so the Swift and the Rust C-ABI it calls live together; referenced
+      # here, not copied. PacketTunnelMain.swift provides `_main` (NEProvider.startSystemExtensionMode)
+      # which a macOS system extension needs and the iOS appex (principal-class) does not.
       - path: ../../crates/nil-apple/apple/PacketTunnelProvider.swift
+      - path: ../../crates/nil-apple/apple/PacketTunnelMain.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nilvpn.client.PacketTunnel
@@ -85,60 +88,17 @@ targets:
           - -lc++
           - -lresolv
     dependencies:
+      # NilApple.xcframework is a PREREQUISITE built out-of-band by ./build-engine.sh (cargo →
+      # universal static lib → xcframework) BEFORE `xcodebuild`. It is NOT produced by an in-target
+      # script phase: a script that generates a framework this target also *links* creates a build
+      # cycle ("Cycle inside PacketTunnel") because Xcode resolves the linked framework before the
+      # phase that would create it. So: run `./build-engine.sh` (or embed-systemextension.sh, which
+      # calls it) first; this target just links the existing xcframework. See client/apple/.gitignore.
       - framework: NilApple.xcframework
         embed: false                  # static lib inside the xcframework; nothing to embed
         codeSign: false
       - sdk: NetworkExtension.framework
       - sdk: Security.framework
-    preBuildScripts:
-      - name: "Build nil-apple + pack NilApple.xcframework (cargo, absolute paths)"
-        # Xcode strips PATH for run-script phases, so every tool is an absolute path.
-        # CARGO is rustup's shim under $HOME/.cargo/bin; lipo/xcodebuild/xcrun from the
-        # active Xcode toolchain. WORKSPACE/TARGETDIR derive from SRCROOT (client/apple).
-        basedOnDependencyAnalysis: false
-        script: |
-          set -euo pipefail
-
-          CARGO="$HOME/.cargo/bin/cargo"
-          RUSTUP="$HOME/.cargo/bin/rustup"
-          LIPO="/usr/bin/lipo"
-          XCODEBUILD="/usr/bin/xcodebuild"
-
-          WORKSPACE="$SRCROOT/../.."          # repo root (the Cargo workspace)
-          TARGETDIR="$WORKSPACE/target"        # workspace cargo target dir
-          OUTDIR="$SRCROOT"                    # NilApple.xcframework lands here (linked above)
-
-          PROFILE="release"
-          PROFILE_FLAG="--release"
-          if [ "${CONFIGURATION:-Release}" = "Debug" ]; then PROFILE="debug"; PROFILE_FLAG=""; fi
-
-          # Make sure both desktop slices' std libs are present (idempotent).
-          "$RUSTUP" target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
-
-          # Build the C-ABI staticlib for both macOS arches.
-          "$CARGO" build -p nil-apple $PROFILE_FLAG \
-            --target aarch64-apple-darwin --target-dir "$TARGETDIR"
-          "$CARGO" build -p nil-apple $PROFILE_FLAG \
-            --target x86_64-apple-darwin  --target-dir "$TARGETDIR"
-
-          LIB_ARM="$TARGETDIR/aarch64-apple-darwin/$PROFILE/libnil_apple.a"
-          LIB_X86="$TARGETDIR/x86_64-apple-darwin/$PROFILE/libnil_apple.a"
-          HEADERS="$WORKSPACE/crates/nil-apple/include"
-
-          # Fuse the two macOS slices into one fat static lib, then wrap in an xcframework.
-          FAT="$DERIVED_FILE_DIR/libnil_apple-macos-universal.a"
-          mkdir -p "$DERIVED_FILE_DIR"
-          "$LIPO" -create "$LIB_ARM" "$LIB_X86" -output "$FAT"
-
-          rm -rf "$OUTDIR/NilApple.xcframework"
-          "$XCODEBUILD" -create-xcframework \
-            -library "$FAT" -headers "$HEADERS" \
-            -output "$OUTDIR/NilApple.xcframework"
-        inputFiles:
-          - $(SRCROOT)/../../crates/nil-apple/src/lib.rs
-          - $(SRCROOT)/../../crates/nil-apple/Cargo.toml
-        outputFiles:
-          - $(SRCROOT)/NilApple.xcframework/Info.plist
 
   # ---------------------------------------------------------------------------
   # Minimal host/dev wrapper: installs + drives the SE. Does NOT link the engine.

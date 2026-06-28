@@ -164,7 +164,8 @@ final class NilControlBridge: NSObject {
     }
 
     /// Configure the manager from the decoded provider config and start the tunnel.
-    func startTunnel(_ cfg: NilProviderConfig) {
+    /// `fileprivate` because `NilProviderConfig` is file-private (called from the @_cdecl entry below).
+    fileprivate func startTunnel(_ cfg: NilProviderConfig) {
         loadManager { mgr, error in
             guard let mgr = mgr else { return }
 

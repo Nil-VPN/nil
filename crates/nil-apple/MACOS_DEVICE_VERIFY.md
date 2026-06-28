@@ -1,5 +1,28 @@
 # macOS — on-device verification (no-sudo System Extension epic, M2–M6)
 
+> **Build status — UPDATED 2026-06-28 on Xcode 26.6 / macOS 26.5 (Apple Silicon):**
+> **M2 (the SE compiles + links) is VERIFIED.** Building the scaffolding for real surfaced and fixed
+> three bugs it shipped with: (1) a build-graph cycle — the xcframework was both *linked by* and
+> *generated inside* the SE target; the engine is now built out-of-band by `client/apple/build-engine.sh`
+> and the target only links it; (2) `UInt`/`Int` FFI mismatches in the shared
+> `PacketTunnelProvider.swift` (would have broken iOS too); (3) a missing macOS entry point — a system
+> extension is a standalone executable and needs `_main`; added `PacketTunnelMain.swift` calling
+> `NEProvider.startSystemExtensionMode()`. Working local build (arm64, unsigned):
+> `./build-engine.sh debug && cd client/apple && xcodegen generate && xcodebuild -target PacketTunnel
+> -configuration Debug -destination 'platform=macOS,arch=arm64' ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build`
+> → a `Mach-O arm64` `.systemextension` with `_nil_start`/`_nil_stop`/`_nil_ingest_packets`/
+> `_nil_negotiated_mtu` linked in. (x86_64/universal hit an SDK build-sandbox quirk — local dev is
+> arm64-only; universal is a distribution follow-up.)
+>
+> **M3 (activate + connect) is BLOCKED on the paid Apple Developer Program.** A signed build with a
+> free/personal team (`Apple Development`, here team MN9HR4P896) fails: `No profiles for
+> 'com.nilvpn.client.PacketTunnel' were found` — `-allowProvisioningUpdates` cannot create a profile
+> because personal teams **cannot provision the Network Extension / System Extension capabilities**.
+> Dev mode relaxes *notarization*, not *entitlement provisioning*, so the SE cannot be activated until
+> the App ID `com.nilvpn.client.PacketTunnel` carries the Network Extension capability under a paid
+> membership. **Next human step: enrol in the paid program, enable Network Extensions on the App ID,
+> then re-run the signed build + the activation steps below.**
+
 > **Status: authored, NOT verified.** The macOS System Extension wrapper around the shared
 > `NEPacketTunnelProvider` (`apple/PacketTunnelProvider.swift`) and its build/activation scaffolding
 > are integration code that **cannot be compiled or run here** — there is no Xcode, no dev-mode /
