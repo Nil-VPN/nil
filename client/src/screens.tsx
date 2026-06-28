@@ -240,7 +240,9 @@ export function MainScreen({
 
       <button
         className={`toggle ${connected ? "toggle-on" : "toggle-off"}`}
-        disabled={busy || needToken}
+        // A token is required to CONNECT, but never to disconnect — otherwise, once the last token is
+        // consumed by the active connection (balance → 0), the user could no longer turn the VPN off.
+        disabled={busy || (needToken && !connected)}
         onClick={toggle}
       >
         {connected ? "Disconnect" : "Connect"}

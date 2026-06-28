@@ -57,7 +57,7 @@ export const connect = async (): Promise<ConnState> => {
     // Preflight the OS VPN consent BEFORE redeeming: a single-use token must not be burned if the
     // user hasn't granted (or denies) the VPN permission. prepareVPN launches the system dialog when
     // needed and reports authorized=false so we stop here without touching the token store.
-    const { authorized } = await invoke<{ authorized: boolean }>("plugin:nil-vpn|prepareVPN");
+    const { authorized } = await invoke<{ authorized: boolean }>("plugin:nil-vpn|prepareVpn");
     if (!authorized) {
       throw new Error("Grant the VPN permission in the system dialog, then tap Connect again.");
     }
@@ -66,24 +66,24 @@ export const connect = async (): Promise<ConnState> => {
     // command backs the macOS system-extension build; routing macOS Connect through it lands with
     // the SE control plugin (see the macOS-SE milestones).
     const args = await invoke<NativeStartArgs>("extension_connect");
-    await invoke<void>("plugin:nil-vpn|startVPN", args);
+    await invoke<void>("plugin:nil-vpn|startVpn", args);
     // startVPN only KICKS OFF the out-of-process VpnService; the MASQUE handshake + the attestation
     // gate run there. Poll the engine's REAL status and report connected ONLY once it confirms the
     // tunnel is up — never optimistically, so the UI can't claim protection the gate hasn't granted.
     const deadline = Date.now() + MOBILE_CONNECT_TIMEOUT_MS;
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 500));
-      const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVPN");
+      const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVpn");
       if (state === "up") return "connected";
       if (state === "down" || state === "dead") {
         // The service wrote a terminal state: attestation refused, consent denied, or a dead tunnel.
         // Tear down so no half-state lingers, then surface the failure honestly.
-        await invoke<void>("plugin:nil-vpn|stopVPN").catch(() => {});
+        await invoke<void>("plugin:nil-vpn|stopVpn").catch(() => {});
         throw new Error("Tunnel did not come up — attestation or connection failed.");
       }
       // state === "connecting" → keep waiting
     }
-    await invoke<void>("plugin:nil-vpn|stopVPN").catch(() => {});
+    await invoke<void>("plugin:nil-vpn|stopVpn").catch(() => {});
     throw new Error("Tunnel connect timed out.");
   }
   return invoke<ConnState>("connect");
@@ -91,7 +91,7 @@ export const connect = async (): Promise<ConnState> => {
 
 export const disconnect = async (): Promise<ConnState> => {
   if (await isMobile()) {
-    await invoke<void>("plugin:nil-vpn|stopVPN");
+    await invoke<void>("plugin:nil-vpn|stopVpn");
     return "disconnected";
   }
   return invoke<ConnState>("disconnect");
@@ -112,7 +112,7 @@ export const status = async (): Promise<ConnState> => {
   if (await isMobile()) {
     // Mirror the out-of-process VpnService's real health (written by the engine poll) so the UI
     // reflects a dropped tunnel instead of staying stuck on "connected".
-    const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVPN");
+    const { state } = await invoke<{ state: string }>("plugin:nil-vpn|statusVpn");
     return state === "up"
       ? "connected"
       : state === "connecting"

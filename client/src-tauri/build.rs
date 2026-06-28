@@ -8,7 +8,11 @@ fn main() {
     let attributes = tauri_build::Attributes::new().plugin(
         "nil-vpn",
         tauri_build::InlinedPlugin::new()
-            .commands(&["startVPN", "stopVPN", "statusVPN", "prepareVPN", "openVpnSettings"])
+            // camelCase with title-case acronyms (Vpn, not VPN): Tauri's mobile plugin dispatch
+            // lowercases a trailing all-caps acronym (startVPN → startVpn) when matching the Kotlin
+            // @Command, so the command names MUST be the already-lowercased form or dispatch fails
+            // at runtime with "No command … found" (the @Command methods match these verbatim).
+            .commands(&["startVpn", "stopVpn", "statusVpn", "prepareVpn", "openVpnSettings"])
             .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
     );
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
