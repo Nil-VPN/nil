@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the NIL VPN macOS System Extension (the packet-tunnel provider).
+
+  INTEGRATION SCAFFOLDING ONLY — this cannot be built or run in this environment (no
+  Xcode / no developer-mode Mac / no Apple Developer account). It is the property list
+  Xcode embeds in the .systemextension bundle so macOS can discover, install, and launch
+  the NEPacketTunnelProvider. Pair it with the matching .entitlements (see SHARED CONTRACT)
+  before signing; the Swift principal class lives in apple/PacketTunnelProvider.swift.
+
+  Key-by-key:
+    CFBundleIdentifier        — the SE's bundle id; MUST be a child of the container app id
+                                (com.nilvpn.client) so macOS treats it as that app's extension.
+    CFBundleName/DisplayName  — internal + Settings-facing names.
+    CFBundlePackageType       — "SYSX" marks this bundle as a System Extension (vs. "APPL"/"XPC!").
+    CFBundleExecutable        — the Mach-O the SE runs; resolved by Xcode to $(EXECUTABLE_NAME).
+    LSMinimumSystemVersion    — minimum macOS (13.0), per the shared deployment target.
+    NSExtension               — declares this as an app/system extension:
+      NSExtensionPointIdentifier — com.apple.networkextension.packet-tunnel: this SE is an
+                                   NEPacketTunnelProvider (the Personal-VPN / packet-tunnel point).
+      NSExtensionPrincipalClass  — $(PRODUCT_MODULE_NAME).PacketTunnelProvider: NetworkExtension
+                                   instantiates this Swift class. The $(PRODUCT_MODULE_NAME) prefix
+                                   is the Swift-module namespacing Xcode expands at build time.
+    NEMachServiceName         — the registered Mach service the container app's NETunnelProviderManager
+                                reaches the provider through; uses the App Group so app + SE share it.
+    NEProviderClasses         — maps the packet-tunnel extension point to the provider class, so the
+                                NE framework knows which class backs which point inside this bundle.
+
+  Privacy note (NIL SOUL): nothing identifying lives here — this file declares only how macOS
+  loads the extension. No node address, token, grant, or measurement appears in any plist; those
+  cross over at runtime via providerConfiguration only, and are never logged (PD-2/PD-3).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>NIL VPN</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.nilvpn.client.PacketTunnel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NIL VPN Packet Tunnel</string>
+	<key>CFBundlePackageType</key>
+	<string>SYSX</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.networkextension.packet-tunnel</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+	</dict>
+	<key>NetworkExtension</key>
+	<dict>
+		<key>NEMachServiceName</key>
+		<string>group.com.nilvpn.client.PacketTunnel</string>
+		<key>NEProviderClasses</key>
+		<dict>
+			<key>com.apple.networkextension.packet-tunnel</key>
+			<string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+		</dict>
+	</dict>
+</dict>
+</plist>

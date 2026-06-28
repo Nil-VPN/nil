@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NIL VPN — System Extension entitlements
+  (bundle id: com.nilvpn.client.PacketTunnel, child of the app id).
+
+  This is integration scaffolding. It CANNOT be compiled, signed, or run in this
+  environment (no Xcode, no developer-mode Mac, no Apple Developer account).
+  Signing for real requires a paid Apple Developer ID plus provisioning that
+  grants the Network Extension capability — a deferred milestone.
+
+  Privacy note (NIL SOUL): the System Extension is the only place packets flow.
+  It receives just the node endpoint + pinned measurement + per-connection grant
+  via providerConfiguration and never logs any of it (PD-2, PD-3). It carries no
+  account, email, or payment identity — none is ever passed to it.
+
+  Keys, and why each is here:
+
+  * com.apple.developer.networking.networkextension
+      Same value as the app (`packet-tunnel-provider-systemextension`). The
+      NEPacketTunnelProvider process must itself hold this entitlement to be
+      loaded by the OS as a packet-tunnel provider.
+
+  * com.apple.security.application-groups
+      Identical group `group.com.nilvpn.client` as the app, so the extension can
+      reach the shared container. Must match the app's value exactly.
+
+  Note: the extension does NOT carry com.apple.developer.system-extension.install
+  — only the container app installs/activates extensions.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider-systemextension</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.nilvpn.client</string>
+	</array>
+</dict>
+</plist>

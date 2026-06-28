@@ -14,6 +14,7 @@ fn main() {
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 
     sync_android_sources();
+    sync_apple_sources();
 }
 
 /// Mirror the canonical Android/Kotlin VPN sources (`crates/nil-android/android/*.kt`) into the
@@ -61,6 +62,53 @@ fn sync_android_sources() {
             if let Err(e) = std::fs::copy(&path, &target) {
                 println!(
                     "cargo:warning=failed to sync canonical Android source {} into gen/: {e}",
+                    name.to_string_lossy()
+                );
+            }
+        }
+    }
+}
+
+/// Mirror the canonical Apple/Swift sources (`crates/nil-apple/apple/*.swift` — the
+/// `NEPacketTunnelProvider` and the system-extension control bridge) into the gitignored
+/// `gen/apple/...` tree, if one exists. Same rationale and privacy foot-gun as
+/// [`sync_android_sources`]: a fix to a canonical Swift source (e.g. removing a leak) must not depend
+/// on a developer remembering a `cp`, and a regenerated project must not resurrect stale code.
+///
+/// Best-effort and never fatal: a plain `cargo`/desktop build has no `gen/apple` tree (Tauri has no
+/// macOS system-extension generator today — the SE is built from a standalone Xcode project whose
+/// sources point directly at `crates/nil-apple/apple/`), so this no-ops when the target is absent.
+fn sync_apple_sources() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let src = manifest.join("../../crates/nil-apple/apple");
+    // The Tauri-generated Apple project's packet-tunnel target source dir, when one exists.
+    let dst = manifest.join("gen/apple/PacketTunnel");
+    if !src.is_dir() || !dst.is_dir() {
+        return; // No Apple gen tree (desktop build, or the standalone Xcode project is used) — no-op.
+    }
+    let entries = match std::fs::read_dir(&src) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("swift") {
+            continue;
+        }
+        // A symlink in the committed source tree is never a legitimate .swift source — skip, don't
+        // follow it (defense-in-depth, mirrors the Android sync).
+        if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        let Some(name) = path.file_name() else { continue };
+        println!("cargo:rerun-if-changed={}", path.display());
+        let target = dst.join(name);
+        if target.exists() {
+            if let Err(e) = std::fs::copy(&path, &target) {
+                println!(
+                    "cargo:warning=failed to sync canonical Apple source {} into gen/: {e}",
                     name.to_string_lossy()
                 );
             }
