@@ -48,7 +48,9 @@ impl From<Entitlement> for EntitlementDto {
 /// There is deliberately no email, no name, and no signup IP — the absence *is* the privacy
 /// guarantee (a hard privacy invariant; architecture spec §7.5). The single timestamp that may be
 /// present is the subscription expiry *inside* `entitlement` — tied to the anonymous account, never
-/// to a person (ADR-0007). Even a full Portal compromise yields no personal identity.
+/// to a person (ADR-0007). `auth_pubkey` is the **public** half of a per-account Ed25519 key derived
+/// from the account secret — an anonymous key (no identity), used to verify a signed challenge so a
+/// subscriber can mint tokens. Even a full Portal compromise yields no personal identity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountRecord {
     /// `= H(secret)`; doubles as the store's lookup key.
@@ -56,6 +58,9 @@ pub struct AccountRecord {
     /// `SHA-256(domain || recovery_code)` — never the code itself.
     pub recovery_code_hash: [u8; 32],
     pub entitlement: Entitlement,
+    /// Public half of the account's auth key (ADR-0007). All-zero marks a legacy account with no
+    /// auth key — it can never pass auth (see `nil_crypto::account::verify_auth_signature`).
+    pub auth_pubkey: [u8; 32],
 }
 
 #[cfg(test)]
@@ -92,19 +97,24 @@ mod tests {
         assert_eq!(EntitlementDto::from(Entitlement::Expired), EntitlementDto::Expired);
     }
 
-    /// Tripwire on the "store only H(secret) + entitlement" invariant. This exhaustive
-    /// destructuring (no `..`) fails to COMPILE the moment anyone adds a field such as
-    /// an email or signup IP, forcing a conscious review before any PII can be stored.
+    /// Tripwire on the "store only non-identifying account fields" invariant. This exhaustive
+    /// destructuring (no `..`) fails to COMPILE the moment anyone adds a field such as an email or
+    /// signup IP, forcing a conscious review before any PII can be stored. The set was widened from
+    /// three to FOUR fields under ADR-0007: `auth_pubkey` is a per-account *anonymous* key (no
+    /// identity), added deliberately through this very tripwire. Adding anything identity-bearing
+    /// must still stop here and be justified against a Prime Directive.
     #[test]
-    fn account_record_has_exactly_three_non_identifying_fields() {
+    fn account_record_has_exactly_four_non_identifying_fields() {
         let AccountRecord {
             account_number: _,
             recovery_code_hash: _,
             entitlement: _,
+            auth_pubkey: _,
         } = AccountRecord {
             account_number: [0u8; 32],
             recovery_code_hash: [0u8; 32],
             entitlement: Entitlement::None,
+            auth_pubkey: [0u8; 32],
         };
     }
 }

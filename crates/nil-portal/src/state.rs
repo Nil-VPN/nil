@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::account::auth::ChallengeStore;
 use crate::ratelimit::RateLimiter;
 use crate::store::Store;
 
@@ -21,11 +22,18 @@ pub struct AppState {
     /// Abuse control on `POST /v1/account` (create), keyed by client IP. Caps storage-exhaustion
     /// flooding. PII-free: a transient per-window counter, never persisted or logged.
     pub limiter: Arc<RateLimiter>,
+    /// Single-use, short-TTL account-auth challenges (ADR-0007). In-memory and non-identifying:
+    /// throwaway nonces a client signs to prove account ownership before minting.
+    pub challenges: Arc<ChallengeStore>,
 }
 
 impl AppState {
     /// Build the account-plane state with the default create rate limiter.
     pub fn new(store: Arc<dyn Store>) -> Self {
-        Self { store, limiter: Arc::new(RateLimiter::new(CREATE_RATE_MAX, CREATE_RATE_WINDOW)) }
+        Self {
+            store,
+            limiter: Arc::new(RateLimiter::new(CREATE_RATE_MAX, CREATE_RATE_WINDOW)),
+            challenges: Arc::new(ChallengeStore::new()),
+        }
     }
 }

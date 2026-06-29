@@ -8,9 +8,11 @@ use axum::Json;
 
 use nil_crypto::account::{self, Phrase, RecoveryCode};
 use nil_proto::account::{
-    CreateAccountRequest, CreateAccountResponse, RecoverRequest, RecoverResponse,
+    AccountAuth, AccountStatusResponse, ChallengeResponse, CreateAccountRequest,
+    CreateAccountResponse, RecoverRequest, RecoverResponse,
 };
 
+use crate::account::auth::{authenticate, AuthError};
 use crate::account::error::ApiError;
 use crate::account::model::{AccountRecord, Entitlement};
 use crate::state::AppState;
@@ -39,6 +41,10 @@ pub async fn create_account(
                 account_number: *derived.account_number.as_bytes(),
                 recovery_code_hash: derived.recovery_code_hash,
                 entitlement: Entitlement::None,
+                // Store the PUBLIC auth key so the account can later prove ownership via a signed
+                // challenge (ADR-0007). The secret half is derived on the client from the phrase
+                // and never leaves it.
+                auth_pubkey: derived.auth_public_key,
             };
             state
                 .store
@@ -100,6 +106,61 @@ pub async fn recover_account(
         entitlement: entitlement.into(),
         until: entitlement.active_until(now),
     }))
+}
+
+/// `POST /v1/account/challenge` — mint a single-use, short-TTL nonce for account auth (ADR-0007).
+///
+/// No request body and no account identifier: a challenge is account-agnostic (the signature, which
+/// only the key holder can produce, ties it to an account at verify time), so issuing one reveals
+/// nothing — not even whether any account exists. Rate-limited per IP like the other write paths.
+pub async fn account_challenge(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+) -> Result<Json<ChallengeResponse>, ApiError> {
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(ApiError::TooManyRequests);
+    }
+    let now = nil_core::grant::now_unix_secs();
+    let challenge = state.challenges.issue(now).map_err(|e| {
+        // Never log the nonce; only that minting failed.
+        tracing::error!("challenge CSPRNG failed: {e}");
+        ApiError::Internal
+    })?;
+    Ok(Json(ChallengeResponse { challenge }))
+}
+
+/// `POST /v1/account/status` — the authenticated subscription state (ADR-0007).
+///
+/// The client first gets a nonce from `/v1/account/challenge`, signs it with its account auth key,
+/// and posts the [`AccountAuth`] proof here. The Portal verifies it, resolves the entitlement
+/// against the clock, and returns status only — never any identity. This is what a re-logged-in
+/// client calls to learn "am I still subscribed, and until when?".
+pub async fn account_status(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(state): State<AppState>,
+    Json(auth): Json<AccountAuth>,
+) -> Result<Json<AccountStatusResponse>, ApiError> {
+    if !state.limiter.check(&peer.ip().to_string()) {
+        return Err(ApiError::TooManyRequests);
+    }
+    // A gate ("is the subscription still live?") → fail-closed clock: unknown clock reads as Expired.
+    let now = nil_core::grant::now_unix_secs_for_expiry();
+    let record = authenticate(&state, &auth, now).await.map_err(map_auth_err)?;
+    let entitlement = record.entitlement.resolved(now);
+    Ok(Json(AccountStatusResponse {
+        entitlement: entitlement.into(),
+        until: entitlement.active_until(now),
+    }))
+}
+
+/// Map an [`AuthError`] to its HTTP error. `Unauthorized` is deliberately one bucket (no
+/// account-existence oracle, PD-3); a malformed proof is a 400; a backend failure fails closed.
+fn map_auth_err(e: AuthError) -> ApiError {
+    match e {
+        AuthError::Malformed => ApiError::BadRequest("malformed authentication proof"),
+        AuthError::Unauthorized => ApiError::Unauthorized,
+        AuthError::Backend => ApiError::Internal,
+    }
 }
 
 /// `GET /v1/account` — account + entitlement status. Session-authenticated; Phase 1.

@@ -57,6 +57,39 @@ pub enum EntitlementDto {
     Expired,
 }
 
+/// Response for `POST /v1/account/challenge` — a single-use, short-TTL nonce the client signs with
+/// its account auth key to prove ownership (ADR-0007). The nonce is opaque and non-identifying.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeResponse {
+    /// Lowercase-hex challenge nonce. The client signs these ASCII bytes with its auth key.
+    pub challenge: String,
+}
+
+/// Proof of account ownership attached to an authenticated request (e.g. mint, account-tied
+/// checkout). All three fields are anonymous: the account number is `H(secret)`, the auth key is a
+/// per-account anonymous key, and the challenge is a throwaway nonce. Nothing identity-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountAuth {
+    /// Lowercase hex of the 32-byte account number (`H(secret)`), as the client derives from the
+    /// recovery phrase. The Portal uses it as the store lookup key.
+    pub account_number: String,
+    /// The challenge nonce returned by `POST /v1/account/challenge` (echoed back).
+    pub challenge: String,
+    /// Lowercase hex of the 64-byte Ed25519 signature over the challenge's ASCII bytes.
+    pub signature: String,
+}
+
+/// Response for `POST /v1/account/status` — the authenticated subscription state. Status only,
+/// never any identity (the caller already knows which account it authenticated as).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountStatusResponse {
+    pub entitlement: EntitlementDto,
+    /// Subscription expiry (unix secs) iff `entitlement == Active` — lets the client show
+    /// "Active until …". Tied to the anonymous account, never to a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

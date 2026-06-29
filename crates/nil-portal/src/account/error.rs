@@ -9,6 +9,8 @@ use serde::Serialize;
 pub enum ApiError {
     #[error("not implemented")]
     NotImplemented,
+    #[error("bad request: {0}")]
+    BadRequest(&'static str),
     #[error("invalid recovery phrase: {0}")]
     BadPhrase(String),
     /// Recovery failed: either no account matches the phrase OR the recovery code is wrong. These
@@ -31,6 +33,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
             ApiError::NotImplemented => StatusCode::NOT_IMPLEMENTED,
+            ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::BadPhrase(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,

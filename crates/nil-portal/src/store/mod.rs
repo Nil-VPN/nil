@@ -62,6 +62,22 @@ pub(crate) fn ent_from(s: &str) -> Option<Entitlement> {
     }
 }
 
+/// Serialize the account auth public key (ADR-0007) to the store's TEXT column: lowercase hex.
+pub(crate) fn auth_str(pk: &[u8; 32]) -> String {
+    hex32(pk)
+}
+
+/// Parse an auth-public-key column. An EMPTY column is a legacy/pre-ADR-0007 row that predates the
+/// auth key: it maps to the all-zero sentinel, which can never pass auth (so such an account simply
+/// can't use the subscription flows until re-created — fail-closed). Any other value must be valid
+/// 32-byte hex.
+pub(crate) fn auth_from(s: &str) -> Option<[u8; 32]> {
+    if s.is_empty() {
+        return Some([0u8; 32]);
+    }
+    unhex32(s)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error("account already exists")]
@@ -108,6 +124,17 @@ mod ent_encoding_tests {
         assert_eq!(ent_from("active:"), None);
         assert_eq!(ent_from("active:notanumber"), None);
         assert_eq!(ent_from("bogus"), None);
+    }
+
+    #[test]
+    fn auth_pubkey_round_trips_and_handles_legacy_empty() {
+        let pk = [0xab; 32];
+        assert_eq!(auth_from(&auth_str(&pk)), Some(pk));
+        // A legacy/pre-ADR-0007 row has no auth column → all-zero sentinel.
+        assert_eq!(auth_from(""), Some([0u8; 32]));
+        // Anything non-empty must be valid 32-byte hex.
+        assert_eq!(auth_from("xyz"), None);
+        assert_eq!(auth_from("ab"), None);
     }
 }
 

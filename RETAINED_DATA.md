@@ -15,12 +15,16 @@ and die with the process. There is no analytics, no crash SDK, no usage telemetr
 |---|---|---|---|
 | `account_number` | `H(secret)` — a hash of the account secret; **not** an email or name | While the account exists | Authenticate the account on use. Nothing identifying is derivable from the hash. (PD-1) |
 | `recovery_code_hash` | SHA-256 of the recovery code | While the account exists | Let a holder recover their account. (PD-1) |
-| `entitlement` | Enum (`none` / `active` / `expired`) | While the account exists | Gate token issuance to a paid account. Carries no identity. (PD-1) |
+| `entitlement` | Enum `none` / `active` / `expired`; an `active` subscription also carries its **expiry** (a unix-seconds deadline) | While the account exists | Gate token issuance to a subscribed account, and know when the subscription lapses. The expiry is tied to the anonymous account, never to a person. Carries no identity. (PD-1) |
+| `auth_pubkey` | The **public** half of a per-account Ed25519 key derived from the account secret | While the account exists | Verify a signed challenge so a subscriber can mint fresh connection tokens. An anonymous per-account key — not an email, name, or device id; the secret half never leaves the client. (PD-1/PD-4) |
 
 There is **no** email, name, signup IP, signup timestamp, payment identifier, or session/activity
-field. (An optional email-account flow, if ever built, would store only an *encrypted* email — out
-of scope here.) Both a compile-time tripwire (`account/model.rs`) and the runtime schema audit
-enforce this.
+field. The **only** timestamp stored is the subscription expiry carried inside `entitlement` — a
+coarse billing deadline tied to the anonymous account, never to a person — and the **only** key
+stored is the *public* `auth_pubkey` (the account proves ownership by signing with the private half,
+which stays on the client). (An optional email-account flow, if ever built, would store only an
+*encrypted* email — out of scope here.) Both a compile-time tripwire (`account/model.rs`) and the
+runtime schema audit enforce this.
 
 ## 2. Control plane — `nil-coordinator` nullifiers table
 

@@ -20,6 +20,10 @@ classic-mceliece-rust = { workspace = true }
 # Privacy Pass unlinkable blind tokens (Phase 3): issuer signs with the private key, verifier
 # checks with only the public key — the blinding makes redemption unlinkable to issuance.
 blind-rsa-signatures = { workspace = true }
+# Account auth key (ADR-0007): an Ed25519 keypair derived from the account secret. The client
+# signs a Portal challenge; the Portal stores only the public half. `zeroize` clears the signing
+# key on drop. Same major version already used by `nil-attest`.
+ed25519-dalek = { version = "2", features = ["zeroize"] }
 
 [dev-dependencies]
 rand_chacha = "0.3"

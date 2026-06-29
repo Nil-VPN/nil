@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{ent_from, ent_str, hex32, unhex32, Store, StoreError};
+use super::{auth_from, auth_str, ent_from, ent_str, hex32, unhex32, Store, StoreError};
 use crate::account::model::AccountRecord;
 
 /// On-disk representation of one account (hex-encoded; PII-free by construction).
@@ -24,6 +24,10 @@ struct RecordDto {
     account_number: String,
     recovery_code_hash: String,
     entitlement: String,
+    // Additive (ADR-0007): default "" so a record written before the auth key reads back as the
+    // all-zero "no auth key" sentinel rather than failing to parse.
+    #[serde(default)]
+    auth_pubkey: String,
 }
 
 impl RecordDto {
@@ -32,6 +36,7 @@ impl RecordDto {
             account_number: hex32(&r.account_number),
             recovery_code_hash: hex32(&r.recovery_code_hash),
             entitlement: ent_str(r.entitlement),
+            auth_pubkey: auth_str(&r.auth_pubkey),
         }
     }
 
@@ -40,6 +45,7 @@ impl RecordDto {
             account_number: unhex32(&self.account_number)?,
             recovery_code_hash: unhex32(&self.recovery_code_hash)?,
             entitlement: ent_from(&self.entitlement)?,
+            auth_pubkey: auth_from(&self.auth_pubkey)?,
         })
     }
 }
@@ -148,7 +154,12 @@ mod tests {
     }
 
     fn record(byte: u8, ent: Entitlement) -> AccountRecord {
-        AccountRecord { account_number: [byte; 32], recovery_code_hash: [byte ^ 0xff; 32], entitlement: ent }
+        AccountRecord {
+            account_number: [byte; 32],
+            recovery_code_hash: [byte ^ 0xff; 32],
+            entitlement: ent,
+            auth_pubkey: [byte ^ 0x0f; 32],
+        }
     }
 
     #[cfg(unix)]
@@ -181,6 +192,7 @@ mod tests {
         let got = s2.get(&[1u8; 32]).await.expect("get").expect("account 1 persisted");
         assert_eq!(got.entitlement, Entitlement::Active { until: 1_900_000_000 });
         assert_eq!(got.recovery_code_hash, [0xfeu8; 32]);
+        assert_eq!(got.auth_pubkey, [0x0eu8; 32], "auth pubkey survives a restart");
         assert!(s2.get(&[2u8; 32]).await.expect("get").is_some());
         assert!(s2.get(&[3u8; 32]).await.expect("get").is_none());
 
