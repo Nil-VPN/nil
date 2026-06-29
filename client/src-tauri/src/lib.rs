@@ -52,6 +52,19 @@ fn derive_auth_material(phrase: &[String]) -> Result<AccountAuthMaterial, String
     })
 }
 
+/// Serializes tests that read or mutate the shared `NW_*` process env — the engine connect-path
+/// tests (which read `NW_COORDINATOR_URL`) vs. the config `apply_env` tests (which set it).
+/// `std::env` is process-global, so without this they race when the test harness runs them in
+/// parallel (a config test setting `NW_COORDINATOR_URL` makes a concurrent loopback `connect`
+/// take the real-path branch and fail `NoTokens`). A `tokio::sync::Mutex` because the engine tests
+/// hold the guard across `connect().await` (a `std` guard held across await trips clippy and risks
+/// deadlock); a `OnceLock` because `tokio::sync::Mutex::new` isn't `const`. Test-only.
+#[cfg(test)]
+pub(crate) fn env_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 // ---- Settings: operator endpoints + toggles (persisted; applied to the datapath env) ----
 
 #[tauri::command]

@@ -216,8 +216,20 @@ mod tests {
         );
     }
 
+    /// Hold the shared env lock and clear `NW_COORDINATOR_URL` so a parallel `config` test's
+    /// `apply_env` can't make this loopback `connect(None)` take the real (token-required) path and
+    /// fail `NoTokens`. `std::env` is process-global; the lock serializes the env-reading connect
+    /// tests against the env-mutating config tests. The (tokio) guard is held for the whole test
+    /// body — including across `connect().await`.
+    async fn loopback_env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        let g = crate::env_test_lock().lock().await;
+        std::env::remove_var("NW_COORDINATOR_URL");
+        g
+    }
+
     #[tokio::test]
     async fn connect_disconnect_cycle() {
+        let _env = loopback_env_guard().await;
         assert_unconfigured();
         let engine = AppEngine::new();
         assert_eq!(engine.state().await, ConnState::Disconnected);
@@ -228,6 +240,7 @@ mod tests {
 
     #[tokio::test]
     async fn double_connect_is_rejected() {
+        let _env = loopback_env_guard().await;
         assert_unconfigured();
         let engine = AppEngine::new();
         engine.connect(None).await.expect("first connect");
