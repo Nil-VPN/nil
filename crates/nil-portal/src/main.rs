@@ -11,10 +11,12 @@ mod app;
 mod billing;
 #[cfg(feature = "card-payments")]
 mod cards;
+mod mint;
 mod monero;
 mod ratelimit;
 mod state;
 mod store;
+mod subscription;
 mod tokens;
 
 use std::net::SocketAddr;
@@ -27,10 +29,12 @@ use nil_crypto::Issuer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
+use crate::mint::{mint_router, MintState};
 use crate::monero::{MockWatcher, MoneroRpcWatcher, PaymentWatcher};
 use crate::state::AppState;
 use crate::store::{file::FileStore, memory::InMemoryStore, Store};
-use crate::tokens::{token_router, TokenState};
+use crate::subscription::{subscription_router, SubscriptionState};
+use crate::tokens::{token_router, TokenSigner, TokenState};
 
 /// (composed payment watcher, optional card rail = (card watcher shared with the composite, the
 /// MoR signing secret)). Aliased so the dual-rail wiring below isn't a clippy::type_complexity wall.
@@ -180,6 +184,13 @@ async fn main() -> Result<()> {
             _ => (watcher, None),
         };
 
+    // Clone the (possibly composite) watcher for the subscription plane before it moves into the
+    // token state — both planes ask the SAME watcher "has this reference been paid?".
+    let watcher_for_sub = watcher.clone();
+    // Clone the issuer for the mint plane before it moves into the token state — mint blind-signs
+    // with the SAME issuer key as one-shot issuance, just gated on a subscription.
+    let issuer_for_mint: Arc<dyn TokenSigner> = issuer.clone();
+
     // One-token-per-payment set: durable when NW_ISSUED_PATH is set, else volatile + a warning
     // (a restart with a volatile set could re-issue a token for an already-spent payment).
     let token_state = match std::env::var("NW_ISSUED_PATH") {
@@ -234,10 +245,92 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Subscription durable sets (ADR-0007), both PII-free (each holds only opaque hashes of a
+    // payment reference + account number — no plaintext payment↔account link):
+    //  - bindings: references a client subscribed for but hasn't activated yet. TIMED so abandoned
+    //    subscriptions age out (pruned by the same task as `pending`). Durable so a payment that
+    //    confirms after a restart can still be activated.
+    //  - activated: references already used to extend a subscription — one extension per payment,
+    //    durable and never pruned (like the one-token-per-payment `issued` set).
+    // Couple the two sets' durability: `bindings` + `activated` TOGETHER form the anti-double-extend
+    // invariant. A durable binding that outlives a VOLATILE activated set re-opens a paid reference
+    // for re-extension after a restart, so refuse that asymmetry at startup rather than fall back to
+    // a volatile activated set (mirrors the NW_CARD_REVOKED_PATH bail above). The reverse — durable
+    // activated, volatile bindings — is harmless (a lost binding only fails closed), so allow it.
+    if std::env::var("NW_SUB_BINDINGS_PATH").is_ok() && std::env::var("NW_SUB_ACTIVATED_PATH").is_err() {
+        anyhow::bail!(
+            "NW_SUB_ACTIVATED_PATH must be set when NW_SUB_BINDINGS_PATH is — the anti-double-extend \
+             guard MUST survive restarts (a durable subscription binding outliving a volatile \
+             activated set would re-open an already-paid reference for re-extension after a restart)"
+        );
+    }
+    let sub_bindings = match std::env::var("NW_SUB_BINDINGS_PATH") {
+        Ok(path) => {
+            let s = TimedDurableSet::open(&path)
+                .map_err(|e| anyhow::anyhow!("open subscription bindings store {path}: {e}"))?;
+            tracing::info!(%path, bindings = s.len(), "durable subscription-binding set loaded");
+            Arc::new(s)
+        }
+        Err(_) => {
+            tracing::warn!("NW_SUB_BINDINGS_PATH unset — subscription bindings are VOLATILE (dev only; a restart drops in-flight subscriptions)");
+            Arc::new(TimedDurableSet::in_memory())
+        }
+    };
+    let sub_activated = match std::env::var("NW_SUB_ACTIVATED_PATH") {
+        Ok(path) => {
+            let s = DurableSet::open(&path)
+                .map_err(|e| anyhow::anyhow!("open subscription activated store {path}: {e}"))?;
+            tracing::info!(%path, activated = s.len(), "durable subscription-activated set loaded");
+            Arc::new(s)
+        }
+        Err(_) => {
+            tracing::warn!("NW_SUB_ACTIVATED_PATH unset — the subscription-activated set is VOLATILE (dev only; a restart can re-extend an already-claimed payment)");
+            Arc::new(DurableSet::in_memory())
+        }
+    };
+    // TTL-prune the subscription-binding set on the same schedule/policy as `pending` (abandoned
+    // subscriptions age out; fail-closed — pruning can only deny a stale binding, never enable a
+    // double-extend, which is the separate, never-pruned `activated` set).
+    let bindings_for_prune = sub_bindings.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            let cutoff = nil_core::grant::now_unix_secs().saturating_sub(ttl_secs);
+            match bindings_for_prune.prune_older_than(cutoff) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(pruned = n, "subscription-binding TTL prune"),
+                Err(e) => tracing::warn!("subscription-binding prune failed (non-fatal): {e}"),
+            }
+        }
+    });
+
+    // Per-account mint cap (the abuse/resale bound). Tunable via NW_MINT_RATE_MAX; default is
+    // generous for real use (a token per connection, reconnects, multi-hop) but far below resale.
+    let mint_rate_max = match std::env::var("NW_MINT_RATE_MAX") {
+        Ok(s) => match s.parse::<u32>() {
+            Ok(v) if v > 0 => v,
+            _ => {
+                tracing::warn!(value = %s, "NW_MINT_RATE_MAX is not a positive u32 — using the default");
+                mint::DEFAULT_MINT_ACCOUNT_RATE_MAX
+            }
+        },
+        Err(_) => mint::DEFAULT_MINT_ACCOUNT_RATE_MAX,
+    };
+
+    // Share ONE account state across the account, subscription, and mint routers so a challenge
+    // issued by `/v1/account/challenge` is consumable by `/v1/billing/activate` and `/v1/tokens/mint`
+    // (same in-memory challenge set).
+    let app_state = AppState::new(store);
+    let sub_state =
+        SubscriptionState::new(app_state.clone(), watcher_for_sub, sub_bindings, sub_activated);
+    let mint_state = MintState::new(app_state.clone(), issuer_for_mint, mint_rate_max);
+
     #[allow(unused_mut)] // `mut` is only needed when the card-payments feature merges its router.
-    let mut app = app::router(AppState::new(store))
+    let mut app = app::router(app_state)
         .merge(token_router(token_state.clone()))
-        .merge(billing::billing_router(token_state));
+        .merge(billing::billing_router(token_state))
+        .merge(subscription_router(sub_state))
+        .merge(mint_router(mint_state));
     #[cfg(feature = "card-payments")]
     if let Some((card, secret)) = card_rail {
         app = app.merge(cards::cards_router(card, secret));

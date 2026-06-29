@@ -38,21 +38,44 @@ pub(crate) fn unhex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-pub(crate) fn ent_str(e: Entitlement) -> &'static str {
+/// Serialize an entitlement to the store's TEXT column. An active subscription encodes its expiry as
+/// `active:<unix_secs>` so the durable record round-trips the `until`; `none`/`expired` are bare.
+pub(crate) fn ent_str(e: Entitlement) -> String {
     match e {
-        Entitlement::None => "none",
-        Entitlement::Active => "active",
-        Entitlement::Expired => "expired",
+        Entitlement::None => "none".to_string(),
+        Entitlement::Active { until } => format!("active:{until}"),
+        Entitlement::Expired => "expired".to_string(),
     }
 }
 
 pub(crate) fn ent_from(s: &str) -> Option<Entitlement> {
     match s {
         "none" => Some(Entitlement::None),
-        "active" => Some(Entitlement::Active),
         "expired" => Some(Entitlement::Expired),
-        _ => None,
+        // Back-compat: a legacy bare "active" (pre-expiry rows) reads as already-lapsed, so a
+        // pre-ADR-0007 row can never grant unlimited access — it must be re-activated by a payment.
+        "active" => Some(Entitlement::Expired),
+        other => other
+            .strip_prefix("active:")
+            .and_then(|u| u.parse::<u64>().ok())
+            .map(|until| Entitlement::Active { until }),
     }
+}
+
+/// Serialize the account auth public key (ADR-0007) to the store's TEXT column: lowercase hex.
+pub(crate) fn auth_str(pk: &[u8; 32]) -> String {
+    hex32(pk)
+}
+
+/// Parse an auth-public-key column. An EMPTY column is a legacy/pre-ADR-0007 row that predates the
+/// auth key: it maps to the all-zero sentinel, which can never pass auth (so such an account simply
+/// can't use the subscription flows until re-created — fail-closed). Any other value must be valid
+/// 32-byte hex.
+pub(crate) fn auth_from(s: &str) -> Option<[u8; 32]> {
+    if s.is_empty() {
+        return Some([0u8; 32]);
+    }
+    unhex32(s)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,4 +94,65 @@ pub trait Store: Send + Sync {
     async fn insert(&self, record: AccountRecord) -> Result<(), StoreError>;
     /// Fetch an account by its number (= `H(secret)`), if present.
     async fn get(&self, account_number: &[u8; 32]) -> Result<Option<AccountRecord>, StoreError>;
+    /// Atomically extend (or start) a subscription by `by_secs`, stacking on the account's CURRENT
+    /// persisted expiry: `new_until = max(now_secs, current_until) + by_secs`. The base is read from
+    /// the stored value **under the same lock/row as the write**, so two concurrent activations of
+    /// distinct confirmed payments each add their period (no lost update — unlike a read-then-set on
+    /// a pre-read snapshot). Returns the new `until` (`Some`), or `None` if no such account exists.
+    async fn extend_subscription(
+        &self,
+        account_number: &[u8; 32],
+        now_secs: u64,
+        by_secs: u64,
+    ) -> Result<Option<u64>, StoreError>;
+}
+
+#[cfg(test)]
+mod ent_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn ent_str_round_trips_through_ent_from() {
+        for e in [
+            Entitlement::None,
+            Entitlement::Expired,
+            Entitlement::Active { until: 0 },
+            Entitlement::Active { until: 1_900_000_000 },
+            Entitlement::Active { until: u64::MAX },
+        ] {
+            let s = ent_str(e);
+            assert_eq!(ent_from(&s), Some(e), "round-trip failed for {e:?} -> {s:?}");
+        }
+    }
+
+    #[test]
+    fn active_encodes_its_expiry() {
+        assert_eq!(ent_str(Entitlement::Active { until: 1_234 }), "active:1234");
+        assert_eq!(ent_str(Entitlement::None), "none");
+        assert_eq!(ent_str(Entitlement::Expired), "expired");
+    }
+
+    #[test]
+    fn legacy_bare_active_reads_as_expired_not_unlimited() {
+        // A pre-ADR-0007 row had a bare "active" with no expiry; it must NOT grant unlimited access.
+        assert_eq!(ent_from("active"), Some(Entitlement::Expired));
+    }
+
+    #[test]
+    fn malformed_entitlement_columns_are_rejected() {
+        assert_eq!(ent_from("active:"), None);
+        assert_eq!(ent_from("active:notanumber"), None);
+        assert_eq!(ent_from("bogus"), None);
+    }
+
+    #[test]
+    fn auth_pubkey_round_trips_and_handles_legacy_empty() {
+        let pk = [0xab; 32];
+        assert_eq!(auth_from(&auth_str(&pk)), Some(pk));
+        // A legacy/pre-ADR-0007 row has no auth column → all-zero sentinel.
+        assert_eq!(auth_from(""), Some([0u8; 32]));
+        // Anything non-empty must be valid 32-byte hex.
+        assert_eq!(auth_from("xyz"), None);
+        assert_eq!(auth_from("ab"), None);
+    }
 }

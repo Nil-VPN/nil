@@ -275,6 +275,11 @@ mod tests {
 
     #[test]
     fn update_changes_only_the_targeted_field_and_persists() {
+        // `state.update` calls `apply_env`, which set_var's NW_COORDINATOR_URL into the PROCESS env.
+        // Hold the shared env lock so this can't race the engine loopback-connect tests (which read
+        // NW_COORDINATOR_URL) when the harness runs tests in parallel. std::env is process-global.
+        // `blocking_lock`: this is a sync `#[test]` (no async runtime), so it can't `.await`.
+        let _env = crate::env_test_lock().blocking_lock();
         // The atomic partial-update path: flip one field, leave the rest intact, and round-trip
         // through disk. (This is the writer toggle_kill_switch uses instead of get-mutate-set, so a
         // concurrent full `set` can't lost-update it — the whole RMW runs under the write lock.)

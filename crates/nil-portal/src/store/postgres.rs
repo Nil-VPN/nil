@@ -27,7 +27,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio_postgres::Client;
 
-use super::{ent_from, ent_str, hex32, unhex32, Store, StoreError};
+use super::{auth_from, auth_str, ent_from, ent_str, hex32, unhex32, Store, StoreError};
 use crate::account::model::AccountRecord;
 
 /// Bound every DB round-trip: a reachable-but-stalled database (lock contention, slow failover)
@@ -58,18 +58,33 @@ pub(crate) fn ensure_loopback_for_notls(conn_str: &str) -> Result<(), StoreError
     Ok(())
 }
 
-/// The accounts table. Idempotent so `connect` can run it on startup.
+/// The accounts table. Idempotent so `connect` can run it on startup. `auth_pubkey` (ADR-0007) has
+/// a `DEFAULT ''` and a second idempotent `ALTER` so a table created before the auth key gains the
+/// column without a manual migration; an existing row keeps `''`, which reads back as the all-zero
+/// "no auth key" sentinel (such an account can't pass auth — fail-closed).
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS accounts (\
     account_number TEXT PRIMARY KEY, \
     recovery_code_hash TEXT NOT NULL, \
-    entitlement TEXT NOT NULL)";
+    entitlement TEXT NOT NULL, \
+    auth_pubkey TEXT NOT NULL DEFAULT ''); \
+    ALTER TABLE accounts ADD COLUMN IF NOT EXISTS auth_pubkey TEXT NOT NULL DEFAULT ''";
 
 /// Atomic create: `ON CONFLICT DO NOTHING` makes a duplicate account number a no-op (0 rows),
 /// which `insert` maps to [`StoreError::Duplicate`] — no read-then-write race.
-const INSERT_SQL: &str = "INSERT INTO accounts (account_number, recovery_code_hash, entitlement) \
-    VALUES ($1, $2, $3) ON CONFLICT (account_number) DO NOTHING";
+const INSERT_SQL: &str = "INSERT INTO accounts (account_number, recovery_code_hash, entitlement, auth_pubkey) \
+    VALUES ($1, $2, $3, $4) ON CONFLICT (account_number) DO NOTHING";
 
-const GET_SQL: &str = "SELECT recovery_code_hash, entitlement FROM accounts WHERE account_number = $1";
+const GET_SQL: &str = "SELECT recovery_code_hash, entitlement, auth_pubkey FROM accounts WHERE account_number = $1";
+
+/// Atomically extend a subscription by `$3` seconds, stacking on the row's OWN current expiry:
+/// `new_until = max($2, current_until) + $3`, computed and written in one statement under the
+/// implicit row lock (no lost update across concurrent activations). The current expiry is parsed
+/// from the `active:<secs>` encoding; `none`/`expired`/legacy bare `active` parse to 0, so
+/// `max($2, 0) = now` — a fresh or lapsed subscription re-starts from now. `RETURNING` gives the
+/// new value so the caller can report it. 0 rows ⇒ no such account.
+const EXTEND_SUBSCRIPTION_SQL: &str = "UPDATE accounts SET entitlement = 'active:' || \
+    (GREATEST($2::bigint, COALESCE(NULLIF(split_part(entitlement, ':', 2), '')::bigint, 0)) + $3::bigint)::text \
+    WHERE account_number = $1 RETURNING entitlement";
 
 /// A Postgres-backed account store.
 pub struct PgStore {
@@ -104,26 +119,27 @@ impl PgStore {
     }
 }
 
-/// The three text columns persisted for a record (PII-free). Free function so the encoding is
+/// The four text columns persisted for a record (PII-free). Free function so the encoding is
 /// unit-testable without a live database.
-fn columns(r: &AccountRecord) -> [String; 3] {
-    [hex32(&r.account_number), hex32(&r.recovery_code_hash), ent_str(r.entitlement).to_string()]
+fn columns(r: &AccountRecord) -> [String; 4] {
+    [hex32(&r.account_number), hex32(&r.recovery_code_hash), ent_str(r.entitlement), auth_str(&r.auth_pubkey)]
 }
 
 /// Rebuild a record from its persisted columns, or `None` if any column is malformed.
-fn from_columns(account_hex: &str, recovery_hex: &str, ent: &str) -> Option<AccountRecord> {
+fn from_columns(account_hex: &str, recovery_hex: &str, ent: &str, auth: &str) -> Option<AccountRecord> {
     Some(AccountRecord {
         account_number: unhex32(account_hex)?,
         recovery_code_hash: unhex32(recovery_hex)?,
         entitlement: ent_from(ent)?,
+        auth_pubkey: auth_from(auth)?,
     })
 }
 
 #[async_trait]
 impl Store for PgStore {
     async fn insert(&self, record: AccountRecord) -> Result<(), StoreError> {
-        let [acct, recovery, ent] = columns(&record);
-        let affected = tokio::time::timeout(DB_TIMEOUT, self.client.execute(INSERT_SQL, &[&acct, &recovery, &ent]))
+        let [acct, recovery, ent, auth] = columns(&record);
+        let affected = tokio::time::timeout(DB_TIMEOUT, self.client.execute(INSERT_SQL, &[&acct, &recovery, &ent, &auth]))
             .await
             .map_err(|_| StoreError::Backend("postgres insert timed out".into()))?
             .map_err(|e| StoreError::Backend(format!("postgres insert: {e}")))?;
@@ -149,9 +165,44 @@ impl Store for PgStore {
                 let ent: String = row
                     .try_get(1)
                     .map_err(|e| StoreError::Backend(format!("accounts.entitlement: {e}")))?;
-                from_columns(&acct, &recovery, &ent)
+                let auth: String = row
+                    .try_get(2)
+                    .map_err(|e| StoreError::Backend(format!("accounts.auth_pubkey: {e}")))?;
+                from_columns(&acct, &recovery, &ent, &auth)
                     .ok_or_else(|| StoreError::Backend("malformed row in accounts table".into()))
                     .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn extend_subscription(
+        &self,
+        account_number: &[u8; 32],
+        now_secs: u64,
+        by_secs: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let acct = hex32(account_number);
+        // Postgres bigint is i64. now+30d is far inside i64 range; cast saturating for safety.
+        let now_i = i64::try_from(now_secs).unwrap_or(i64::MAX);
+        let by_i = i64::try_from(by_secs).unwrap_or(i64::MAX);
+        let row = tokio::time::timeout(
+            DB_TIMEOUT,
+            self.client.query_opt(EXTEND_SUBSCRIPTION_SQL, &[&acct, &now_i, &by_i]),
+        )
+        .await
+        .map_err(|_| StoreError::Backend("postgres extend_subscription timed out".into()))?
+        .map_err(|e| StoreError::Backend(format!("postgres extend_subscription: {e}")))?;
+        match row {
+            Some(row) => {
+                let ent: String = row
+                    .try_get(0)
+                    .map_err(|e| StoreError::Backend(format!("accounts.entitlement (extend): {e}")))?;
+                // The row now holds `active:<new_until>`; parse it back to the numeric expiry.
+                let until = ent_from(&ent)
+                    .and_then(|e| e.active_until(now_secs))
+                    .ok_or_else(|| StoreError::Backend("extend produced a non-active entitlement".into()))?;
+                Ok(Some(until))
             }
             None => Ok(None),
         }
@@ -168,21 +219,33 @@ mod tests {
         let rec = AccountRecord {
             account_number: [0xab; 32],
             recovery_code_hash: [0x12; 32],
-            entitlement: Entitlement::Active,
+            entitlement: Entitlement::Active { until: 1_900_000_000 },
+            auth_pubkey: [0x34; 32],
         };
-        let [acct, recovery, ent] = columns(&rec);
+        let [acct, recovery, ent, auth] = columns(&rec);
         assert_eq!(acct.len(), 64); // 32 bytes hex
-        assert_eq!(ent, "active");
-        let back = from_columns(&acct, &recovery, &ent).expect("round-trips");
+        assert_eq!(ent, "active:1900000000");
+        assert_eq!(auth.len(), 64);
+        let back = from_columns(&acct, &recovery, &ent, &auth).expect("round-trips");
         assert_eq!(back, rec);
+    }
+
+    #[test]
+    fn legacy_row_without_auth_pubkey_reads_as_sentinel() {
+        // A pre-ADR-0007 row (auth_pubkey defaulted to '') must still load, with the all-zero key.
+        let back = from_columns(&"a".repeat(64), &"b".repeat(64), "none", "")
+            .expect("legacy row loads");
+        assert_eq!(back.auth_pubkey, [0u8; 32]);
     }
 
     #[test]
     fn malformed_columns_rejected() {
         // Wrong-length hex and unknown entitlement both yield None (mapped to a Backend error, not
         // a silently-wrong record).
-        assert!(from_columns("dead", &"1".repeat(64), "active").is_none());
-        assert!(from_columns(&"a".repeat(64), &"b".repeat(64), "bogus").is_none());
+        assert!(from_columns("dead", &"1".repeat(64), "active", "").is_none());
+        assert!(from_columns(&"a".repeat(64), &"b".repeat(64), "bogus", "").is_none());
+        // A non-empty but malformed auth_pubkey is rejected too.
+        assert!(from_columns(&"a".repeat(64), &"b".repeat(64), "none", "xyz").is_none());
     }
 
     #[test]
@@ -207,7 +270,8 @@ mod schema_audit {
     use super::SCHEMA;
 
     /// The exact accounts columns, mirrored in RETAINED_DATA.md. Keep the two in sync.
-    const DOCUMENTED_COLUMNS: &[&str] = &["account_number", "recovery_code_hash", "entitlement"];
+    const DOCUMENTED_COLUMNS: &[&str] =
+        &["account_number", "recovery_code_hash", "entitlement", "auth_pubkey"];
 
     /// Substrings that betray a personally-identifying column.
     const PII_TOKENS: &[&str] = &[

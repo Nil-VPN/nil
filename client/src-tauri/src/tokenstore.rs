@@ -55,6 +55,15 @@ impl TokenStore {
         Ok(Some(tok))
     }
 
+    /// Drop all stored tokens (e.g. on logout). Idempotent — a missing file is already "empty".
+    pub fn clear(&self) -> Result<(), TokenError> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(TokenError::Storage(format!("clear token store: {e}"))),
+        }
+    }
+
     /// Atomic write (temp file + rename), `0600` on unix — the file holds bearer credentials.
     fn write(&self, tokens: &[StoredToken]) -> Result<(), TokenError> {
         if let Some(dir) = self.path.parent() {
@@ -69,7 +78,9 @@ impl TokenStore {
     }
 }
 
-fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+/// Atomic, owner-only (`0600` on unix) write: temp file + fsync + rename + parent fsync. Shared
+/// with [`crate::authstore`], which persists the account auth seed with the same at-rest guarantees.
+pub(crate) fn write_private_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
 

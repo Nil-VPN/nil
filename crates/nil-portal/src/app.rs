@@ -5,7 +5,9 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::post;
 use axum::Router;
 
-use crate::account::handlers::{create_account, get_account, recover_account};
+use crate::account::handlers::{
+    account_challenge, account_status, create_account, get_account, recover_account,
+};
 use crate::state::AppState;
 
 /// Hard cap on account-endpoint request bodies. A create body is ~30 B and a recover body
@@ -18,6 +20,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/v1/account", post(create_account).get(get_account))
         .route("/v1/account/recover", post(recover_account))
+        .route("/v1/account/challenge", post(account_challenge))
+        .route("/v1/account/status", post(account_status))
         .layer(DefaultBodyLimit::max(ACCOUNT_BODY_LIMIT))
         .with_state(state)
 }
@@ -231,6 +235,128 @@ mod tests {
             }
         }
         assert!(saw_429, "a per-IP recover flood must be capped with 429");
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn status_endpoint_authenticates_and_reports_entitlement() {
+        use nil_crypto::account::{account_number_from_phrase, AuthKeypair, Phrase};
+
+        // ONE app instance so the create/challenge/status calls share the same store + challenge set.
+        let app = app(store());
+
+        let created = body_json(
+            app.clone()
+                .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
+                .await
+                .expect("create"),
+        )
+        .await;
+        let words: Vec<String> = created["recovery_phrase"]
+            .as_array()
+            .expect("phrase")
+            .iter()
+            .map(|w| w.as_str().expect("word").to_string())
+            .collect();
+        let phrase = Phrase::parse(&words).expect("phrase parses");
+        let kp = AuthKeypair::from_phrase(&phrase).expect("derive auth key");
+        let acct_hex = hex(account_number_from_phrase(&phrase).expect("account number").as_bytes());
+
+        // Get a challenge and sign it with the account auth key.
+        let ch = body_json(
+            app.clone()
+                .oneshot(post_json("/v1/account/challenge", ""))
+                .await
+                .expect("challenge"),
+        )
+        .await;
+        let challenge = ch["challenge"].as_str().expect("challenge").to_string();
+        let sig_hex = hex(&kp.sign(challenge.as_bytes()));
+
+        let body = serde_json::json!({
+            "account_number": acct_hex,
+            "challenge": challenge,
+            "signature": sig_hex,
+        })
+        .to_string();
+        let resp = app
+            .clone()
+            .oneshot(post_json("/v1/account/status", &body))
+            .await
+            .expect("status");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["entitlement"], "none", "a fresh account has no subscription");
+        assert!(v.get("until").is_none(), "no expiry when not active");
+
+        // Replaying the same proof must fail — the challenge was single-use.
+        let replay = app
+            .oneshot(post_json("/v1/account/status", &body))
+            .await
+            .expect("status replay");
+        assert_eq!(replay.status(), StatusCode::UNAUTHORIZED, "challenge is single-use");
+    }
+
+    #[tokio::test]
+    async fn status_with_a_bogus_challenge_is_unauthorized() {
+        let app = app(store());
+        let created = body_json(
+            app.clone()
+                .oneshot(post_json("/v1/account", r#"{"type":"anonymous"}"#))
+                .await
+                .expect("create"),
+        )
+        .await;
+        use nil_crypto::account::{account_number_from_phrase, AuthKeypair, Phrase};
+        let words: Vec<String> = created["recovery_phrase"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w.as_str().unwrap().to_string())
+            .collect();
+        let phrase = Phrase::parse(&words).unwrap();
+        let kp = AuthKeypair::from_phrase(&phrase).unwrap();
+        let acct_hex = hex(account_number_from_phrase(&phrase).unwrap().as_bytes());
+        // A nonce the Portal never issued.
+        let challenge = "ab".repeat(32);
+        let body = serde_json::json!({
+            "account_number": acct_hex,
+            "challenge": challenge,
+            "signature": hex(&kp.sign(challenge.as_bytes())),
+        })
+        .to_string();
+        let resp = app
+            .oneshot(post_json("/v1/account/status", &body))
+            .await
+            .expect("status");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn challenge_endpoint_returns_distinct_hex_nonces() {
+        // The route is wired and mints a fresh 32-byte (64 hex) nonce each call.
+        let app = app(store());
+        let a = body_json(
+            app.clone()
+                .oneshot(post_json("/v1/account/challenge", ""))
+                .await
+                .expect("challenge"),
+        )
+        .await;
+        let b = body_json(
+            app.oneshot(post_json("/v1/account/challenge", ""))
+                .await
+                .expect("challenge"),
+        )
+        .await;
+        let ca = a["challenge"].as_str().expect("challenge string");
+        let cb = b["challenge"].as_str().expect("challenge string");
+        assert_eq!(ca.len(), 64, "32-byte nonce => 64 hex chars");
+        assert!(ca.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(ca, cb, "each challenge is a fresh nonce");
     }
 
     #[tokio::test]

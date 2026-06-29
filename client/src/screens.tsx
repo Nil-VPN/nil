@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import * as api from "./lib/commands";
+import type { SubscriptionStatus } from "./lib/commands";
 import type { AnonymousAccount, ConnState, PortalConfig } from "./lib/types";
 import { HonestLimits, HonestyBanner, StatusPill, TokenBalanceBadge } from "./components";
 
@@ -190,24 +191,29 @@ export function MainScreen({
   onNavigate,
 }: {
   onError: (msg: string) => void;
-  onNavigate: (screen: "buy" | "settings") => void;
+  onNavigate: (screen: "buy" | "subscribe" | "settings") => void;
 }) {
   const [state, setState] = useState<ConnState>("disconnected");
   const [balance, setBalance] = useState<number | null>(null);
   const [cfg, setCfg] = useState<PortalConfig | null>(null);
+  const [sub, setSub] = useState<SubscriptionStatus | null>(null);
 
   useEffect(() => {
     api.status().then(setState).catch((e) => onError(String(e)));
     api.tokenBalance().then(setBalance).catch(() => setBalance(null));
     api.getConfig().then(setCfg).catch(() => setCfg(null));
+    api.subscriptionStatus().then((s) => setSub(s ?? null)).catch(() => setSub(null));
   }, [onError]);
 
   const busy = state === "connecting" || state === "disconnecting";
   const connected = state === "connected";
   // A real (attested) path is configured when a Coordinator URL is set.
   const realPath = !!cfg && cfg.coordinator_url.trim().length > 0;
-  // Fail-closed: with a Coordinator configured you need a token to connect.
-  const needToken = realPath && balance === 0;
+  const subscribed = sub?.entitlement === "active";
+  const activeUntil = sub?.until ? new Date(sub.until * 1000).toLocaleDateString() : null;
+  // Fail-closed: with a Coordinator configured you need EITHER an active subscription (connect mints
+  // a token on demand) or a leftover token to connect — otherwise no token, no tunnel.
+  const needToken = realPath && !subscribed && (balance ?? 0) === 0;
 
   async function toggle() {
     try {
@@ -238,6 +244,14 @@ export function MainScreen({
       <h1 className="brand">NIL VPN</h1>
       <StatusPill state={state} />
 
+      {realPath && (
+        <p className="hint sub-status">
+          {subscribed
+            ? `Subscription active${activeUntil ? ` until ${activeUntil}` : ""} — connecting mints a token on demand.`
+            : "No active subscription."}
+        </p>
+      )}
+
       <button
         className={`toggle ${connected ? "toggle-on" : "toggle-off"}`}
         // A token is required to CONNECT, but never to disconnect — otherwise, once the last token is
@@ -254,14 +268,19 @@ export function MainScreen({
             ? "Connected through an attested node — the client verified its hardware report before any packet flowed."
             : "Connected via the in-memory loopback transport (no Coordinator configured — no real tunnel)."
           : needToken
-            ? "Buy a connection token to connect (fail-closed — no token, no tunnel)."
+            ? "Subscribe — or buy a connection token — to connect (fail-closed: no token, no tunnel)."
             : realPath
-              ? "Tap Connect to redeem a token and bring up the attested tunnel."
+              ? subscribed
+                ? "Tap Connect — your subscription mints a token and brings up the attested tunnel."
+                : "Tap Connect to redeem a token and bring up the attested tunnel."
               : "Tap Connect to exercise the engine through the loopback transport."}
       </p>
 
+      <button className="btn btn-primary" disabled={busy} onClick={() => onNavigate("subscribe")}>
+        {subscribed ? "Manage subscription" : "Subscribe"}
+      </button>
       <button className="btn btn-secondary" disabled={busy} onClick={() => onNavigate("buy")}>
-        Buy connection tokens
+        Buy a one-off connection token
       </button>
 
       <HonestLimits />
@@ -324,6 +343,105 @@ export function BuyTokensScreen({
       >
         Claim token
       </button>
+      <button className="link" disabled={busy} onClick={onBack}>
+        ← Back
+      </button>
+    </div>
+  );
+}
+
+/** Subscribe / renew (ADR-0007): pay once, then connect freely while active. The app mints unlinkable
+ *  tokens on demand, so logging back in on any device reconnects with no extra payment. */
+export function SubscribeScreen({
+  onError,
+  onBack,
+}: {
+  onError: (msg: string) => void;
+  onBack: () => void;
+}) {
+  // undefined = still loading; null = no account / unknown.
+  const [status, setStatus] = useState<SubscriptionStatus | null | undefined>(undefined);
+  const [reference, setReference] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [cfg, setCfg] = useState<PortalConfig | null>(null);
+
+  useEffect(() => {
+    api.subscriptionStatus().then((s) => setStatus(s ?? null)).catch(() => setStatus(null));
+    api.getConfig().then(setCfg).catch(() => setCfg(null));
+  }, []);
+
+  const active = status?.entitlement === "active";
+  const until = status?.until ? new Date(status.until * 1000).toLocaleString() : null;
+  const address = cfg?.monero_address?.trim() ?? "";
+
+  async function start() {
+    setBusy(true);
+    try {
+      setReference(await api.subscribe());
+    } catch (e) {
+      onError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function claim() {
+    if (!reference) return;
+    setBusy(true);
+    try {
+      const next = await api.activateSubscription(reference);
+      setStatus(next);
+      setReference(null); // activated — clear the pending reference
+    } catch (e) {
+      // The Rust side returns "payment not confirmed yet — wait …, then try again" until it lands;
+      // surface it verbatim so the user knows to retry, not that something broke.
+      onError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="screen">
+      <h2>Subscription</h2>
+      <p className="hint">
+        {active
+          ? `Active until ${until}. While active, connecting mints unlinkable tokens on demand — log back in on any device and reconnect, no extra payment (Pillar 4).`
+          : "Pay once for a month of access. While active, the app mints unlinkable connection tokens on demand, so what you pay stays unlinkable to what you do — and re-login on any device reconnects without paying again."}
+      </p>
+
+      {!reference ? (
+        <button
+          className="btn btn-primary"
+          disabled={busy || status === undefined}
+          onClick={start}
+        >
+          {active ? "Renew — extend +30 days" : "Start subscription"}
+        </button>
+      ) : (
+        <>
+          <div className="field">
+            <span className="field-label">Pay this reference (as your Monero payment id)</span>
+            <code className="code">{reference}</code>
+            {address ? (
+              <>
+                <span className="field-label">to the deposit address</span>
+                <code className="code">{address}</code>
+              </>
+            ) : (
+              <span className="hint">
+                No Monero address is configured — for the closed alpha, give this reference to the
+                operator as your comp / invite id. (Set a deposit address in Settings for self-serve.)
+              </span>
+            )}
+            <span className="hint">Send the payment, then tap below — it can take a few minutes to confirm.</span>
+          </div>
+          <button className="btn btn-primary" disabled={busy} onClick={claim}>
+            I've paid — activate
+          </button>
+        </>
+      )}
+
       <button className="link" disabled={busy} onClick={onBack}>
         ← Back
       </button>

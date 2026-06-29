@@ -13,7 +13,10 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+use nil_proto::account::MintRequest;
 use nil_proto::token::{CheckoutResponse, IssueRequest, IssueResponse, PubKeyResponse};
+
+use crate::authstore::AccountAuthMaterial;
 
 const DEFAULT_PORTAL_URL: &str = "http://127.0.0.1:8080";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -37,6 +40,8 @@ pub enum TokenError {
     AlreadyIssued,
     #[error("the token service rejected the request (HTTP {0})")]
     IssuerRejected(u16),
+    #[error("no active subscription — subscribe (or renew) to connect")]
+    NotSubscribed,
     #[error("this Portal has no checkout endpoint (it predates the front-running guard)")]
     CheckoutUnsupported,
     #[error("couldn't reach the token service — is nil-portal running? ({0})")]
@@ -169,11 +174,85 @@ impl TokenClient {
         })
     }
 
+    /// Mint ONE unblinded token against an ACTIVE subscription (ADR-0007). Mirrors [`Self::acquire`]
+    /// but gated on the account's subscription instead of a one-time payment: it proves account
+    /// ownership (single-use challenge + signature) and calls `POST /v1/tokens/mint`. The blinding
+    /// secret stays in this process; the Portal blind-signs without seeing `msg`, so the minted token
+    /// stays unlinkable to the account. `402` ⇒ no active subscription ([`TokenError::NotSubscribed`]).
+    pub async fn mint(&self, material: &AccountAuthMaterial) -> Result<StoredToken, TokenError> {
+        self.ensure_safe_base_url()?;
+        let base = self.base_url.trim_end_matches('/');
+
+        // 1. Issuer pubkey → blind a fresh random message locally (the secret never leaves here).
+        let pk: PubKeyResponse = self
+            .http
+            .get(format!("{base}/v1/tokens/pubkey"))
+            .send()
+            .await
+            .map_err(net_err)?
+            .error_for_status()
+            .map_err(net_err)?
+            .json()
+            .await
+            .map_err(net_err)?;
+        let pubkey_der = from_hex(&pk.public_der)
+            .ok_or_else(|| TokenError::Crypto("issuer pubkey not hex".into()))?;
+        let mut msg = [0u8; 32];
+        getrandom::getrandom(&mut msg).map_err(|e| TokenError::Crypto(format!("rng: {e}")))?;
+        let req = nil_crypto::token::blind(&pubkey_der, &msg)
+            .map_err(|e| TokenError::Crypto(e.to_string()))?;
+
+        // 2. Prove account ownership (fresh single-use challenge per mint).
+        let auth = crate::account::auth_proof(&self.http, base, material)
+            .await
+            .map_err(portal_err)?;
+
+        // 3. Subscription-gated blind-sign.
+        let mint = MintRequest { auth, blind_msg: to_hex(&req.blind_msg) };
+        let resp = self
+            .http
+            .post(format!("{base}/v1/tokens/mint"))
+            .json(&mint)
+            .send()
+            .await
+            .map_err(net_err)?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                402 => TokenError::NotSubscribed, // no active subscription
+                other => TokenError::IssuerRejected(other),
+            });
+        }
+        let issued: IssueResponse = resp.json().await.map_err(net_err)?;
+        let blind_sig = from_hex(&issued.blind_sig)
+            .ok_or_else(|| TokenError::Crypto("blind_sig not hex".into()))?;
+
+        // 4. Unblind → the final, unlinkable token.
+        let tok = nil_crypto::token::finalize(&pubkey_der, &req, &blind_sig)
+            .map_err(|e| TokenError::Crypto(e.to_string()))?;
+        tracing::info!("minted 1 Privacy Pass token (subscription)");
+        Ok(StoredToken { msg: to_hex(&msg), token: to_hex(&tok) })
+    }
+
     fn ensure_safe_base_url(&self) -> Result<(), TokenError> {
         if nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
             return Ok(());
         }
         nil_core::net::require_tls_or_loopback(&self.base_url).map_err(TokenError::UnsafeUrl)
+    }
+}
+
+/// Map an account [`crate::account::PortalError`] (from the shared `auth_proof` challenge fetch) onto
+/// a [`TokenError`], so the mint path surfaces one error type.
+fn portal_err(e: crate::account::PortalError) -> TokenError {
+    use crate::account::PortalError as P;
+    match e {
+        P::UnsafeUrl(s) => TokenError::UnsafeUrl(s),
+        P::Unreachable(s) => TokenError::Unreachable(s),
+        P::Unauthorized => TokenError::IssuerRejected(401),
+        P::PaymentNotConfirmed => TokenError::NotSubscribed,
+        P::Crypto(s) => TokenError::Crypto(s),
+        P::Status(s) => TokenError::Unreachable(format!("auth: {s}")),
     }
 }
 

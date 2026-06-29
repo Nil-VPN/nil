@@ -15,8 +15,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
-use super::{ent_from, ent_str, hex32, unhex32, Store, StoreError};
-use crate::account::model::AccountRecord;
+use super::{auth_from, auth_str, ent_from, ent_str, hex32, unhex32, Store, StoreError};
+use crate::account::model::{AccountRecord, Entitlement};
 
 /// On-disk representation of one account (hex-encoded; PII-free by construction).
 #[derive(Serialize, Deserialize)]
@@ -24,6 +24,10 @@ struct RecordDto {
     account_number: String,
     recovery_code_hash: String,
     entitlement: String,
+    // Additive (ADR-0007): default "" so a record written before the auth key reads back as the
+    // all-zero "no auth key" sentinel rather than failing to parse.
+    #[serde(default)]
+    auth_pubkey: String,
 }
 
 impl RecordDto {
@@ -31,7 +35,8 @@ impl RecordDto {
         Self {
             account_number: hex32(&r.account_number),
             recovery_code_hash: hex32(&r.recovery_code_hash),
-            entitlement: ent_str(r.entitlement).to_string(),
+            entitlement: ent_str(r.entitlement),
+            auth_pubkey: auth_str(&r.auth_pubkey),
         }
     }
 
@@ -40,6 +45,7 @@ impl RecordDto {
             account_number: unhex32(&self.account_number)?,
             recovery_code_hash: unhex32(&self.recovery_code_hash)?,
             entitlement: ent_from(&self.entitlement)?,
+            auth_pubkey: auth_from(&self.auth_pubkey)?,
         })
     }
 }
@@ -132,6 +138,31 @@ impl Store for FileStore {
     async fn get(&self, account_number: &[u8; 32]) -> Result<Option<AccountRecord>, StoreError> {
         Ok(self.inner.read().await.get(account_number).cloned())
     }
+
+    async fn extend_subscription(
+        &self,
+        account_number: &[u8; 32],
+        now_secs: u64,
+        by_secs: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let mut map = self.inner.write().await;
+        let Some(rec) = map.get_mut(account_number) else {
+            return Ok(None);
+        };
+        let prev = rec.entitlement;
+        // Base read from the live record under the write lock → atomic stack (no lost update).
+        let base = rec.entitlement.active_until(now_secs).unwrap_or(now_secs);
+        let until = base.saturating_add(by_secs);
+        rec.entitlement = Entitlement::Active { until };
+        // Fail closed: roll back the in-memory change if the durable write fails.
+        if let Err(e) = self.persist(&map) {
+            if let Some(rec) = map.get_mut(account_number) {
+                rec.entitlement = prev;
+            }
+            return Err(StoreError::Backend(e.to_string()));
+        }
+        Ok(Some(until))
+    }
 }
 
 #[cfg(test)]
@@ -148,7 +179,12 @@ mod tests {
     }
 
     fn record(byte: u8, ent: Entitlement) -> AccountRecord {
-        AccountRecord { account_number: [byte; 32], recovery_code_hash: [byte ^ 0xff; 32], entitlement: ent }
+        AccountRecord {
+            account_number: [byte; 32],
+            recovery_code_hash: [byte ^ 0xff; 32],
+            entitlement: ent,
+            auth_pubkey: [byte ^ 0x0f; 32],
+        }
     }
 
     #[cfg(unix)]
@@ -171,7 +207,7 @@ mod tests {
 
         {
             let s = FileStore::open(&path).expect("open");
-            s.insert(record(1, Entitlement::Active)).await.expect("insert 1");
+            s.insert(record(1, Entitlement::Active { until: 1_900_000_000 })).await.expect("insert 1");
             // Duplicate account number is rejected.
             assert!(matches!(s.insert(record(1, Entitlement::None)).await, Err(StoreError::Duplicate)));
             s.insert(record(2, Entitlement::None)).await.expect("insert 2");
@@ -179,11 +215,55 @@ mod tests {
 
         let s2 = FileStore::open(&path).expect("reopen");
         let got = s2.get(&[1u8; 32]).await.expect("get").expect("account 1 persisted");
-        assert_eq!(got.entitlement, Entitlement::Active);
+        assert_eq!(got.entitlement, Entitlement::Active { until: 1_900_000_000 });
         assert_eq!(got.recovery_code_hash, [0xfeu8; 32]);
+        assert_eq!(got.auth_pubkey, [0x0eu8; 32], "auth pubkey survives a restart");
         assert!(s2.get(&[2u8; 32]).await.expect("get").is_some());
         assert!(s2.get(&[3u8; 32]).await.expect("get").is_none());
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn extend_subscription_persists_across_restart() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let now = 1_500_000_000u64;
+        {
+            let s = FileStore::open(&path).expect("open");
+            s.insert(record(5, Entitlement::None)).await.expect("insert");
+            let until = s.extend_subscription(&[5u8; 32], now, 30 * 24 * 60 * 60).await.expect("ext").expect("present");
+            assert_eq!(until, now + 30 * 24 * 60 * 60);
+        } // restart
+        let s2 = FileStore::open(&path).expect("reopen");
+        let got = s2.get(&[5u8; 32]).await.expect("get").expect("present");
+        assert_eq!(got.entitlement, Entitlement::Active { until: now + 30 * 24 * 60 * 60 }, "extension survived restart");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn extend_subscription_stacks_on_the_persisted_value() {
+        let path = temp_path();
+        let _ = std::fs::remove_file(&path);
+        let s = FileStore::open(&path).expect("open");
+        s.insert(record(6, Entitlement::None)).await.expect("insert");
+
+        let now = 1_000_000u64;
+        let day = 24 * 60 * 60;
+        // First extend starts from `now` (None → max(now, -) = now).
+        let u1 = s.extend_subscription(&[6u8; 32], now, 30 * day).await.expect("ext1").expect("present");
+        assert_eq!(u1, now + 30 * day);
+        // Second extend reads the PERSISTED until and stacks (the lost-update regression): each
+        // distinct payment adds its period rather than overwriting from a stale snapshot.
+        let u2 = s.extend_subscription(&[6u8; 32], now, 30 * day).await.expect("ext2").expect("present");
+        assert_eq!(u2, now + 60 * day, "second extend stacks on the persisted first");
+        // A lapsed/now-in-the-future clock still starts no earlier than `now`.
+        let later = u2 + 100 * day; // well past the current expiry
+        let u3 = s.extend_subscription(&[6u8; 32], later, 30 * day).await.expect("ext3").expect("present");
+        assert_eq!(u3, later + 30 * day, "an expired sub re-starts from now, not the stale past expiry");
+
+        // Missing account → None.
+        assert!(s.extend_subscription(&[7u8; 32], now, day).await.expect("missing").is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

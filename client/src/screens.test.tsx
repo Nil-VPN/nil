@@ -14,6 +14,7 @@ import {
   BuyTokensScreen,
   SettingsScreen,
   RecoverAccountScreen,
+  SubscribeScreen,
 } from "./screens";
 
 const liveCfg: PortalConfig = {
@@ -54,6 +55,33 @@ describe("MainScreen fail-closed token gate", () => {
     render(<MainScreen onError={() => {}} onNavigate={() => {}} />);
     const connect = await screen.findByRole("button", { name: /^connect$/i });
     await waitFor(() => expect(connect).toBeEnabled());
+  });
+
+  it("enables Connect when subscribed even with no token (mint-on-demand)", async () => {
+    routeInvoke({
+      token_balance: 0,
+      subscription_status: { entitlement: "active", until: 9_999_999_999 },
+    });
+    render(<MainScreen onError={() => {}} onNavigate={() => {}} />);
+    const connect = await screen.findByRole("button", { name: /^connect$/i });
+    await waitFor(() => expect(connect).toBeEnabled());
+    expect(screen.getByText(/subscription active/i)).toBeInTheDocument();
+  });
+});
+
+describe("SubscribeScreen", () => {
+  it("starts a subscription and shows the payment reference to pay", async () => {
+    routeInvoke({
+      subscription_status: { entitlement: "none" },
+      subscribe: "ref-abc123",
+    });
+    render(<SubscribeScreen onError={() => {}} onBack={() => {}} />);
+    const start = await screen.findByRole("button", { name: /start subscription/i });
+    await waitFor(() => expect(start).toBeEnabled());
+    fireEvent.click(start);
+    // The minted reference is shown for the user to pay, plus the activate step.
+    expect(await screen.findByText("ref-abc123")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /i've paid — activate/i })).toBeInTheDocument();
   });
 });
 

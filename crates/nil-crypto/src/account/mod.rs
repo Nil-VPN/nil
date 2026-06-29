@@ -5,12 +5,14 @@
 //! fully recoverable from the phrase alone. The one-time recovery code is an
 //! independent second factor.
 
+mod auth;
 mod derive;
 mod encoding;
 mod phrase;
 mod recovery;
 mod words;
 
+pub use auth::{verify_auth_signature, AuthKeypair, AUTH_PUBKEY_LEN, AUTH_SIG_LEN};
 pub use phrase::Phrase;
 pub use recovery::RecoveryCode;
 
@@ -42,13 +44,16 @@ impl AccountNumber {
 }
 
 /// Everything produced when creating a fresh anonymous account. The Portal keeps only
-/// `account_number` (= `H(secret)`) and `recovery_code_hash`; the phrase and code are
-/// returned to the user and never stored.
+/// `account_number` (= `H(secret)`), `recovery_code_hash`, and `auth_public_key`; the phrase and
+/// code are returned to the user and never stored.
 pub struct DerivedAccount {
     pub account_number: AccountNumber,
     pub recovery_phrase: Phrase,
     pub recovery_code: RecoveryCode,
     pub recovery_code_hash: [u8; 32],
+    /// Public half of the account's Ed25519 auth key (derived from the phrase). Stored by the
+    /// Portal to verify a signed challenge later (ADR-0007). Anonymous — carries no identity.
+    pub auth_public_key: [u8; AUTH_PUBKEY_LEN],
 }
 
 /// Create a fresh anonymous account from the given CSPRNG. The RNG is injected so
@@ -60,6 +65,7 @@ pub fn create_account<R: RngCore + CryptoRng>(rng: &mut R) -> DerivedAccount {
     let account_number = AccountNumber {
         canonical: derive::account_hash(&secret),
     };
+    let auth_public_key = AuthKeypair::from_entropy(&entropy).public_key_bytes();
     let recovery_code = RecoveryCode::random(rng);
     let recovery_code_hash = recovery_code.hash();
     DerivedAccount {
@@ -67,6 +73,7 @@ pub fn create_account<R: RngCore + CryptoRng>(rng: &mut R) -> DerivedAccount {
         recovery_phrase,
         recovery_code,
         recovery_code_hash,
+        auth_public_key,
     }
     // `entropy` and `secret` are zeroized as they drop here.
 }
