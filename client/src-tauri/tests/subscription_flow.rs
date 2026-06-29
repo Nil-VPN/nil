@@ -80,3 +80,51 @@ async fn subscribe_activate_mint_and_relogin() {
 
     println!("OK: create → subscribe → activate → mint x2 → re-login → status Active → mint again");
 }
+
+/// Deploy smoke test: verifies the subscription endpoints are DEPLOYED and correctly gated, WITHOUT
+/// needing a confirmed payment — so it runs against a real (un-mocked) production Portal. It checks
+/// the pre-payment states: status `none`, subscribe returns a reference, activate-before-payment is
+/// `PaymentNotConfirmed` (402), and mint-without-subscription is `NotSubscribed` (402). On a
+/// `NW_MOCK_PAID_ALL` Portal activate would instead succeed — use `subscribe_activate_mint_and_relogin`
+/// there. Run: `PORTAL_URL=https://<portal-host> cargo test -p nil-client --test subscription_flow \
+///   subscription_endpoints_live_smoke -- --ignored --nocapture`
+#[tokio::test]
+#[ignore = "needs a running nil-portal at PORTAL_URL; verifies the endpoints are deployed + gated, no payment"]
+async fn subscription_endpoints_live_smoke() {
+    let url = std::env::var("PORTAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let portal = PortalClient::with_base_url(url.clone());
+    let tokens = TokenClient::with_base_url(url);
+
+    let account = portal.create_anonymous().await.expect("create account");
+    let material = material_from_phrase(&account.recovery_phrase);
+
+    // /v1/account/challenge + /v1/account/status are wired: a fresh account is not active.
+    assert_ne!(
+        portal.status(&material).await.expect("status").entitlement,
+        EntitlementDto::Active,
+        "a fresh account must not be active"
+    );
+
+    // /v1/billing/subscribe is wired + authenticates: returns a 256-bit reference, no payment needed.
+    let reference = portal.subscribe(&material).await.expect("subscribe").payment_reference;
+    assert_eq!(reference.len(), 64, "a 256-bit reference is 64 hex chars");
+
+    // /v1/billing/activate BEFORE the payment confirms → 402 PaymentNotConfirmed. (A mock-paid Portal
+    // would instead succeed — that's the other test.)
+    match portal.activate(&material, reference).await {
+        Err(nil_client_lib::account::PortalError::PaymentNotConfirmed) => {}
+        Ok(_) => panic!(
+            "activate succeeded with NO payment — this looks like a NW_MOCK_PAID_ALL Portal; run \
+             subscribe_activate_mint_and_relogin instead"
+        ),
+        Err(e) => panic!("unexpected activate error: {e:?}"),
+    }
+
+    // /v1/tokens/mint without an active subscription → 402 NotSubscribed.
+    assert!(
+        matches!(tokens.mint(&material).await, Err(nil_client_lib::tokens::TokenError::NotSubscribed)),
+        "mint must be refused without an active subscription"
+    );
+
+    println!("OK: subscription endpoints deployed + gated (challenge/status/subscribe/activate/mint); no payment used");
+}
