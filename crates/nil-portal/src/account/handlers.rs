@@ -117,7 +117,9 @@ pub async fn account_challenge(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> Result<Json<ChallengeResponse>, ApiError> {
-    if !state.limiter.check(&peer.ip().to_string()) {
+    // The generous auth limiter, NOT the tight create limiter: a challenge is fetched before every
+    // authed op (and on every connect's mint-on-demand), and mints nothing durable.
+    if !state.auth_limiter.check(&peer.ip().to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     let now = nil_core::grant::now_unix_secs();
@@ -140,7 +142,8 @@ pub async fn account_status(
     State(state): State<AppState>,
     Json(auth): Json<AccountAuth>,
 ) -> Result<Json<AccountStatusResponse>, ApiError> {
-    if !state.limiter.check(&peer.ip().to_string()) {
+    // Generous auth limiter (a client may poll status); not the tight create limiter.
+    if !state.auth_limiter.check(&peer.ip().to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     // A gate ("is the subscription still live?") → fail-closed clock: unknown clock reads as Expired.
