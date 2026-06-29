@@ -40,6 +40,20 @@ impl AuthKeypair {
         Ok(Self::from_entropy(&phrase.to_entropy()?))
     }
 
+    /// Reconstruct the keypair from a previously persisted 32-byte seed (the value returned by
+    /// [`AuthKeypair::to_seed_bytes`]). Lets a client re-derive the auth key after a restart without
+    /// re-entering the phrase (ADR-0007). The seed is SECRET — treat it exactly like the phrase.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        Self { signing: SigningKey::from_bytes(seed) }
+    }
+
+    /// The 32-byte Ed25519 seed, for at-rest persistence by a client that caches the auth key
+    /// (ADR-0007). SECRET: the holder must store it the way it stores tokens (owner-only, atomic,
+    /// never logged) and zeroize copies. Reconstruct the keypair via [`AuthKeypair::from_seed`].
+    pub fn to_seed_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
+    }
+
     /// The 32-byte public key — the only half the Portal persists.
     pub fn public_key_bytes(&self) -> [u8; AUTH_PUBKEY_LEN] {
         self.signing.verifying_key().to_bytes()
@@ -123,6 +137,18 @@ mod tests {
         // The auth pubkey must not equal the account number (distinct HKDF labels → independent).
         let acct = create_account(&mut seeded());
         assert_ne!(&acct.auth_public_key, acct.account_number.as_bytes());
+    }
+
+    #[test]
+    fn seed_round_trips_through_from_seed() {
+        // Persisting the seed and reconstructing reproduces the same keypair (the client cache path).
+        let acct = create_account(&mut seeded());
+        let kp = AuthKeypair::from_phrase(&acct.recovery_phrase).unwrap();
+        let seed = kp.to_seed_bytes();
+        let restored = AuthKeypair::from_seed(&seed);
+        assert_eq!(restored.public_key_bytes(), kp.public_key_bytes());
+        let challenge = b"persisted-then-restored-01234567";
+        assert!(verify_auth_signature(&kp.public_key_bytes(), challenge, &restored.sign(challenge)));
     }
 
     #[test]

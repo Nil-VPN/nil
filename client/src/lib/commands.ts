@@ -135,6 +135,28 @@ export const buyTokens = (paymentId: string) =>
   invoke<number>("buy_tokens", { paymentId });
 export const tokenBalance = () => invoke<number>("token_balance");
 
+// Subscription (ADR-0007): subscribe → pay the returned reference → poll activate; connect then
+// mints tokens on demand while active, so re-login reconnects without re-entering the phrase.
+export interface SubscriptionStatus {
+  entitlement: "none" | "active" | "expired";
+  until?: number; // unix seconds; present iff entitlement === "active"
+}
+
+/** Begin/renew a subscription; returns the payment reference to pay (e.g. the Monero payment id). */
+export const subscribe = () => invoke<string>("subscribe");
+
+/** Claim a confirmed payment to activate/extend. Rejects with a "payment not confirmed yet" message
+ *  until the payment lands — callers poll at a wide interval. */
+export const activateSubscription = (paymentReference: string) =>
+  invoke<SubscriptionStatus>("activate_subscription", { paymentReference });
+
+/** The authenticated subscription status, or null if no account is cached on this device. */
+export const subscriptionStatus = () =>
+  invoke<SubscriptionStatus | null>("subscription_status");
+
+/** Forget the cached account on this device (log out). Does not delete the account at the Portal. */
+export const logout = () => invoke<void>("logout");
+
 // Settings: operator endpoints + toggles, persisted and applied to the datapath.
 export const getConfig = () => invoke<PortalConfig>("get_config");
 export const setConfig = (cfg: PortalConfig) => invoke<void>("set_config", { cfg });
