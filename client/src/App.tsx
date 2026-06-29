@@ -11,9 +11,18 @@ import {
   RecoverAccountScreen,
   RecoveryPhraseScreen,
   SettingsScreen,
+  SubscribeScreen,
 } from "./screens";
 
-type Screen = "firstrun" | "email" | "phrase" | "recover" | "main" | "buy" | "settings";
+type Screen =
+  | "firstrun"
+  | "email"
+  | "phrase"
+  | "recover"
+  | "main"
+  | "buy"
+  | "subscribe"
+  | "settings";
 
 function App() {
   const [screen, setScreen] = useState<Screen>("firstrun");
@@ -111,6 +120,9 @@ function App() {
       {screen === "main" && <MainScreen onError={showError} onNavigate={setScreen} />}
       {screen === "buy" && (
         <BuyTokensScreen busy={busy} onBuy={handleBuy} onBack={() => setScreen("main")} />
+      )}
+      {screen === "subscribe" && (
+        <SubscribeScreen onError={showError} onBack={() => setScreen("main")} />
       )}
       {screen === "settings" && (
         <SettingsScreen onError={showError} onBack={() => setScreen("main")} />
