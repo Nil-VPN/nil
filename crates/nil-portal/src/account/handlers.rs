@@ -155,7 +155,7 @@ pub async fn account_status(
 
 /// Map an [`AuthError`] to its HTTP error. `Unauthorized` is deliberately one bucket (no
 /// account-existence oracle, PD-3); a malformed proof is a 400; a backend failure fails closed.
-fn map_auth_err(e: AuthError) -> ApiError {
+pub(crate) fn map_auth_err(e: AuthError) -> ApiError {
     match e {
         AuthError::Malformed => ApiError::BadRequest("malformed authentication proof"),
         AuthError::Unauthorized => ApiError::Unauthorized,

@@ -20,6 +20,12 @@ pub enum ApiError {
     Unauthorized,
     #[error("too many requests")]
     TooManyRequests,
+    /// Payment not yet confirmed — the client should retry later. Mirrors the token-issue 402.
+    #[error("payment required")]
+    PaymentRequired,
+    /// The action was already performed (e.g. this payment already activated the subscription).
+    #[error("conflict")]
+    Conflict,
     #[error("internal error")]
     Internal,
 }
@@ -37,6 +43,8 @@ impl IntoResponse for ApiError {
             ApiError::BadPhrase(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+            ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
+            ApiError::Conflict => StatusCode::CONFLICT,
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = ErrorBody {

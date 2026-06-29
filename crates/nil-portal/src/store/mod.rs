@@ -144,4 +144,15 @@ pub trait Store: Send + Sync {
     async fn insert(&self, record: AccountRecord) -> Result<(), StoreError>;
     /// Fetch an account by its number (= `H(secret)`), if present.
     async fn get(&self, account_number: &[u8; 32]) -> Result<Option<AccountRecord>, StoreError>;
+    /// Atomically extend (or start) a subscription by `by_secs`, stacking on the account's CURRENT
+    /// persisted expiry: `new_until = max(now_secs, current_until) + by_secs`. The base is read from
+    /// the stored value **under the same lock/row as the write**, so two concurrent activations of
+    /// distinct confirmed payments each add their period (no lost update — unlike a read-then-set on
+    /// a pre-read snapshot). Returns the new `until` (`Some`), or `None` if no such account exists.
+    async fn extend_subscription(
+        &self,
+        account_number: &[u8; 32],
+        now_secs: u64,
+        by_secs: u64,
+    ) -> Result<Option<u64>, StoreError>;
 }

@@ -14,7 +14,7 @@ postgres = ["dep:tokio-postgres"]
 # Card payments via a Merchant-of-Record (Paddle / Lemon Squeezy): a signed webhook marks a
 # checkout reference paid/revoked, mirroring the Monero watcher. Off by default — Monero-only build
 # pulls no HMAC deps. Sell strictly as a "VPN software subscription" (MoR AUP forbids "donation").
-card-payments = ["dep:hmac", "dep:sha2", "dep:subtle"]
+card-payments = ["dep:hmac", "dep:subtle"]
 
 [dependencies]
 nil-core = { workspace = true }     # durable one-token-per-payment + account stores
@@ -28,6 +28,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 getrandom = { workspace = true }   # CSPRNG for server-minted checkout references
+sha2 = { workspace = true }        # hash the payment<->account binding (subscription, ADR-0007)
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -37,7 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-postgres = { workspace = true, optional = true }
 # Card (Merchant-of-Record) webhook signature verification, behind the `card-payments` feature.
 hmac = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 
 [dev-dependencies]

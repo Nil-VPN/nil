@@ -90,6 +90,16 @@ pub struct AccountStatusResponse {
     pub until: Option<u64>,
 }
 
+/// Request body for `POST /v1/billing/activate` — claim a confirmed payment to activate/extend the
+/// authenticated account's subscription (ADR-0007). The `payment_reference` is the one returned by
+/// `POST /v1/billing/subscribe`; the auth proof binds the claim to the account that subscribed, so a
+/// confirmed reference can only ever extend the account that created it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivateRequest {
+    pub auth: AccountAuth,
+    pub payment_reference: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

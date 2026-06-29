@@ -76,6 +76,16 @@ const INSERT_SQL: &str = "INSERT INTO accounts (account_number, recovery_code_ha
 
 const GET_SQL: &str = "SELECT recovery_code_hash, entitlement, auth_pubkey FROM accounts WHERE account_number = $1";
 
+/// Atomically extend a subscription by `$3` seconds, stacking on the row's OWN current expiry:
+/// `new_until = max($2, current_until) + $3`, computed and written in one statement under the
+/// implicit row lock (no lost update across concurrent activations). The current expiry is parsed
+/// from the `active:<secs>` encoding; `none`/`expired`/legacy bare `active` parse to 0, so
+/// `max($2, 0) = now` — a fresh or lapsed subscription re-starts from now. `RETURNING` gives the
+/// new value so the caller can report it. 0 rows ⇒ no such account.
+const EXTEND_SUBSCRIPTION_SQL: &str = "UPDATE accounts SET entitlement = 'active:' || \
+    (GREATEST($2::bigint, COALESCE(NULLIF(split_part(entitlement, ':', 2), '')::bigint, 0)) + $3::bigint)::text \
+    WHERE account_number = $1 RETURNING entitlement";
+
 /// A Postgres-backed account store.
 pub struct PgStore {
     client: Client,
@@ -161,6 +171,38 @@ impl Store for PgStore {
                 from_columns(&acct, &recovery, &ent, &auth)
                     .ok_or_else(|| StoreError::Backend("malformed row in accounts table".into()))
                     .map(Some)
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn extend_subscription(
+        &self,
+        account_number: &[u8; 32],
+        now_secs: u64,
+        by_secs: u64,
+    ) -> Result<Option<u64>, StoreError> {
+        let acct = hex32(account_number);
+        // Postgres bigint is i64. now+30d is far inside i64 range; cast saturating for safety.
+        let now_i = i64::try_from(now_secs).unwrap_or(i64::MAX);
+        let by_i = i64::try_from(by_secs).unwrap_or(i64::MAX);
+        let row = tokio::time::timeout(
+            DB_TIMEOUT,
+            self.client.query_opt(EXTEND_SUBSCRIPTION_SQL, &[&acct, &now_i, &by_i]),
+        )
+        .await
+        .map_err(|_| StoreError::Backend("postgres extend_subscription timed out".into()))?
+        .map_err(|e| StoreError::Backend(format!("postgres extend_subscription: {e}")))?;
+        match row {
+            Some(row) => {
+                let ent: String = row
+                    .try_get(0)
+                    .map_err(|e| StoreError::Backend(format!("accounts.entitlement (extend): {e}")))?;
+                // The row now holds `active:<new_until>`; parse it back to the numeric expiry.
+                let until = ent_from(&ent)
+                    .and_then(|e| e.active_until(now_secs))
+                    .ok_or_else(|| StoreError::Backend("extend produced a non-active entitlement".into()))?;
+                Ok(Some(until))
             }
             None => Ok(None),
         }

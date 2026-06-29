@@ -36,7 +36,8 @@ use crate::tokens::TokenState;
 const REFERENCE_BYTES: usize = 32;
 
 /// Mint a fresh, unguessable payment reference (lowercase hex). 256 bits from the OS CSPRNG.
-fn mint_reference() -> Result<String, getrandom::Error> {
+/// Shared with the subscription flow (`crate::subscription`), which mints references the same way.
+pub(crate) fn mint_reference() -> Result<String, getrandom::Error> {
     let mut raw = [0u8; REFERENCE_BYTES];
     getrandom::getrandom(&mut raw)?;
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
