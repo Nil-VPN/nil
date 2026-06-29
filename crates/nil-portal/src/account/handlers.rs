@@ -91,9 +91,14 @@ pub async fn recover_account(
         return Err(ApiError::Unauthorized);
     }
 
+    // Resolve a lapsed subscription against the clock (a gate: "has the deadline passed?"), so use
+    // the fail-closed clock — an unknown clock reads as Expired (refuse), never as still-Active.
+    let now = nil_core::grant::now_unix_secs_for_expiry();
+    let entitlement = record.entitlement.resolved(now);
     Ok(Json(RecoverResponse {
         account_number: account_number.display(),
-        entitlement: record.entitlement.into(),
+        entitlement: entitlement.into(),
+        until: entitlement.active_until(now),
     }))
 }
 

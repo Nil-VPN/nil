@@ -31,7 +31,7 @@ impl RecordDto {
         Self {
             account_number: hex32(&r.account_number),
             recovery_code_hash: hex32(&r.recovery_code_hash),
-            entitlement: ent_str(r.entitlement).to_string(),
+            entitlement: ent_str(r.entitlement),
         }
     }
 
@@ -171,7 +171,7 @@ mod tests {
 
         {
             let s = FileStore::open(&path).expect("open");
-            s.insert(record(1, Entitlement::Active)).await.expect("insert 1");
+            s.insert(record(1, Entitlement::Active { until: 1_900_000_000 })).await.expect("insert 1");
             // Duplicate account number is rejected.
             assert!(matches!(s.insert(record(1, Entitlement::None)).await, Err(StoreError::Duplicate)));
             s.insert(record(2, Entitlement::None)).await.expect("insert 2");
@@ -179,7 +179,7 @@ mod tests {
 
         let s2 = FileStore::open(&path).expect("reopen");
         let got = s2.get(&[1u8; 32]).await.expect("get").expect("account 1 persisted");
-        assert_eq!(got.entitlement, Entitlement::Active);
+        assert_eq!(got.entitlement, Entitlement::Active { until: 1_900_000_000 });
         assert_eq!(got.recovery_code_hash, [0xfeu8; 32]);
         assert!(s2.get(&[2u8; 32]).await.expect("get").is_some());
         assert!(s2.get(&[3u8; 32]).await.expect("get").is_none());

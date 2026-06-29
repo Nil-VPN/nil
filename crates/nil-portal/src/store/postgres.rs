@@ -107,7 +107,7 @@ impl PgStore {
 /// The three text columns persisted for a record (PII-free). Free function so the encoding is
 /// unit-testable without a live database.
 fn columns(r: &AccountRecord) -> [String; 3] {
-    [hex32(&r.account_number), hex32(&r.recovery_code_hash), ent_str(r.entitlement).to_string()]
+    [hex32(&r.account_number), hex32(&r.recovery_code_hash), ent_str(r.entitlement)]
 }
 
 /// Rebuild a record from its persisted columns, or `None` if any column is malformed.
@@ -168,11 +168,11 @@ mod tests {
         let rec = AccountRecord {
             account_number: [0xab; 32],
             recovery_code_hash: [0x12; 32],
-            entitlement: Entitlement::Active,
+            entitlement: Entitlement::Active { until: 1_900_000_000 },
         };
         let [acct, recovery, ent] = columns(&rec);
         assert_eq!(acct.len(), 64); // 32 bytes hex
-        assert_eq!(ent, "active");
+        assert_eq!(ent, "active:1900000000");
         let back = from_columns(&acct, &recovery, &ent).expect("round-trips");
         assert_eq!(back, rec);
     }

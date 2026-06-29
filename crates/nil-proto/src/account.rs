@@ -40,6 +40,11 @@ pub struct RecoverRequest {
 pub struct RecoverResponse {
     pub account_number: String,
     pub entitlement: EntitlementDto,
+    /// Subscription expiry (unix secs) iff `entitlement == Active`; lets the client show
+    /// "Active until …". Additive + optional so older clients (which read `entitlement` as a bare
+    /// string) keep working. Tied to the anonymous account, never to a person (ADR-0007).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<u64>,
 }
 
 /// Subscription/entitlement state. Carries no identity — just what the account is
