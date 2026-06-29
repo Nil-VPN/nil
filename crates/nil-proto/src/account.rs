@@ -100,6 +100,18 @@ pub struct ActivateRequest {
     pub payment_reference: String,
 }
 
+/// Request body for `POST /v1/tokens/mint` — an authenticated, subscription-gated blind-token mint
+/// (ADR-0007). The same blind-sign path as one-shot issuance, but gated on an *active subscription*
+/// (rate-capped per account) instead of a one-time payment. The issuer never sees the unblinded
+/// token, so mint↔redeem stays unlinkable (account↔connection unlinkability holds). The response is
+/// a [`crate::token::IssueResponse`] (the blind signature; the client unblinds locally).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MintRequest {
+    pub auth: AccountAuth,
+    /// Lowercase hex of the blinded token message (the client blinds locally, unblinds the reply).
+    pub blind_msg: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
