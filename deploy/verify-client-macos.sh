@@ -31,6 +31,36 @@ MEAS="${NW_EXPECTED_MEASUREMENT:-}"
 EGRESS_URL="${NW_E2E_EGRESS_URL:-https://api.ipify.org}"
 BIN="$ROOT/target/release/nil-client-e2e"
 
+# Subscription e2e mode (NW_SUBSCRIBE=1): exercise the merged subscribe -> activate -> mint-on-demand
+# -> connect -> re-login -> reconnect flow on the REAL macOS engine, against a LOCAL mock-paid portal
+# (the live Portal doesn't yet carry the subscription endpoints). Loopback connect, so NO root, NO
+# node, NO comp-id. Proves the subscription path on macOS with one command, fully headless.
+if [ "${NW_SUBSCRIBE:-0}" = "1" ]; then
+  echo "== NIL macOS subscription e2e (local mock-paid portal, loopback connect) =="
+  ( cd "$ROOT" && cargo build --release --bin nil-client-e2e --bin nil-portal ) || { echo "FAIL: build"; exit 1; }
+  SUB_PORT="${NW_SUB_PORT:-8088}"
+  NW_MOCK_PAID_ALL=1 NW_PORTAL_ADDR="127.0.0.1:$SUB_PORT" RUST_LOG=warn "$ROOT/target/release/nil-portal" \
+    >"${TMPDIR:-/tmp}/nil-sub-portal.$$.log" 2>&1 &
+  SUB_PORTAL_PID=$!
+  trap '[ -n "${SUB_PORTAL_PID:-}" ] && kill "$SUB_PORTAL_PID" 2>/dev/null' EXIT
+  for _ in $(seq 1 20); do
+    curl -fsS -o /dev/null -X POST "http://127.0.0.1:$SUB_PORT/v1/account/challenge" 2>/dev/null && break
+    sleep 1
+  done
+  OUT="$(NW_SUBSCRIBE=1 PORTAL_URL="http://127.0.0.1:$SUB_PORT" "$BIN" 2>&1)"; RC=$?
+  printf '%s\n' "$OUT"
+  echo "------------------------------------------------------------"
+  if [ $RC -eq 0 ] \
+     && printf '%s' "$OUT" | grep -q '^MINT-ON-DEMAND-OK' \
+     && printf '%s' "$OUT" | grep -q '^RELOGIN-RECONNECT-OK' \
+     && printf '%s' "$OUT" | grep -q '^E2E-OK'; then
+    echo "PASS ✅  macOS subscription e2e: subscribe -> activate -> mint-on-demand -> connect -> re-login -> reconnect (no new payment)."
+    exit 0
+  fi
+  echo "FAIL ❌  macOS subscription e2e (rc=$RC)"
+  exit 1
+fi
+
 echo "== NIL macOS desktop client e2e =="
 echo "portal=$PORTAL_URL coordinator=$COORD_URL node=${NODE_HOST:-<unset>}:$NODE_PORT comp_id=$COMP_ID"
 
