@@ -190,6 +190,17 @@ jobs:
       - name: Clippy (windows datapath)
         run: cargo clippy -p nil-datapath --all-targets -- -D warnings
 
+  # Compile-check the Apple engine (nil-apple) for macOS (arm64+x86_64) AND iOS (device + simulator)
+  # and package the NilApple.xcframework — catches Apple-target bitrot (BoringSSL/quiche for the iOS
+  # sysroot, the cbindgen C-ABI) without a device. The runtime datapath (NEPacketTunnelProvider on a
+  # device / the macOS system extension) still needs hardware + signing (tracked separately).
+  apple-check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Apple engine xcframework (macOS + iOS slices)
+        run: NIL_APPLE_WITH_IOS=1 bash client/apple/build-engine.sh debug
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:

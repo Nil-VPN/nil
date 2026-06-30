@@ -39,6 +39,25 @@ LIB_X86="$TARGETDIR/x86_64-apple-darwin/$PROFILE/libnil_apple.a"
 FAT="$(mktemp -d)/libnil_apple-macos-universal.a"
 lipo -create "$LIB_ARM" "$LIB_X86" -output "$FAT"
 
+XCARGS=(-library "$FAT" -headers "$HEADERS")
+
+# Optional iOS slice (NIL_APPLE_WITH_IOS=1): the device (arm64) static lib the iOS PacketTunnel appex
+# links. OFF by default so the macOS System Extension build stays macOS-only and fast; the iOS build
+# + the `apple-check` CI job set it. DEVICE ONLY — the packet-tunnel appex cannot run in the iOS
+# Simulator (NetworkExtension is device-only), and quiche's bundled BoringSSL doesn't cleanly build
+# for `aarch64-apple-ios-sim` (its prebuilt asm is tagged `iOS`, not `iOS-simulator`), so we don't
+# ship a sim slice. BoringSSL/quiche for the iOS sysroot need the cmake-4 compat shim + a deploy target.
+if [[ "${NIL_APPLE_WITH_IOS:-}" == "1" ]]; then
+  export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
+  export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
+  rustup target add aarch64-apple-ios >/dev/null 2>&1 || true
+  cargo build -p nil-apple $PROFILE_FLAG --target aarch64-apple-ios --target-dir "$TARGETDIR"
+  LIB_IOS="$TARGETDIR/aarch64-apple-ios/$PROFILE/libnil_apple.a"
+  [[ -f "$LIB_IOS" ]] || { echo "missing iOS static lib: $LIB_IOS" >&2; exit 1; }
+  XCARGS+=(-library "$LIB_IOS" -headers "$HEADERS")
+  echo "== build-engine: including iOS device slice (arm64) =="
+fi
+
 rm -rf "$OUT"
-xcodebuild -create-xcframework -library "$FAT" -headers "$HEADERS" -output "$OUT"
+xcodebuild -create-xcframework "${XCARGS[@]}" -output "$OUT"
 echo "== build-engine: wrote $OUT =="
