@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the NIL VPN iOS PacketTunnel APP EXTENSION (the NEPacketTunnelProvider).
+
+  INTEGRATION SCAFFOLDING. This is the iOS counterpart of PacketTunnel-Info.plist (which is the
+  macOS *System Extension* flavor). Differences that matter on iOS:
+
+    CFBundlePackageType        — "XPC!" marks this as an iOS *app extension* (NOT "SYSX", which is a
+                                 macOS system extension, nor "APPL").
+    MinimumOSVersion           — minimum iOS (15.0); iOS uses this key, not LSMinimumSystemVersion.
+    NSExtension                — declares the appex and its principal class. On iOS the packet-tunnel
+                                 provider is loaded purely via NSExtensionPrincipalClass; the macOS-only
+                                 NEMachServiceName / NEProviderClasses keys are NOT used here.
+
+    CFBundleIdentifier         — MUST be a child of the container app id (com.nilvpn.client) so iOS
+                                 treats it as that app's extension: com.nilvpn.client.PacketTunnel.
+                                 This is exactly the providerBundleIdentifier NilVpnPlugin.swift sets
+                                 on the NETunnelProviderProtocol.
+
+  Privacy note (NIL SOUL): nothing identifying lives here — this file declares only how iOS loads the
+  extension. No node address, token, grant, or measurement appears in any plist; those cross over at
+  runtime via providerConfiguration only, and are never logged (PD-2/PD-3).
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>NIL VPN</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.nilvpn.client.PacketTunnel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NIL VPN Packet Tunnel</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>MinimumOSVersion</key>
+	<string>15.0</string>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.networkextension.packet-tunnel</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).PacketTunnelProvider</string>
+	</dict>
+</dict>
+</plist>

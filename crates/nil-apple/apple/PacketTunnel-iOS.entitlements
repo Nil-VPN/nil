@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NIL VPN — iOS PacketTunnel app-extension entitlements
+  (bundle id: com.nilvpn.client.PacketTunnel, child of the container app id).
+
+  INTEGRATION SCAFFOLDING. iOS counterpart of PacketTunnel.entitlements (the macOS System-Extension
+  flavor). The ONE value that differs from macOS is the network-extension flavor:
+
+  * com.apple.developer.networking.networkextension
+      iOS uses `packet-tunnel-provider` (an app extension). macOS uses
+      `packet-tunnel-provider-systemextension` (a system extension). They MUST match the target type
+      or the extension will not load. This entitlement is DISCRETIONARY on iOS — it requires an Apple
+      Developer *organization* account and is granted by Apple on request
+      (email networkextension@apple.com); allow weeks of latency. Without it, signing fails.
+
+  * com.apple.security.application-groups
+      Identical group `group.com.nilvpn.client` as the container app, so app + appex share a
+      container. Must match the app's value exactly.
+
+  Privacy note (NIL SOUL): the appex is the only place packets flow. It receives just the node
+  endpoint + pinned measurement + per-connection grant via providerConfiguration and never logs any
+  of it (PD-2, PD-3). It carries no account, email, or payment identity — none is ever passed to it.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.nilvpn.client</string>
+	</array>
+</dict>
+</plist>
