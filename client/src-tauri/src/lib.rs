@@ -410,11 +410,12 @@ fn init_vpn_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .build()
 }
 
-// The iOS plugin registration entry point (exported by the Swift `NilVpnPlugin`).
+// The iOS plugin registration entry point, exported by the Swift `NilVpnPlugin`
+// (`@_cdecl("init_nil_vpn_plugin")`). `ios_plugin_binding!` generates the correctly-typed FFI
+// binding (`unsafe extern "C" fn() -> *const c_void`) that `register_ios_plugin` requires — a
+// hand-written `extern "C" { fn init_nil_vpn_plugin(); }` has the wrong signature and fails to link.
 #[cfg(target_os = "ios")]
-extern "C" {
-    fn init_nil_vpn_plugin();
-}
+tauri::ios_plugin_binding!(init_nil_vpn_plugin);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {

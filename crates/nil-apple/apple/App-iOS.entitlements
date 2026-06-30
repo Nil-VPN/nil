@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  NIL VPN — iOS CONTAINER-APP entitlements (bundle id: com.nilvpn.client).
+
+  INTEGRATION SCAFFOLDING. The container app (where NilVpnPlugin.swift runs) needs the SAME two
+  entitlements as the appex so it can (a) install/manage a packet-tunnel configuration via
+  NETunnelProviderManager and (b) share a container with the appex:
+
+  * com.apple.developer.networking.networkextension = [packet-tunnel-provider]
+      Required for the app to create/save a NETunnelProviderProtocol configuration (the
+      `saveToPreferences` consent flow in prepareVpn/startVpn). Discretionary — see
+      PacketTunnel-iOS.entitlements; requires an Apple Developer organization account.
+
+  * com.apple.security.application-groups = [group.com.nilvpn.client]
+      Must match the appex's group exactly.
+
+  When `pnpm tauri ios init` generates gen/apple, merge these keys into the generated App target's
+  entitlements (Tauri's template ships a minimal app entitlements file). Privacy: the app process
+  holds identity/token/payment, but NONE of it is ever passed to the appex (PD-3).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.developer.networking.networkextension</key>
+	<array>
+		<string>packet-tunnel-provider</string>
+	</array>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.com.nilvpn.client</string>
+	</array>
+</dict>
+</plist>
