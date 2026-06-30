@@ -40,7 +40,8 @@ use tokenstore::TokenStore;
 /// Derive the cacheable auth material (account number + Ed25519 auth seed) from a recovery phrase,
 /// so the client can mint tokens on demand while subscribed WITHOUT re-entering the phrase
 /// (ADR-0007). We cache the derived seed, never the phrase itself. Used on create + recover ("login").
-fn derive_auth_material(phrase: &[String]) -> Result<AccountAuthMaterial, String> {
+/// `pub` so the headless e2e harness (`bin/nil-client-e2e.rs`) derives auth material the SAME way.
+pub fn derive_auth_material(phrase: &[String]) -> Result<AccountAuthMaterial, String> {
     let parsed = nil_crypto::account::Phrase::parse(phrase).map_err(|e| e.to_string())?;
     let account_number =
         nil_crypto::account::account_number_from_phrase(&parsed).map_err(|e| e.to_string())?;
