@@ -115,12 +115,12 @@ both with the same identity/team), or a missing-entitlement error at activation 
 
 ## M3 — activate the System Extension
 
-`embed-systemextension.sh` (committed) does the post-build copy into `/Applications` and any
-re-sign, so activation isn't a manual drag:
+`client/scripts/embed-systemextension.sh` (committed) does the post-build copy into `/Applications`
+and any re-sign, so activation isn't a manual drag:
 
 ```sh
-./embed-systemextension.sh            # copies the built .app to /Applications, fixes up signing
-open /Applications/NilVPN.app          # launch the container app
+bash client/scripts/embed-systemextension.sh   # copies the built .app to /Applications, fixes up signing
+open /Applications/NilVPN.app                  # launch the container app
 ```
 
 In the running app, trigger activation — the container app issues
