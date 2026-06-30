@@ -26,13 +26,16 @@ Add the **PacketTunnel appex** target in Xcode, link `libnil_apple.a` + `Network
 - The **per-flow leak protection** is the network settings in `applySettingsAndRead`: IPv4 default
   route **and now the IPv6 default route** (the engine is IPv4-only, so v6 is captured into the
   tunnel and dropped — no ISP-IPv6 leak around the tunnel).
-- **"Block all traffic when the tunnel is down"** is `includeAllNetworks` on the
-  `NETunnelProviderProtocol`, set by the **container app** when it installs the tunnel config — it is
-  NOT readable/settable inside the provider. The kill-switch PR adds a `block_without_vpn` flag to
-  the app-side `StartArgs` (fail-closed default `true`); the container app must read that flag and
-  set `protocolConfiguration.includeAllNetworks = blockWithoutVpn` BEFORE starting the tunnel. This
-  container-app wiring is NOT yet implemented and must be completed (and verified, step 3 below)
-  before iOS ships — until then iOS has no programmatic "block without VPN".
+- **"Block traffic when the VPN *process* is down"** is the OS *Always-on VPN / "Block connections
+  without VPN"* SYSTEM setting (backed by `includeAllNetworks` on the `NETunnelProviderProtocol`,
+  set by the **container app** at install time — it is NOT readable/settable inside the provider).
+  An app **cannot silently enable** this; it can only deep-link the user to the OS VPN settings
+  (mirror Android's `openVpnSettings`), and the UI must say so honestly (PD-8). There is deliberately
+  **no `block_without_vpn` StartArg** — an earlier one was hardcoded `true`, never read by the
+  native side, and conflated with `setBlocking` (the fd's I/O mode), implying a configurable control
+  that didn't exist; it was removed (see `client/src-tauri/src/extension.rs`). The container-app
+  `includeAllNetworks` wiring + the settings deep-link are the remaining iOS work — do NOT re-add the
+  StartArg.
 
 ## Verify on device (pass/fail)
 1. Redeem a token in the app → it writes `providerConfiguration` (node host/port, `measurementHex`,
