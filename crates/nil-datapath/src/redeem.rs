@@ -326,6 +326,43 @@ mod tests {
     }
 
     #[test]
+    fn grant_requires_a_paired_32_byte_nonce() {
+        // A grant MUST be bound to a per-connection nonce, and that nonce must be exactly 32 bytes.
+        // Any half-specified or wrong-length grant fails the whole path closed (no unbound grant).
+        let m = "ab".repeat(48);
+        let grant = "cd".repeat(90);
+
+        // grant with NO grant_nonce → rejected (must be provided together).
+        let only_grant = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}"}}]}}"#
+        );
+        assert!(
+            path_from_response(only_grant.as_bytes(), NO_PINS).is_err(),
+            "a grant with no grant_nonce is rejected"
+        );
+
+        // grant_nonce with NO grant → rejected.
+        let nonce = "11".repeat(32);
+        let only_nonce = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant_nonce":"{nonce}"}}]}}"#
+        );
+        assert!(
+            path_from_response(only_nonce.as_bytes(), NO_PINS).is_err(),
+            "a grant_nonce with no grant is rejected"
+        );
+
+        // grant + a WRONG-LENGTH (16-byte) nonce → rejected.
+        let short = "11".repeat(16);
+        let bad_len = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{short}"}}]}}"#
+        );
+        assert!(
+            path_from_response(bad_len.as_bytes(), NO_PINS).is_err(),
+            "the grant nonce must be exactly 32 bytes"
+        );
+    }
+
+    #[test]
     fn empty_path_fails_closed() {
         assert!(
             path_from_response(br#"{"hops":[]}"#, NO_PINS).is_err(),
