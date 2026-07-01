@@ -269,8 +269,8 @@ pub enum PreflightError {
 ///
 /// `Ok` here is necessary but not sufficient: the real [`open_tun`] remains the authority and still
 /// fails closed. This only lets the caller refuse a doomed connect *before* spending a token.
-/// Windows (wintun, a different admin model) and any non-desktop target return `Ok` and rely on the
-/// later open to fail closed.
+/// Windows has its own elevation check (below); any other non-desktop target returns `Ok` and relies
+/// on the later open to fail closed.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn preflight_privilege() -> Result<(), PreflightError> {
     // `libc`/`nix` aren't workspace deps; a one-line extern adds no supply-chain surface.
@@ -284,8 +284,67 @@ pub fn preflight_privilege() -> Result<(), PreflightError> {
     Ok(())
 }
 
-/// Non-(macOS/Linux) targets: no cheap pre-check; the later [`open_tun`] is the fail-closed gate.
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+/// Windows: refuse a doomed connect BEFORE a token is spent by checking whether this process token
+/// is elevated (creating the wintun adapter requires administrator). macOS/Linux fail closed here via
+/// `geteuid`; the previous Windows stub returned `Ok` unconditionally, so a non-admin user PASSED the
+/// gate and only failed later at [`open_tun`] — AFTER the token was already redeemed (burned). This
+/// restores parity: a non-admin process is rejected up front (the caller shows "needs admin, no token
+/// used, relaunch elevated") exactly as on POSIX.
+///
+/// Uses minimal Win32 externs — no new dependency, mirroring the one-line `geteuid` extern above
+/// (advapi32 is already linked by the standard library). If the token query itself fails we fall
+/// back to `Ok` — no worse than the old behaviour — and let [`open_tun`] be the fail-closed authority.
+#[cfg(target_os = "windows")]
+pub fn preflight_privilege() -> Result<(), PreflightError> {
+    use std::os::raw::c_void;
+    #[repr(C)]
+    struct TokenElevation {
+        token_is_elevated: u32,
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_ELEVATION: i32 = 20; // TOKEN_INFORMATION_CLASS::TokenElevation
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut c_void,
+            class: i32,
+            info: *mut c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    // SAFETY: a standard Win32 token-elevation query. `GetCurrentProcess` returns a pseudo-handle
+    // (must NOT be closed); the opened token handle is closed before returning; all buffers are
+    // stack-local and correctly sized. On any query failure we return Ok (degrade, don't false-fail).
+    unsafe {
+        let mut token: *mut c_void = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Ok(());
+        }
+        let mut elevation = TokenElevation { token_is_elevated: 0 };
+        let mut ret_len: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_ELEVATION,
+            &mut elevation as *mut _ as *mut c_void,
+            std::mem::size_of::<TokenElevation>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        if ok != 0 && elevation.token_is_elevated == 0 {
+            return Err(PreflightError::NeedsPrivilege);
+        }
+    }
+    Ok(())
+}
+
+/// Other targets (non-macOS/Linux/Windows): no cheap pre-check; [`open_tun`] is the fail-closed gate.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn preflight_privilege() -> Result<(), PreflightError> {
     Ok(())
 }
