@@ -215,6 +215,9 @@ impl Selector {
             rungs.extend(self.fast.iter().cloned());
         }
         rungs.extend(self.resistant.iter().cloned());
+        // `class` is a coarse network-shape verdict (Clean/Hostile/Unknown) with NO user identity in
+        // it — safe to log (architecture §4.3). It only orders the cascade rungs; it never gates, and
+        // the resistant rungs are always retained regardless.
         tracing::info!(?class, rungs = rungs.len(), "selector built cascade");
         Cascade::new(rungs).with_liveness_probe(Arc::new(DnsLivenessProbe::default()))
     }
