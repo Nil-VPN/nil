@@ -201,6 +201,19 @@ jobs:
       - name: Build the Apple engine xcframework (macOS + iOS slices)
         run: NIL_APPLE_WITH_IOS=1 bash client/apple/build-engine.sh debug
 
+  # Build the macOS System Extension (NEPacketTunnelProvider) UNSIGNED from the XcodeGen spec —
+  # catches SE build-graph bitrot (the .swift provider + bridging header, the linked xcframework,
+  # the project.yml) without any signing/Developer account/device. Signing + activation + runtime
+  # remain on-device handoffs (crates/nil-apple/MACOS_DEVICE_VERIFY.md).
+  macos-se-build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Build the macOS system extension (unsigned)
+        run: bash deploy/verify-macos-se-build.sh
+
   supply-chain:
     runs-on: ubuntu-latest
     steps:
