@@ -13,6 +13,14 @@
 //!
 //! The dev/test [`DurableSet::in_memory`] variant carries no file and is **not** durable; the
 //! binaries log a warning when they fall back to it.
+//!
+//! **Lock poisoning is recovered, not propagated.** Every `Mutex::lock()` below uses
+//! `unwrap_or_else(|e| e.into_inner())`. No code path holds these locks across an unwinding panic
+//! (I/O goes through `?`, and the collections abort rather than unwind on allocation failure), so a
+//! poisoned lock is effectively unreachable here. Recovering it anyway keeps the single-use guard
+//! functioning instead of turning one stray panic into a cascade of panics on a spend-critical path,
+//! and keeps this module free of `expect()`/`unwrap()` on the lock. Recovery is safe: the protected
+//! set is only ever mutated *after* the durable write, so its in-memory contents are consistent.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -100,7 +108,7 @@ impl DurableSet {
                 "durable key must not contain a newline (the on-disk format is line-delimited)",
             ));
         }
-        let mut inner = self.inner.lock().expect("DurableSet mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seen.contains(key) {
             return Ok(false);
         }
@@ -116,12 +124,12 @@ impl DurableSet {
 
     /// Whether `key` has been recorded.
     pub fn contains(&self, key: &str) -> bool {
-        self.inner.lock().expect("DurableSet mutex poisoned").seen.contains(key)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.contains(key)
     }
 
     /// Number of recorded keys.
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("DurableSet mutex poisoned").seen.len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -241,7 +249,7 @@ impl EpochDurableSet {
                 "epoch-durable key must not contain a space or newline (on-disk format is `<epoch> <key>`)",
             ));
         }
-        let mut inner = self.inner.lock().expect("EpochDurableSet mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seen.contains_key(key) {
             return Ok(false);
         }
@@ -256,12 +264,12 @@ impl EpochDurableSet {
 
     /// Whether `key` has been recorded (in any epoch).
     pub fn contains(&self, key: &str) -> bool {
-        self.inner.lock().expect("EpochDurableSet mutex poisoned").seen.contains_key(key)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.contains_key(key)
     }
 
     /// Total recorded keys across all partitions.
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("EpochDurableSet mutex poisoned").seen.len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -281,7 +289,7 @@ impl EpochDurableSet {
             // in LEGACY_EPOCH, so this is unreachable — refuse to nuke the set rather than risk it.
             return Ok(0);
         }
-        let mut inner = self.inner.lock().expect("EpochDurableSet mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let to_drop = inner.seen.values().filter(|e| !retained.contains(e)).count();
         if to_drop == 0 {
             return Ok(0);
@@ -416,7 +424,7 @@ impl TimedDurableSet {
                 "timed-durable key must not contain a space or newline (on-disk format is `<key> <unix>`)",
             ));
         }
-        let mut inner = self.inner.lock().expect("TimedDurableSet mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.seen.contains_key(key) {
             return Ok(false);
         }
@@ -431,11 +439,11 @@ impl TimedDurableSet {
 
     /// Whether `key` is present.
     pub fn contains(&self, key: &str) -> bool {
-        self.inner.lock().expect("TimedDurableSet mutex poisoned").seen.contains_key(key)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.contains_key(key)
     }
 
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("TimedDurableSet mutex poisoned").seen.len()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).seen.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -451,7 +459,7 @@ impl TimedDurableSet {
     /// (in-memory set mutated only after the rewrite is durable). Pruning is fail-closed — see the
     /// type docs: it can only deny a stale checkout, never enable a double-issue.
     pub fn prune_older_than(&self, cutoff_unix: u64) -> io::Result<usize> {
-        let mut inner = self.inner.lock().expect("TimedDurableSet mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let to_drop = inner.seen.values().filter(|t| **t < cutoff_unix).count();
         if to_drop == 0 {
             return Ok(0);
@@ -709,5 +717,31 @@ mod tests {
         assert!(s3.contains("ref-b"));
         assert!(s3.contains("ref-c"), "a ref inserted AFTER a prune survives (rebound append handle is live)");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn poisoned_lock_recovers_and_still_dedups() {
+        use std::sync::Arc;
+        // Poison the internal mutex by panicking while holding it in another thread, then confirm the
+        // public API recovers the guard (no panic cascade) AND the single-use invariant still holds —
+        // a recovered poison must never reopen a double-spend. This exercises the otherwise-unreachable
+        // `unwrap_or_else(|e| e.into_inner())` recovery branch used at every lock site.
+        let s = Arc::new(DurableSet::in_memory());
+        assert!(s.insert("alpha").unwrap());
+        let s2 = s.clone();
+        let joined = std::thread::spawn(move || {
+            let _g = s2.inner.lock().expect("fresh lock");
+            panic!("poison the lock while it is held");
+        })
+        .join();
+        assert!(joined.is_err(), "the helper thread panicked, poisoning the mutex");
+
+        // Reads recover the poisoned guard rather than propagating the panic.
+        assert!(s.contains("alpha"), "contains() recovers a poisoned lock");
+        assert_eq!(s.len(), 1);
+        // And the dedup invariant still holds after recovery (no double-spend).
+        assert!(!s.insert("alpha").unwrap(), "replay still rejected after poison recovery");
+        assert!(s.insert("beta").unwrap(), "a fresh key still inserts after recovery");
+        assert_eq!(s.len(), 2);
     }
 }
