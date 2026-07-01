@@ -59,3 +59,6 @@ getrandom = { workspace = true }   # fresh random token-message nonce (client-si
 [target.'cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))'.dependencies]
 nil-transport = { workspace = true, features = ["masque", "pqwg"] }
 nil-datapath = { workspace = true, features = ["launch"] }
+# Desktop single-instance: a second launch focuses the running window instead of starting a second
+# app (which would arm a second tunnel + kill-switch over the first). Mobile OSes enforce this natively.
+tauri-plugin-single-instance = "2"
