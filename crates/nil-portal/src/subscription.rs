@@ -373,4 +373,45 @@ mod tests {
         // And B's attempt did NOT consume A's ability to activate.
         assert!(do_activate(&state, &acct_a, &kpa, &reference).await.is_ok());
     }
+
+    #[tokio::test]
+    async fn two_confirmed_payments_stack_cumulatively() {
+        // Two DISTINCT confirmed payments on the same account must each add a full period — the
+        // second stacks on the first's expiry, never overwrites it (the atomic `extend_subscription`
+        // reads the persisted expiry under the store lock, not a pre-guard snapshot).
+        let watcher = Arc::new(MockWatcher::confirm_everything());
+        let state = state_with(watcher);
+        let (_d, kp, acct) = add_account(&state).await;
+        let now = now_unix_secs();
+
+        let r1 = do_subscribe(&state, &acct, &kp).await;
+        let after1 = do_activate(&state, &acct, &kp, &r1).await.expect("activate 1").until.expect("active");
+        assert!(after1 >= now + THIRTY_DAYS_SECS - 5, "first payment grants ~30d");
+
+        let r2 = do_subscribe(&state, &acct, &kp).await;
+        let after2 = do_activate(&state, &acct, &kp, &r2).await.expect("activate 2").until.expect("active");
+        assert!(
+            after2 >= after1 + THIRTY_DAYS_SECS - 5 && after2 <= after1 + THIRTY_DAYS_SECS + 5,
+            "the second distinct payment stacks ANOTHER ~30d (≈60d total), it does not overwrite"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pruned_binding_cannot_be_activated() {
+        // An abandoned subscription ages out: once its binding is pruned (the TTL sweep), the payment
+        // can no longer be claimed even if the watcher would confirm it — the front-running guard
+        // (`bindings.contains`) is checked before the payment, so a missing binding is Unauthorized.
+        let watcher = Arc::new(MockWatcher::confirm_everything());
+        let state = state_with(watcher);
+        let (_d, kp, acct) = add_account(&state).await;
+
+        let reference = do_subscribe(&state, &acct, &kp).await;
+        // Prune with a cutoff far past the insertion time → drops the single pending binding.
+        let pruned = state.bindings.prune_older_than(now_unix_secs() + 100_000).expect("prune");
+        assert_eq!(pruned, 1, "the one pending binding is pruned");
+        match do_activate(&state, &acct, &kp, &reference).await {
+            Err(ApiError::Unauthorized) => {}
+            other => panic!("expected Unauthorized after the binding was pruned, got {other:?}"),
+        }
+    }
 }
