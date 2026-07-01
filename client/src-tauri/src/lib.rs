@@ -419,8 +419,23 @@ tauri::ios_plugin_binding!(init_nil_vpn_plugin);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let builder = tauri::Builder::default()
-        .plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default();
+
+    // Single-instance MUST be the FIRST plugin (Tauri requirement). A second launch focuses the
+    // existing window instead of starting a second app process — which would bring up a SECOND
+    // tunnel + kill-switch over the first, an incoherent (and potentially leaky) state for a VPN.
+    // Desktop only; mobile OSes already enforce single-instance for a packaged app.
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.unminimize();
+            let _ = window.show();
+            let _ = window.set_focus();
+        }
+    }));
+
+    let builder = builder.plugin(tauri_plugin_opener::init());
 
     // On mobile, register the native VPN plugin so in-app Connect drives the OS datapath.
     #[cfg(any(target_os = "android", target_os = "ios"))]
