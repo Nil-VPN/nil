@@ -34,7 +34,10 @@ impl Exit {
             .mtu(cfg.mtu)
             .build_async()
             .map_err(|e| anyhow::anyhow!("create TUN {}: {e}", cfg.tun_name))?;
-        tracing::info!(tun = %cfg.tun_name, ip = %cfg.node_tun_ip, mtu = cfg.mtu, role = ?cfg.role, "TUN up");
+        // PD-1: keep node startup logging minimal. The interface name + MTU are enough to debug the
+        // datapath; the tunnel gateway IP and the node's role are not needed in the logs and only
+        // add path-topology detail that could be correlated if a node's logs ever leaked.
+        tracing::info!(tun = %cfg.tun_name, mtu = cfg.mtu, "TUN up");
 
         // Disable TX checksum offload: a TUN otherwise hands userspace forwarded packets
         // with partial (CHECKSUM_PARTIAL) L4 checksums, which we'd relay verbatim and the
