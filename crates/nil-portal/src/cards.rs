@@ -287,4 +287,52 @@ mod tests {
         assert!(!is_confirm_event("refund") && !is_revoke_event("confirmed"));
         assert!(!is_confirm_event("unknown") && !is_revoke_event("unknown"));
     }
+
+    #[tokio::test]
+    async fn webhook_handler_gates_on_signature_then_confirms_or_revokes() {
+        use axum::http::HeaderValue;
+        let secret = b"mor-signing-secret".to_vec();
+        let pending = Arc::new(TimedDurableSet::in_memory());
+        pending.insert("ref-1", 0).unwrap();
+        let card = Arc::new(CardWatcher::new(pending, Arc::new(DurableSet::in_memory())));
+        let state = CardState { card: card.clone(), secret: Arc::new(secret.clone()) };
+        let body = br#"{"event_type":"confirmed","transaction_id":"t","payment_reference":"ref-1"}"#.to_vec();
+        let sign = |b: &[u8]| -> String {
+            let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
+            mac.update(b);
+            mac.finalize().into_bytes().iter().map(|x| format!("{x:02x}")).collect()
+        };
+
+        // No signature header → 400, and nothing is confirmed.
+        assert_eq!(
+            webhook(State(state.clone()), HeaderMap::new(), Bytes::from(body.clone())).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!card.is_confirmed("ref-1"));
+
+        // Wrong signature → 403, still nothing confirmed (no state change on a bad MAC).
+        let mut bad = HeaderMap::new();
+        bad.insert("x-signature", HeaderValue::from_static("00"));
+        assert_eq!(
+            webhook(State(state.clone()), bad, Bytes::from(body.clone())).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(!card.is_confirmed("ref-1"));
+
+        // Correct signature + confirm event → 200 and the reference is now paid.
+        let mut good = HeaderMap::new();
+        good.insert("x-signature", HeaderValue::from_str(&sign(&body)).unwrap());
+        assert_eq!(
+            webhook(State(state.clone()), good, Bytes::from(body.clone())).await,
+            StatusCode::OK
+        );
+        assert!(card.is_confirmed("ref-1"), "a correctly-signed confirm event marks the reference paid");
+
+        // A correctly-signed refund event → 200 and revokes it (future issuance blocked).
+        let refund = br#"{"event_type":"refunded","transaction_id":"t","payment_reference":"ref-1"}"#.to_vec();
+        let mut rh = HeaderMap::new();
+        rh.insert("x-signature", HeaderValue::from_str(&sign(&refund)).unwrap());
+        assert_eq!(webhook(State(state.clone()), rh, Bytes::from(refund)).await, StatusCode::OK);
+        assert!(!card.is_confirmed("ref-1"), "a signed refund event revokes the reference");
+    }
 }
