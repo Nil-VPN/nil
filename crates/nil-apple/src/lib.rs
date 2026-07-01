@@ -335,6 +335,19 @@ mod tests {
         assert!(t.is_null(), "a wrong-length grant nonce must be rejected");
     }
 
+    #[test]
+    fn parse_tee_maps_tdx_case_insensitively_and_defaults_to_sev_snp() {
+        // "tdx" (any case) → Tdx; everything else → the SEV-SNP default. Never panics — an unknown
+        // TEE name from config falls back to a real, attestable TEE rather than erroring.
+        assert_eq!(parse_tee("tdx"), Tee::Tdx);
+        assert_eq!(parse_tee("TDX"), Tee::Tdx);
+        assert_eq!(parse_tee("Tdx"), Tee::Tdx);
+        assert_eq!(parse_tee("sev-snp"), Tee::SevSnp);
+        assert_eq!(parse_tee("SEV-SNP"), Tee::SevSnp);
+        assert_eq!(parse_tee(""), Tee::SevSnp);
+        assert_eq!(parse_tee("something-unknown"), Tee::SevSnp);
+    }
+
     /// A null node host is a config error → null, no thread spawned.
     #[test]
     fn rejects_missing_node_host() {
