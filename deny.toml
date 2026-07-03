@@ -12,6 +12,16 @@ ignore = [
     # with AMD's PUBLIC keys — it performs no RSA private-key operation — so the attack does
     # not apply to our usage. No fixed `rsa` release exists yet; revisit when one ships.
     "RUSTSEC-2023-0071",
+    # quick-xml DoS advisories (RUSTSEC-2026-0194: quadratic runtime on duplicate start-tag
+    # attributes; RUSTSEC-2026-0195: unbounded namespace-declaration allocation in `NsReader`).
+    # `quick-xml` is pulled transitively by `plist` → the Tauri build/codegen stack, where it parses
+    # our OWN trusted, bundled property lists (Info.plist / entitlements / bundle config) at BUILD
+    # time — never untrusted or network-supplied XML at runtime. Both advisories require feeding
+    # attacker-controlled XML to the parser, which never happens in our usage, so the DoS is not
+    # reachable. `plist` (^0.39) has no fixed `quick-xml` release in range yet; revisit when the Tauri
+    # stack bumps `plist`/`quick-xml`.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 # Gate "unmaintained" status on our OWN (workspace + direct) dependencies. Deep
 # transitive platform bindings pulled by Tauri's Linux webview (the gtk-rs GTK3 crates,
