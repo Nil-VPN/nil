@@ -459,14 +459,15 @@ export function SettingsScreen({
 }) {
   const [cfg, setCfg] = useState<PortalConfig | null>(null);
   const [saved, setSaved] = useState(false);
-  const [isMobile, setIsMobile] = useState(false);
+  const [platform, setPlatform] = useState<string>("other");
   useEffect(() => {
     api.getConfig().then(setCfg).catch((e) => onError(String(e)));
     api
       .platform()
-      .then((p) => setIsMobile(p === "android" || p === "ios"))
-      .catch(() => setIsMobile(false));
+      .then(setPlatform)
+      .catch(() => setPlatform("other"));
   }, [onError]);
+  const isMobile = platform === "android" || platform === "ios";
 
   if (!cfg) {
     return (
@@ -519,15 +520,31 @@ export function SettingsScreen({
       {isMobile && (
         <div className="field">
           <span className="field-label">Always-on VPN (persistent kill-switch)</span>
-          <span className="hint">
-            While connected, all traffic is already forced through the tunnel. To also block traffic
-            if NIL stops or the phone reboots, turn on Android&apos;s <strong>Always-on VPN</strong>{" "}
-            and <strong>Block connections without VPN</strong>. This is an OS setting — the app can
-            take you there, but cannot enable it for you.
-          </span>
-          <button className="btn" onClick={() => api.openAlwaysOnSettings().catch((e) => onError(String(e)))}>
-            Open VPN settings
-          </button>
+          {platform === "ios" ? (
+            <>
+              <span className="hint">
+                While connected, NIL already forces all traffic through the tunnel. iOS has no
+                user-facing system-wide Always-on VPN switch (it&apos;s for managed devices), so it
+                can&apos;t guarantee blocking traffic if NIL stops. Open Settings to review the NIL VPN
+                configuration.
+              </span>
+              <button className="btn" onClick={() => api.openAlwaysOnSettings().catch((e) => onError(String(e)))}>
+                Open Settings
+              </button>
+            </>
+          ) : (
+            <>
+              <span className="hint">
+                While connected, all traffic is already forced through the tunnel. To also block traffic
+                if NIL stops or the phone reboots, turn on Android&apos;s <strong>Always-on VPN</strong>{" "}
+                and <strong>Block connections without VPN</strong>. This is an OS setting — the app can
+                take you there, but cannot enable it for you.
+              </span>
+              <button className="btn" onClick={() => api.openAlwaysOnSettings().catch((e) => onError(String(e)))}>
+                Open VPN settings
+              </button>
+            </>
+          )}
         </div>
       )}
 
