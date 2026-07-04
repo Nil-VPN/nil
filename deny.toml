@@ -6,11 +6,20 @@ version = 2
 # Fail on any security advisory in the dependency graph. Add IDs here only with a
 # documented justification.
 ignore = [
-    # Marvin Attack (timing sidechannel in the `rsa` crate), pulled transitively by `sev`
-    # to verify the AMD ARK/ASK RSA-4096 certificate chain. The sidechannel affects RSA
-    # PRIVATE-key operations (decryption/signing); `nil-attest` only ever VERIFIES signatures
-    # with AMD's PUBLIC keys — it performs no RSA private-key operation — so the attack does
-    # not apply to our usage. No fixed `rsa` release exists yet; revisit when one ships.
+    # Marvin Attack (timing sidechannel in the `rsa` crate). It appears via TWO distinct copies,
+    # so this single ID-ignore silences both — documented honestly (PD-5):
+    #   1. `rsa 0.9` via `sev`/`dcap-qvl` → `nil-attest`, which only VERIFIES signatures with the
+    #      AMD/Intel PUBLIC keys (no RSA private-key op), so the sidechannel does not apply there.
+    #   2. `rsa 0.10.0-rc.18` via `blind-rsa-signatures` → `nil-crypto` → `nil-portal`, which DOES
+    #      perform an RSA PRIVATE-key blind-signing operation on network-reachable input at
+    #      POST /v1/tokens/mint and POST /v1/tokens/issue. This path is exposed but MITIGATED: the
+    #      blind-RSA base blinding is active (the signed message is blinded per request) and both
+    #      endpoints are strictly rate-capped (per-IP, plus per-account for mint), so the millions
+    #      of precisely-timed samples a Marvin key-recovery needs are not achievable at the deployed
+    #      request rates. NOT a documented "no private-key op" exemption — a tracked, rate-limited
+    #      exposure. Revisit: (a) move to a constant-time RSA backend when RUSTSEC-2023-0071 gets a
+    #      fixed `rsa` release, and (b) `rsa 0.10.0-rc.18` is a pre-release pinned by
+    #      `blind-rsa-signatures` — move to a stable release when one is available.
     "RUSTSEC-2023-0071",
     # quick-xml DoS advisories (RUSTSEC-2026-0194: quadratic runtime on duplicate start-tag
     # attributes; RUSTSEC-2026-0195: unbounded namespace-declaration allocation in `NsReader`).

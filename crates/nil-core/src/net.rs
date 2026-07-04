@@ -5,7 +5,8 @@
 //! never plaintext across an untrusted network. The Portal (token issuance), the client
 //! (Coordinator redemption), and the Monero wallet-rpc guard all enforce this; keeping the check
 //! in one place stops it from drifting (and from re-introducing the prefix-match bug where
-//! `127.0.0.1.evil.com` looked like loopback).
+//! `127.0.0.1.evil.com` looked like loopback, or the userinfo bug where `127.0.0.1@evil.com`
+//! looked like loopback while the real connection went to `evil.com`).
 
 /// Read a boolean env flag the safe way: `true` ONLY for an explicit truthy value (`"1"` or
 /// `"true"`, case-insensitive). Absent, empty, `"0"`, and `"false"` all read as `false`.
@@ -52,10 +53,17 @@ pub fn is_loopback_host(host: &str) -> bool {
         || host.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
-/// Extract the host from the part of a URL after `://`: drop the path, strip an optional
-/// `[ipv6]` bracket form, else drop a trailing `:port`.
+/// Extract the host from the part of a URL after `://`: drop the path, strip any RFC-3986
+/// `userinfo@` prefix, strip an optional `[ipv6]` bracket form, else drop a trailing `:port`.
+///
+/// Stripping userinfo is security-critical: the WHATWG/RFC-3986 host is what follows the LAST `@`
+/// in the authority, which is exactly what `reqwest`'s `url` crate dials. Without this,
+/// `http://127.0.0.1:80@evil.com/` would parse here as host `127.0.0.1` (looking like loopback and
+/// passing the plaintext gate) while the actual connection goes in cleartext to `evil.com`.
 fn url_host(rest: &str) -> &str {
     let authority = rest.split('/').next().unwrap_or("");
+    // Host is what follows the LAST '@' (userinfo may itself contain '@'/':'), matching WHATWG.
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
     if let Some(after) = authority.strip_prefix('[') {
         // [ipv6]:port → the host is up to the closing bracket.
         return after.split(']').next().unwrap_or(after);
@@ -91,6 +99,20 @@ mod tests {
         // The classic prefix-match bypass must be refused.
         assert!(require_tls_or_loopback("http://127.0.0.1.evil.com:9000").is_err());
         assert!(require_tls_or_loopback("not-a-url").is_err());
+    }
+
+    #[test]
+    fn http_userinfo_spoof_refused() {
+        // RFC-3986 userinfo bypass: the real host is what follows the LAST '@' — `evil.com` — which
+        // is what reqwest dials. A loopback-looking userinfo must NOT smuggle a plaintext remote
+        // connection past the gate.
+        assert!(require_tls_or_loopback("http://127.0.0.1:80@evil.com/v1/redeem").is_err());
+        assert!(require_tls_or_loopback("http://localhost:1@evil.com/").is_err());
+        assert!(require_tls_or_loopback("http://user:pass@evil.com/").is_err());
+        assert!(require_tls_or_loopback("http://user:p@ss@evil.com/").is_err());
+        // A genuine loopback host with harmless userinfo is still fine (reqwest dials 127.0.0.1).
+        assert!(require_tls_or_loopback("http://user@127.0.0.1:9000/v1/redeem").is_ok());
+        assert!(require_tls_or_loopback("http://user@[::1]:9000/").is_ok());
     }
 
     #[test]
