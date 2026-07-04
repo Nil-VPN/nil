@@ -54,8 +54,13 @@ zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
 data-encoding = "2"            # Crockford base32 for account numbers / recovery codes
 
-# --- Phase 1: MASQUE/QUIC datapath (quiche vendors BoringSSL → needs cmake/clang) ---
-quiche     = "0.22"                    # default MASQUE/QUIC transport (Cloudflare)
+# --- Phase 1: MASQUE/QUIC datapath (BoringSSL via the `boring` crate → needs cmake/clang) ---
+# `boringssl-boring-crate` (in place of the vendored default) exposes
+# `Config::with_boring_ssl_ctx_builder`, which the client uses to shape the outer TLS ClientHello
+# toward a real browser fingerprint (PQ X25519MLKEM768 key share + TLS GREASE). Same BoringSSL,
+# sourced via the `boring` crate so the SslContextBuilder type matches.
+quiche     = { version = "0.22", default-features = false, features = ["boringssl-boring-crate"] }
+boring     = { version = "4", features = ["pq-experimental"] }  # BoringSSL ctx + X25519MLKEM768 for outer-ClientHello shaping
 tun-rs     = { version = "2", features = ["async_tokio"] }  # TUN device (Linux/macOS)
 rcgen      = "0.13"                    # self-signed dev TLS cert for nil-node (Phase 1)
 tokio-util = { version = "0.7", features = ["rt"] }          # CancellationToken for pumps

@@ -10,7 +10,7 @@ description = "NIL VPN transport trait — the single seam between the engine an
 default = []
 # MASQUE/QUIC transport (quiche + BoringSSL → needs cmake to build). Off by default so
 # crates that only need the trait + loopback (and the pure `connectip` framing) build light.
-masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest"]
+masque = ["dep:quiche", "dep:tokio-util", "dep:getrandom", "dep:nil-attest", "dep:boring"]
 # Test/dev only: accept synthetic attestation reports (for the Docker accept/reject harness).
 # Never enable in a release client — the synthetic trust anchor is unreachable without it.
 synthetic-attest = ["masque", "nil-attest/synthetic"]
@@ -59,6 +59,7 @@ tokio-tungstenite = { workspace = true, optional = true } # WebSocket (wstunnel)
 tokio-rustls = { workspace = true, optional = true }     # TLS envelope (wstunnel)
 rustls = { workspace = true, optional = true }           # no-verify client config (wstunnel)
 futures-util = { workspace = true, optional = true }     # split the WS stream (wstunnel)
+boring = { workspace = true, optional = true }           # BoringSSL SslContextBuilder (masque: outer-ClientHello shaping)
 
 [dev-dependencies]
 # A throwaway self-signed TLS cert for the in-crate wstunnel round-trip test's WS-TLS responder.

@@ -887,9 +887,30 @@ const HTTPS_QUIC_PROFILE: QuicShapeProfile = QuicShapeProfile {
 /// receive (advertised to the peer, so it caps *its* sends too) and the size of packets we
 /// send. The outermost hop uses [`MAX_UDP_PAYLOAD`]; a nested hop uses a smaller value so its
 /// QUIC packets fit inside the outer tunnel after [`crate::udpip`] wrapping.
-fn build_client_config(max_udp_payload: usize) -> Result<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)
-        .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
+pub(crate) fn build_client_config(max_udp_payload: usize) -> Result<quiche::Config> {
+    // Own the BoringSSL context so the OUTER TLS ClientHello matches a real browser (Chrome HTTP/3)
+    // fingerprint — a censor fingerprints this handshake (JA4/JA4+) regardless of the SNI (Pillar 1).
+    // quiche still sets TLS 1.3 + the QUIC method + early-data context per connection (Handshake::init),
+    // so this builder only carries the fingerprint-relevant knobs:
+    //   - X25519MLKEM768 first in the group list → NIL offers the post-quantum key share Chrome ships
+    //     by default (2025); its ABSENCE was itself a fingerprint (see the fingerprint-parity harness).
+    //   - TLS-level GREASE (RFC 8701) → real clients grease the ClientHello; not greasing is a tell.
+    //     (quiche's own `grease` flag only greases the QUIC layer, not the TLS ClientHello.)
+    // verify stays OFF: node trust is the RA-TLS attestation appraised AFTER the handshake (the single
+    // ready gate in `driver_run`), never a CA chain — so this changes camouflage, not the trust model.
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
+    let mut tls = SslContextBuilder::new(SslMethod::tls())
+        .map_err(|e| Error::Transport(format!("boring ssl ctx: {e}")))?;
+    tls.set_verify(SslVerifyMode::NONE);
+    tls.set_grease_enabled(true);
+    // Group order mirrors Chrome HTTP/3: the PQ hybrid first, then classical fallbacks. The PQ
+    // group needs boring's `pq-experimental` feature (X25519MLKEM768 in the BoringSSL build).
+    tls.set_curves_list("X25519MLKEM768:X25519:P-256:P-384")
+        .map_err(|e| Error::Transport(format!("boring set_curves_list: {e}")))?;
+
+    let mut config =
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
+            .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
     config
         .set_application_protos(&[b"h3"])
         .map_err(|e| Error::Transport(format!("set_application_protos: {e}")))?;
