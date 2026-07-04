@@ -36,6 +36,16 @@ const INITIAL_SALT: [u8; 20] = [
 const X25519MLKEM768: u16 = 0x11ec;
 const X25519KYBER768_DRAFT: u16 = 0x6399;
 
+/// Real Chrome HTTP/3 ClientHello extension SET (sorted), captured 2026-07 (Chrome on macOS, QUIC
+/// v1) via a local UDP listener + `--origin-to-force-quic-on` + a `--host-resolver-rules` hostname
+/// map (so SNI is present). Chrome's substantive JA4 components — cipher suites `1301/1302/1303`,
+/// supported groups `11ec,001d,0017,0018`, key_share `11ec,001d`, ALPN `h3`, SNI — are all matched
+/// by NIL after the outer-ClientHello shaping. This is the ground-truth reference for the remaining
+/// extension-SET gap (JA4 sorts extensions, so only the set matters, not order).
+const CHROME_EXT_SET: &[u16] = &[
+    0x0000, 0x000a, 0x000d, 0x0010, 0x001b, 0x002b, 0x002d, 0x0033, 0x0039, 0x44cd, 0xfe0d,
+];
+
 fn u16be(b: &[u8]) -> u16 {
     ((b[0] as u16) << 8) | b[1] as u16
 }
@@ -376,6 +386,27 @@ fn nil_client_hello_shape() -> ClientHelloShape {
     parse_client_hello(&reassemble(chunks))
 }
 
+/// Parse a ClientHello out of a length-prefixed (u32 BE + bytes) capture of one or more Initial
+/// datagrams — e.g. a real Chrome QUIC flight captured by a local UDP listener. Retransmits/overlaps
+/// are handled by the offset reassembly.
+fn shape_from_capture(path: &str) -> ClientHelloShape {
+    let raw = std::fs::read(path).expect("read capture file");
+    let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
+    let mut i = 0;
+    while i + 4 <= raw.len() {
+        let len = u32::from_be_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]) as usize;
+        i += 4;
+        let dg = &raw[i..i + len];
+        i += len;
+        // Only decrypt long-header Initial packets (type bits 00); skip anything else defensively.
+        if dg.first().is_some_and(|b| b & 0x80 != 0) {
+            let frames = decrypt_initial(dg);
+            collect_crypto(&frames, &mut chunks);
+        }
+    }
+    parse_client_hello(&reassemble(chunks))
+}
+
 #[test]
 fn nil_outer_client_hello_fingerprint() {
     let sh = nil_client_hello_shape();
@@ -438,4 +469,67 @@ fn nil_outer_client_hello_fingerprint() {
         "NIL's outer ClientHello fingerprint changed (see the printed breakdown). If intentional, \
          re-pin; if not, the handshake shape drifted."
     );
+
+    // Track the exact remaining gap to the pinned real-Chrome reference. Not an assert — it's a
+    // known, documented residual: NIL matches Chrome on every substantive JA4 component; only three
+    // finer extensions remain, and closing them needs quiche per-SSL hooks (see below).
+    let nset: std::collections::BTreeSet<u16> = sh.extensions.iter().copied().collect();
+    let missing: Vec<String> =
+        CHROME_EXT_SET.iter().filter(|e| !nset.contains(e)).map(|e| format!("{e:04x}")).collect();
+    let extra: Vec<String> = sh
+        .extensions
+        .iter()
+        .filter(|e| !CHROME_EXT_SET.contains(e))
+        .map(|e| format!("{e:04x}"))
+        .collect();
+    println!(
+        "--- extension-set gap vs pinned real Chrome ---\n\
+         Chrome set: {}\n\
+         NIL lacks:  [{}]   NIL extra: [{}]\n\
+         fe0d=ECH-GREASE (per-SSL SSL_set_enable_ech_grease — NOT exposed via quiche's ctx builder);\n\
+         001b=compress_certificate (needs a brotli CertificateCompressor impl);\n\
+         44cd=Chrome-specific. Substantive JA4 (ciphers/groups/key_share/ALPN/SNI) matches; the\n\
+         remaining set-parity needs quiche to expose per-SSL config — tracked, not yet closable here.",
+        CHROME_EXT_SET.iter().map(|e| format!("{e:04x}")).collect::<Vec<_>>().join(","),
+        missing.join(","),
+        extra.join(","),
+    );
+}
+
+/// Diagnostic (skips unless `NW_CAPTURED_INITIAL` points at a captured Initial flight): parse a real
+/// browser ClientHello and print the exact parity delta vs NIL. Used to drive full extension-set
+/// parity against a Chrome ground-truth capture.
+#[test]
+fn compare_against_captured_chrome() {
+    let Ok(path) = std::env::var("NW_CAPTURED_INITIAL") else {
+        println!("NW_CAPTURED_INITIAL unset — skipping Chrome-parity comparison (diagnostic only)");
+        return;
+    };
+    use std::collections::BTreeSet;
+    let chrome = shape_from_capture(&path);
+    let nil = nil_client_hello_shape();
+    let dump = |tag: &str, s: &ClientHelloShape| {
+        println!(
+            "{tag}: TLS1.3={} GREASE={} PQ={} JA4={}\n  ciphers: {}\n  exts:    {}\n  groups:  {}  key_share: {}  alpn: {:?}",
+            s.tls13, s.grease_present, s.has_pq_key_share(), s.ja4(),
+            hexlist(&s.ciphers), hexlist(&s.extensions), hexlist(&s.groups),
+            hexlist(&s.key_share_groups), s.alpn,
+        );
+    };
+    println!("\n=== Chrome (captured) vs NIL outer ClientHello ===");
+    dump("Chrome", &chrome);
+    dump("NIL   ", &nil);
+    let cset: BTreeSet<u16> = chrome.extensions.iter().copied().collect();
+    let nset: BTreeSet<u16> = nil.extensions.iter().copied().collect();
+    let hx = |it: std::collections::btree_set::Difference<u16>| {
+        it.map(|e| format!("{e:04x}")).collect::<Vec<_>>().join(",")
+    };
+    let cg: BTreeSet<u16> = chrome.groups.iter().copied().collect();
+    let ng: BTreeSet<u16> = nil.groups.iter().copied().collect();
+    println!("--- parity delta (what NIL must add to match Chrome) ---");
+    println!("extensions Chrome has, NIL LACKS: [{}]", hx(cset.difference(&nset)));
+    println!("extensions NIL has, Chrome lacks: [{}]", hx(nset.difference(&cset)));
+    println!("groups Chrome has, NIL lacks:     [{}]", hx(cg.difference(&ng)));
+    println!("cipher suites match: {}", chrome.ciphers == nil.ciphers);
+    println!("ALPN match: {}", chrome.alpn == nil.alpn);
 }

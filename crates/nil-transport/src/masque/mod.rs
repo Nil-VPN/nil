@@ -903,6 +903,10 @@ pub(crate) fn build_client_config(max_udp_payload: usize) -> Result<quiche::Conf
         .map_err(|e| Error::Transport(format!("boring ssl ctx: {e}")))?;
     tls.set_verify(SslVerifyMode::NONE);
     tls.set_grease_enabled(true);
+    // Permute ClientHello extension order per connection (Chrome/BoringSSL anti-ossification). A
+    // FIXED extension order is itself a stable fingerprint; Chrome randomizes, so NIL does too.
+    // (Invisible to JA4, which sorts extensions — this defeats exact-byte / order-sensitive matchers.)
+    tls.set_permute_extensions(true);
     // Group order mirrors Chrome HTTP/3: the PQ hybrid first, then classical fallbacks. The PQ
     // group needs boring's `pq-experimental` feature (X25519MLKEM768 in the BoringSSL build).
     tls.set_curves_list("X25519MLKEM768:X25519:P-256:P-384")
