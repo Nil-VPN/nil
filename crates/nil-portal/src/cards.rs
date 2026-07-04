@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
@@ -144,10 +144,17 @@ pub struct CardState {
     secret: Arc<Vec<u8>>,
 }
 
+/// Hard cap on the webhook body. A MoR event JSON (Lemon Squeezy / Paddle) is well under 16 KiB.
+/// Without it, Axum's 2 MiB default lets an unauthenticated caller force MiB-scale buffering (the
+/// `Bytes` extractor buffers the full body BEFORE the HMAC check) on this un-rate-limited public
+/// endpoint. Mirrors the ACCOUNT/TOKEN/MINT/SUB body-amplification guards on the sibling routers.
+const WEBHOOK_BODY_LIMIT: usize = 16 * 1024;
+
 /// `POST /v1/billing/webhook`: the MoR posts a signed payment event here.
 pub fn cards_router(card: Arc<CardWatcher>, secret: Vec<u8>) -> Router {
     Router::new()
         .route("/v1/billing/webhook", post(webhook))
+        .layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT))
         .with_state(CardState { card, secret: Arc::new(secret) })
 }
 
@@ -286,6 +293,31 @@ mod tests {
         assert!(is_revoke_event("refund") && is_revoke_event("chargeback"));
         assert!(!is_confirm_event("refund") && !is_revoke_event("confirmed"));
         assert!(!is_confirm_event("unknown") && !is_revoke_event("unknown"));
+    }
+
+    #[tokio::test]
+    async fn oversized_webhook_body_is_rejected_before_handling() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt; // for `oneshot`
+
+        // A body far above WEBHOOK_BODY_LIMIT must be refused (413) by the body-limit layer, before
+        // the `Bytes` extractor buffers it — blocks pre-auth memory amplification on this public,
+        // un-rate-limited endpoint.
+        let pending = Arc::new(TimedDurableSet::in_memory());
+        let router = cards_router(
+            Arc::new(CardWatcher::new(pending, Arc::new(DurableSet::in_memory()))),
+            b"mor-signing-secret".to_vec(),
+        );
+        let big = "a".repeat(64 * 1024);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/billing/webhook")
+            .header("content-type", "application/json")
+            .body(Body::from(big))
+            .expect("request builds");
+        let resp = router.oneshot(req).await.expect("oneshot");
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

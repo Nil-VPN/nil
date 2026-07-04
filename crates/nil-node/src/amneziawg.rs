@@ -37,6 +37,14 @@ use crate::config::NodeConfig;
 /// proper anti-flood; out of scope for this fallback rung.
 const MAX_CLIENTS: usize = 256;
 
+/// Max distinct inner source IPs one client may register in the route table. A legitimate client
+/// uses exactly one inner tunnel IP; the small headroom tolerates a benign re-address. This caps
+/// the global `routes` map at `MAX_CLIENTS * MAX_ROUTES_PER_CLIENT`, so a single established client
+/// cannot inflate it toward the whole 2^32 IPv4 space (memory-exhaustion DoS) by streaming data
+/// packets with attacker-chosen inner source addresses. Full in-band ADDRESS_ASSIGN (one route per
+/// client, pinned) is the long-term fix; see the module header.
+const MAX_ROUTES_PER_CLIENT: usize = 4;
+
 /// One tracked client, keyed in the responder by its UDP source address.
 struct Client {
     /// The client's WireGuard static pubkey (from its preface) — for dedup/logging.
@@ -46,6 +54,10 @@ struct Client {
     established: bool,
     /// Insertion order — used to evict the oldest *non-established* client at capacity.
     seq: u64,
+    /// Inner source IPs this client has registered in `routes`, oldest first. Bounded by
+    /// [`MAX_ROUTES_PER_CLIENT`] so one client cannot inflate the global route table; when full,
+    /// learning a new IP evicts this client's oldest route (FIFO).
+    owned_routes: Vec<Ipv4Addr>,
 }
 
 /// An action the async loop must perform — returned by the (sync, testable) packet handlers so
@@ -100,18 +112,18 @@ impl Responder {
         if !self.clients.contains_key(&from) {
             return Vec::new();
         }
+        // Present per the guard above; capture `seq` up-front so route learning (which needs a
+        // separate &mut self borrow) can run after the per-client core borrow is released.
+        let Some(seq) = self.clients.get(&from).map(|c| c.seq) else { return Vec::new() };
         let mut out = Vec::new();
         let mut input = wg;
-        loop {
-            // Re-borrow each iteration so we can also touch self.routes/self.obfs (disjoint fields).
-            let client = self.clients.get_mut(&from).expect("client present");
+        let mut learned_src = None;
+        // Re-borrow each iteration so we can also touch self.obfs (a disjoint field).
+        while let Some(client) = self.clients.get_mut(&from) {
             match client.core.decapsulate(&input) {
                 WgStep::Ip(ip) => {
                     client.established = true;
-                    let seq = client.seq;
-                    if let Some(src) = ipv4_src(&ip) {
-                        self.routes.insert(src, (from, seq));
-                    }
+                    learned_src = ipv4_src(&ip);
                     out.push(Action::ToTun(ip));
                     break;
                 }
@@ -122,7 +134,51 @@ impl Responder {
                 WgStep::Done | WgStep::Err(_) => break,
             }
         }
+        // Learn the inner-source→client route AFTER releasing the core borrow, with a per-client cap
+        // and an anti-hijack check (see `learn_route`).
+        if let Some(src) = learned_src {
+            self.learn_route(src, from, seq);
+        }
         out
+    }
+
+    /// Register `src → (from, seq)` in the route table, bounded and hijack-safe.
+    ///
+    /// - **Anti-hijack:** never reassign an inner IP that a *different* live client currently owns —
+    ///   otherwise one client could steal another's inner source IP and black-hole (or, combined
+    ///   with the `seq` guard in [`Self::handle_tun`], drop) the victim's return traffic. A *stale*
+    ///   route (owner disconnected or replaced) may be taken over.
+    /// - **Per-client cap:** at [`MAX_ROUTES_PER_CLIENT`], evict this client's oldest route (FIFO)
+    ///   before learning a new one, so a single client streaming packets with distinct spoofed
+    ///   inner sources cannot grow `routes` without bound (memory-exhaustion DoS).
+    fn learn_route(&mut self, src: Ipv4Addr, from: SocketAddr, seq: u64) {
+        if let Some(&(owner_addr, owner_seq)) = self.routes.get(&src) {
+            if owner_addr == from && owner_seq == seq {
+                return; // already ours — no new entry, no growth
+            }
+            let owned_by_other_live =
+                self.clients.get(&owner_addr).is_some_and(|c| c.seq == owner_seq);
+            if owned_by_other_live {
+                return; // a different live client owns this inner IP — drop, never hijack
+            }
+            // else: the route is stale (owner gone/replaced) — safe to take it over.
+        }
+        // Update the owning client's bounded route list, evicting its oldest route if at the cap.
+        let evicted = {
+            let Some(client) = self.clients.get_mut(&from) else { return };
+            let evicted = (client.owned_routes.len() >= MAX_ROUTES_PER_CLIENT)
+                .then(|| client.owned_routes.remove(0));
+            client.owned_routes.push(src);
+            evicted
+        };
+        if let Some(old) = evicted {
+            // Only drop the shared route if THIS client still owns it (a stale-takeover elsewhere
+            // may have reassigned it in the meantime).
+            if self.routes.get(&old).is_some_and(|&(a, s)| a == from && s == seq) {
+                self.routes.remove(&old);
+            }
+        }
+        self.routes.insert(src, (from, seq));
     }
 
     /// A reply arriving on the shared exit TUN → route to the owning client by destination IP.
@@ -196,8 +252,10 @@ impl Responder {
         let core = PqWgCore::without_psk(self.node_secret.clone(), PublicKey::from(client_pub), 2);
         let seq = self.next_seq;
         self.next_seq += 1;
-        self.clients
-            .insert(from, Client { pubkey: client_pub, core, established: false, seq });
+        self.clients.insert(
+            from,
+            Client { pubkey: client_pub, core, established: false, seq, owned_routes: Vec::new() },
+        );
     }
 }
 
@@ -422,6 +480,60 @@ mod tests {
         let c = r.clients.get(&addr).expect("client still present");
         assert!(c.established, "established flag preserved");
         assert_eq!(c.pubkey, real_key, "a bare preface cannot swap an established peer's key");
+    }
+
+    #[test]
+    fn one_client_cannot_inflate_the_route_table_unboundedly() {
+        let node_kp = WgKeypair::generate().unwrap();
+        let node_pub = node_kp.public;
+        let mut r = Responder::new(node_kp.secret, node_pub.as_bytes());
+        let addr: SocketAddr = "203.0.113.9:51820".parse().unwrap();
+        let mut core = establish(&mut r, node_pub, addr, 303);
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
+
+        // The client streams data packets each carrying a DISTINCT (attacker-chosen) inner source
+        // IP. The route table must stay bounded by the per-client cap — not grow one entry per
+        // spoofed source, which would OOM the node.
+        for i in 0..(MAX_ROUTES_PER_CLIENT as u32 + 50) {
+            let src = [10, 74, (i >> 8) as u8, (i & 0xff) as u8];
+            let data = core.encapsulate(&ipv4(src, [1, 1, 1, 1])).unwrap();
+            r.handle_udp(&obfs.obfuscate(&data), addr);
+        }
+        assert!(
+            r.routes.len() <= MAX_ROUTES_PER_CLIENT,
+            "per-client route cap must bound the table, got {} > {}",
+            r.routes.len(),
+            MAX_ROUTES_PER_CLIENT
+        );
+    }
+
+    #[test]
+    fn a_client_cannot_hijack_another_clients_inner_ip() {
+        let node_kp = WgKeypair::generate().unwrap();
+        let node_pub = node_kp.public;
+        let mut r = Responder::new(node_kp.secret, node_pub.as_bytes());
+        let addr_a: SocketAddr = "203.0.113.10:51820".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.11:51820".parse().unwrap();
+        let mut core_a = establish(&mut r, node_pub, addr_a, 401);
+        let mut core_b = establish(&mut r, node_pub, addr_b, 402);
+        let obfs = ObfsParams::derive(node_pub.as_bytes());
+        let shared_ip = [10, 74, 0, 5];
+
+        // A legitimately learns the route for its inner IP.
+        let a_data = core_a.encapsulate(&ipv4(shared_ip, [1, 1, 1, 1])).unwrap();
+        r.handle_udp(&obfs.obfuscate(&a_data), addr_a);
+        let a_seq = r.clients.get(&addr_a).unwrap().seq;
+        assert_eq!(r.routes.get(&Ipv4Addr::from(shared_ip)).copied(), Some((addr_a, a_seq)));
+
+        // B spoofs the SAME inner source IP. The responder must NOT reassign the route to B — doing
+        // so would hijack A's return traffic. A keeps ownership.
+        let b_data = core_b.encapsulate(&ipv4(shared_ip, [1, 1, 1, 1])).unwrap();
+        r.handle_udp(&obfs.obfuscate(&b_data), addr_b);
+        assert_eq!(
+            r.routes.get(&Ipv4Addr::from(shared_ip)).copied(),
+            Some((addr_a, a_seq)),
+            "a live client's inner-IP route must not be hijacked by another client"
+        );
     }
 
     #[test]

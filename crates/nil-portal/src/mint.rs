@@ -95,7 +95,14 @@ async fn mint(
     // Per-account abuse/resale bound, keyed by the account number (H(secret)). Checked AFTER auth so
     // a forged/unauthenticated request can't burn a real account's mint budget. The account number
     // is the Portal's own lookup key (non-identity); the counter is transient + in-memory (PD-2).
-    if !state.account_limiter.check(&req.auth.account_number) {
+    //
+    // Key on the CANONICAL decoded account number (`record.account_number`, re-hexed lowercase), NOT
+    // the raw request string: `unhex32` decodes hex case-insensitively and the auth signature covers
+    // only the challenge, so `AABB…` and `aabb…` authenticate as the SAME account but would otherwise
+    // land in DISTINCT rate-limit buckets — letting one subscription mint at ~2^24× the cap. This is
+    // the same hex-case canonicalization the Coordinator applies to nullifiers (nil-coordinator
+    // api.rs `to_hex(&msg)`); the mint path must match it.
+    if !state.account_limiter.check(&to_hex(&record.account_number)) {
         return Err(ApiError::TooManyRequests);
     }
 
@@ -239,6 +246,29 @@ mod tests {
         match mint(peer(), State(state.clone()), Json(mint_req(&state, &acct, &kp, &blind))).await {
             Err(ApiError::TooManyRequests) => {}
             other => panic!("expected TooManyRequests, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn per_account_cap_is_not_bypassable_by_hex_case() {
+        let issuer = Arc::new(Issuer::generate().unwrap());
+        let state = state_with(issuer.clone(), 1); // cap of 1 mint/window
+        let blind = blinded(&issuer);
+        let (kp, acct) = add_account(&state, active_until_now_plus_30d()).await;
+
+        // First mint with the lowercase account number succeeds.
+        assert!(mint(peer(), State(state.clone()), Json(mint_req(&state, &acct, &kp, &blind)))
+            .await
+            .is_ok());
+
+        // Same account, account number in UPPERCASE hex: hex decode is case-insensitive and the auth
+        // signature covers only the challenge, so this authenticates as the SAME account. It must
+        // therefore hit the SAME per-account bucket and be capped — not handed a fresh mint budget.
+        let acct_upper = acct.to_uppercase();
+        assert_ne!(acct_upper, acct, "test precondition: the account hex contains at least one a-f");
+        match mint(peer(), State(state.clone()), Json(mint_req(&state, &acct_upper, &kp, &blind))).await {
+            Err(ApiError::TooManyRequests) => {}
+            other => panic!("hex-case variant must share the per-account cap, got {other:?}"),
         }
     }
 

@@ -96,7 +96,7 @@ impl PqInitiator {
             .map_err(|_| PskError::BadCiphertext("ml-kem ciphertext length"))?;
         let mc_ct = mceliece_ct_from_bytes(&cts.mceliece_ct)?;
         let ss_mc = decapsulate_boxed(&mc_ct, &self.mceliece_sk);
-        Ok(combine(shared32(ss_mlkem.as_slice()), ss_mc.as_array()))
+        Ok(combine(ss_mlkem.as_slice(), ss_mc.as_array()))
     }
 }
 
@@ -113,25 +113,24 @@ pub fn responder_encapsulate(offer: &PqOffer) -> Result<(PqCiphertexts, Psk), Ps
         mlkem_ct: mlkem_ct.as_slice().to_vec(),
         mceliece_ct: mc_ct.as_array().to_vec(),
     };
-    Ok((cts, combine(shared32(ss_mlkem.as_slice()), ss_mc.as_array())))
+    Ok((cts, combine(ss_mlkem.as_slice(), ss_mc.as_array())))
 }
 
 /// `PSK = HKDF-SHA256(salt, ss_mlkem || ss_mceliece, 32)`. The concatenation order is part of
 /// the construction and both sides agree on it.
-fn combine(ss_mlkem: [u8; 32], ss_mceliece: &[u8; 32]) -> Psk {
+///
+/// The ML-KEM shared secret is passed by slice and copied STRAIGHT into the `Zeroizing` `ikm`
+/// buffer — never into an intermediate plain `[u8; 32]`. That closes a defense-in-depth gap where a
+/// stale, un-zeroized copy of the shared secret could linger on the stack after the source
+/// `SharedKey` (which self-zeroizes on drop) was gone. `ikm` and `out` are both `Zeroizing`.
+fn combine(ss_mlkem: &[u8], ss_mceliece: &[u8; 32]) -> Psk {
     let mut ikm = Zeroizing::new([0u8; 64]);
-    ikm[..32].copy_from_slice(&ss_mlkem);
+    ikm[..32].copy_from_slice(ss_mlkem);
     ikm[32..].copy_from_slice(ss_mceliece);
     let hk = Hkdf::<Sha256>::new(Some(PSK_SALT), ikm.as_ref());
     let mut out = Zeroizing::new([0u8; 32]);
     hk.expand(PSK_INFO, out.as_mut_slice()).expect("32 bytes is within HKDF's output limit");
     Psk(out)
-}
-
-fn shared32(s: &[u8]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    out.copy_from_slice(s);
-    out
 }
 
 fn mceliece_pk_from_bytes(b: &[u8]) -> Result<PublicKey<'static>, PskError> {
@@ -181,7 +180,7 @@ mod tests {
     fn combine_is_a_pinned_function_of_its_inputs() {
         // Anti-drift KAT: fixed shared secrets must always map to this exact PSK, so the HKDF
         // labels / concatenation order can never change silently.
-        let psk = combine([0x01u8; 32], &[0x02u8; 32]);
+        let psk = combine(&[0x01u8; 32], &[0x02u8; 32]);
         assert_eq!(
             hex::encode(psk.as_bytes()),
             "9b8a9798517615ec75d3b77a79b9c33b1257c23dc39df8a65f9270ed226caf45"

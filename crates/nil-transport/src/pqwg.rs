@@ -41,11 +41,16 @@ impl WgKeypair {
     /// Generate a fresh keypair from the OS CSPRNG (via `getrandom`, avoiding an rand_core
     /// version pin).
     pub fn generate() -> std::io::Result<Self> {
+        use zeroize::Zeroize;
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes)
             .map_err(|e| std::io::Error::other(format!("wg key entropy: {e}")))?;
         let secret = StaticSecret::from(bytes);
         let public = PublicKey::from(&secret);
+        // `StaticSecret` self-zeroizes on drop, but the raw `bytes` seed is a plain [u8;32] Copy that
+        // `StaticSecret::from` copied out of — scrub it so no un-zeroized copy of the private scalar
+        // lingers on the stack (matches the crate's Zeroizing discipline; PD-2).
+        bytes.zeroize();
         Ok(Self { secret, public })
     }
 }

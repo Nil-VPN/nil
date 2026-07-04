@@ -26,6 +26,13 @@ use crate::pqwg::ClientPqWg;
 // packet (+28 B IPv4/UDP) under 1500.
 const MAX_UDP_PAYLOAD: usize = 1420;
 
+/// When a client has NO pool-assigned inner address (ADDRESS_ASSIGN fallback — pool exhausted, at
+/// most one such client routes at a time), cap how many distinct inner source IPs it may register.
+/// Bounds `client_routes` so a single authenticated tunnel cannot stream packets with attacker-
+/// chosen (esp. IPv6, 2^128) inner sources and grow the map until the node OOMs. Clients WITH an
+/// assigned address are bound to exactly that one IP (see `learn_client_route`).
+const MAX_LEARNED_ROUTES_PER_CLIENT: usize = 4;
+
 struct Client {
     conn: quiche::Connection,
     h3: Option<quiche::h3::Connection>,
@@ -178,6 +185,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             #[cfg(feature = "dev-trace")]
             diag.record_from_client(raw.len(), raw.iter().map(Vec::len).sum());
             let mut net_replies: Vec<Vec<u8>> = Vec::new();
+            // The client's pool-assigned inner address (Copy); route learning is bound to it so a
+            // tunnel cannot register arbitrary/unbounded inner sources.
+            let assigned = client.assigned_ip;
             for dg in raw {
                 let Ok((_fid, payload)) = connectip::decode_datagram(&dg) else {
                     continue;
@@ -189,7 +199,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         loop {
                             match tunn.decapsulate(&input) {
                                 WgStep::Ip(ip) => {
-                                    if learn_client_route(&mut client_routes, client_id, &ip) {
+                                    if learn_client_route(&mut client_routes, client_id, assigned, &ip) {
                                         to_tun.push(ip);
                                     }
                                     break;
@@ -204,7 +214,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                     }
                     // Plain MASQUE: the datagram is a raw IP packet.
                     None => {
-                        if learn_client_route(&mut client_routes, client_id, payload) {
+                        if learn_client_route(&mut client_routes, client_id, assigned, payload) {
                             to_tun.push(payload.to_vec());
                         }
                     }
@@ -585,9 +595,18 @@ fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result
     Ok(())
 }
 
+/// Route a client's inner IP packet to the TUN, learning its inner source address on first sight.
+///
+/// Learning is deliberately constrained so a single authenticated tunnel cannot inflate the global
+/// `routes` map (memory-exhaustion DoS) or spoof another client's inner source:
+/// - With a pool-`assigned` address, ONLY that exact address is accepted (it is also pre-registered
+///   at tunnel-up), so the client is bound to one route and any other/spoofed source is dropped.
+/// - Without an assigned address (fallback, ≤1 routed client), distinct learned sources are capped
+///   at [`MAX_LEARNED_ROUTES_PER_CLIENT`].
 fn learn_client_route(
     routes: &mut HashMap<IpAddr, Vec<u8>>,
     client_id: &[u8],
+    assigned: Option<std::net::Ipv4Addr>,
     packet: &[u8],
 ) -> bool {
     let Some(src) = packet_src_ip(packet) else {
@@ -600,10 +619,30 @@ fn learn_client_route(
             false
         }
         Some(_) => true,
-        None => {
-            routes.insert(src, client_id.to_vec());
-            true
-        }
+        None => match assigned {
+            // Assigned client: accept only its assigned inner IP (normally already pre-registered).
+            Some(ip) if IpAddr::V4(ip) == src => {
+                routes.insert(src, client_id.to_vec());
+                true
+            }
+            Some(_) => {
+                // A source other than the assigned address — a spoof/hijack attempt. Drop, and log
+                // nothing user-linkable (no source IP) per PD-3.
+                tracing::debug!("dropping client packet whose inner source != assigned address");
+                false
+            }
+            // Fallback (no assigned address): bound how many distinct sources this client can learn.
+            None => {
+                let learned =
+                    routes.values().filter(|id| id.as_slice() == client_id).count();
+                if learned >= MAX_LEARNED_ROUTES_PER_CLIENT {
+                    tracing::debug!("dropping client packet: per-client learned-route cap reached");
+                    return false;
+                }
+                routes.insert(src, client_id.to_vec());
+                true
+            }
+        },
     }
 }
 
@@ -700,6 +739,54 @@ mod tests {
             find(&resp, connectip::ATTEST_REPORT_HEADER.as_bytes()).is_none(),
             "no report header when the node has no attestation identity"
         );
+    }
+
+    #[test]
+    fn route_learning_is_bounded_and_bound_to_assigned_ip() {
+        // Minimal IPv4/IPv6 packets carrying a chosen source address.
+        fn v4(src: [u8; 4]) -> Vec<u8> {
+            let mut p = vec![0u8; 20];
+            p[0] = 0x45;
+            p[12..16].copy_from_slice(&src);
+            p
+        }
+        fn v6(src: [u8; 16]) -> Vec<u8> {
+            let mut p = vec![0u8; 40];
+            p[0] = 0x60;
+            p[8..24].copy_from_slice(&src);
+            p
+        }
+        let cid = b"client-1".as_slice();
+
+        // Assigned client: only the assigned inner IP is ever learned; spoofed v4/v6 sources are
+        // dropped and never inserted — the table cannot grow past that one route.
+        let assigned = Ipv4Addr::new(10, 74, 0, 9);
+        let mut routes: HashMap<IpAddr, Vec<u8>> = HashMap::new();
+        assert!(learn_client_route(&mut routes, cid, Some(assigned), &v4([10, 74, 0, 9])));
+        for i in 0..1000u16 {
+            let src = [100, 0, (i >> 8) as u8, (i & 0xff) as u8];
+            assert!(
+                !learn_client_route(&mut routes, cid, Some(assigned), &v4(src)),
+                "a source other than the assigned address must be dropped"
+            );
+        }
+        let mut v6src = [0u8; 16];
+        v6src[0] = 0xfd;
+        assert!(!learn_client_route(&mut routes, cid, Some(assigned), &v6(v6src)), "spoofed v6 dropped");
+        assert_eq!(routes.len(), 1, "an assigned client is bound to exactly one route");
+
+        // Fallback (no assigned address): distinct learned sources are capped, so a single tunnel
+        // streaming distinct inner sources cannot OOM the node.
+        let mut routes: HashMap<IpAddr, Vec<u8>> = HashMap::new();
+        let mut learned = 0;
+        for i in 0..1000u16 {
+            let src = [10, 8, (i >> 8) as u8, (i & 0xff) as u8];
+            if learn_client_route(&mut routes, cid, None, &v4(src)) {
+                learned += 1;
+            }
+        }
+        assert_eq!(learned, MAX_LEARNED_ROUTES_PER_CLIENT, "fallback learning is capped");
+        assert_eq!(routes.len(), MAX_LEARNED_ROUTES_PER_CLIENT, "route table stays bounded");
     }
 
     /// Coverage for the QUIC source-address-validation (Retry) path of `handle_packet`, which had

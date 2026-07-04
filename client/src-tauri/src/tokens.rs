@@ -4,8 +4,17 @@
 //! `POST /v1/tokens/issue` (the Portal blind-signs, gated on a confirmed payment) → finalize
 //! (unblind). The Portal never sees the unblinded token, so its signature cannot be linked to the
 //! token the Coordinator later redeems — that is Pillar 4 (payment ⊥ usage). The acquired token is
-//! a bearer credential; it is persisted by [`crate::tokenstore`] and is mathematically UNLINKABLE
-//! to the account or payment.
+//! a bearer credential; it is persisted by [`crate::tokenstore`].
+//!
+//! ## Unlinkability caveat — issuer-key consistency (RFC 9576)
+//! Blind RSA makes a token unlinkable to its issuance *for a given issuer key*. It does NOT by
+//! itself defend against **key-tagging**: a compelled/malicious Portal could serve a distinct
+//! issuer key per cohort/client and, together with the Coordinator (which learns the key-derived
+//! epoch at redemption), re-link a session to the account that funded it — the very joint-operator
+//! attack Pillar 4 / PD-7 claim to resist. To make that non-silent, set `NW_TOKEN_ISSUER_PUBKEYS`
+//! to the expected issuer key(s): the client then refuses (fail-closed) to blind under any other
+//! key. Unset (default alpha), the client blinds under whatever the Portal serves — so the
+//! "unlinkable" guarantee then rests on the Portal serving ONE honest key to everyone.
 //!
 //! Privacy: this module talks ONLY to the Portal and never sees a packet. It logs **counts only** —
 //! never a payment id, message, token, or blind signature (PD-2).
@@ -44,6 +53,8 @@ pub enum TokenError {
     NotSubscribed,
     #[error("this Portal has no checkout endpoint (it predates the front-running guard)")]
     CheckoutUnsupported,
+    #[error("the Portal served an unexpected token issuer key (not pinned) — refusing to proceed")]
+    UnexpectedIssuerKey,
     #[error("couldn't reach the token service — is nil-portal running? ({0})")]
     Unreachable(String),
     #[error("{0}")]
@@ -59,6 +70,19 @@ pub enum TokenError {
 pub struct TokenClient {
     http: reqwest::Client,
     base_url: String,
+    /// Expected issuer public keys (decoded DER), from `NW_TOKEN_ISSUER_PUBKEYS`. Empty ⇒ no pin
+    /// (blind under whatever the Portal serves). Non-empty ⇒ fail closed on any other key, so a
+    /// compelled Portal cannot silently key-tag this client (see the module docstring).
+    pinned_issuer_keys: Vec<Vec<u8>>,
+}
+
+/// Parse the optional `NW_TOKEN_ISSUER_PUBKEYS` pin: a comma-separated list of lowercase-hex issuer
+/// public keys. Absent/empty ⇒ no pin. Mirrors the client's attestation-measurement pin anchor.
+fn pinned_issuer_keys_from_env() -> Vec<Vec<u8>> {
+    std::env::var("NW_TOKEN_ISSUER_PUBKEYS")
+        .ok()
+        .map(|v| v.split(',').map(str::trim).filter(|s| !s.is_empty()).filter_map(from_hex).collect())
+        .unwrap_or_default()
 }
 
 impl Default for TokenClient {
@@ -83,6 +107,23 @@ impl TokenClient {
                 .build()
                 .expect("reqwest client"),
             base_url,
+            pinned_issuer_keys: pinned_issuer_keys_from_env(),
+        }
+    }
+
+    /// Fail closed if the Portal-served issuer key is not one we pinned. A no-op when no pin is
+    /// configured (default alpha) — see the module docstring's key-tagging caveat.
+    fn check_issuer_pubkey(&self, pubkey_der: &[u8]) -> Result<(), TokenError> {
+        if self.pinned_issuer_keys.is_empty() {
+            return Ok(());
+        }
+        if self.pinned_issuer_keys.iter().any(|k| k.as_slice() == pubkey_der) {
+            Ok(())
+        } else {
+            // A pinned deployment served an unexpected key: possible per-cohort key-tagging. Refuse
+            // to blind under it (no key material logged, PD-2).
+            tracing::warn!("issuer pubkey is not pinned — refusing to blind (possible key-tagging)");
+            Err(TokenError::UnexpectedIssuerKey)
         }
     }
 
@@ -133,6 +174,8 @@ impl TokenClient {
             .map_err(net_err)?;
         let pubkey_der = from_hex(&pk.public_der)
             .ok_or_else(|| TokenError::Crypto("issuer pubkey not hex".into()))?;
+        // Fail closed if a pinned deployment served an unexpected issuer key (anti key-tagging).
+        self.check_issuer_pubkey(&pubkey_der)?;
 
         // 2. Blind a fresh random 32-byte message. The blinding secret never leaves this process.
         let mut msg = [0u8; 32];
@@ -197,6 +240,8 @@ impl TokenClient {
             .map_err(net_err)?;
         let pubkey_der = from_hex(&pk.public_der)
             .ok_or_else(|| TokenError::Crypto("issuer pubkey not hex".into()))?;
+        // Fail closed if a pinned deployment served an unexpected issuer key (anti key-tagging).
+        self.check_issuer_pubkey(&pubkey_der)?;
         let mut msg = [0u8; 32];
         getrandom::getrandom(&mut msg).map_err(|e| TokenError::Crypto(format!("rng: {e}")))?;
         let req = nil_crypto::token::blind(&pubkey_der, &msg)
@@ -334,6 +379,24 @@ mod tests {
         // Any other non-2xx is surfaced as a rejection with its code (no fallback).
         assert!(matches!(checkout_error_for_status(503), Some(TokenError::IssuerRejected(503))));
         assert!(matches!(checkout_error_for_status(429), Some(TokenError::IssuerRejected(429))));
+    }
+
+    #[test]
+    fn issuer_key_pin_fails_closed_on_an_unexpected_key() {
+        let mut client = TokenClient::with_base_url("https://portal.example.com".to_string());
+
+        // No pin configured → any issuer key is accepted (default alpha behavior).
+        client.pinned_issuer_keys = Vec::new();
+        assert!(client.check_issuer_pubkey(&[9, 9, 9]).is_ok());
+
+        // Pin configured → only a pinned key is accepted; anything else fails closed.
+        client.pinned_issuer_keys = vec![vec![1, 2, 3], vec![4, 5, 6]];
+        assert!(client.check_issuer_pubkey(&[1, 2, 3]).is_ok(), "a pinned key is accepted");
+        assert!(client.check_issuer_pubkey(&[4, 5, 6]).is_ok(), "a second pinned key is accepted");
+        assert!(
+            matches!(client.check_issuer_pubkey(&[7, 8, 9]), Err(TokenError::UnexpectedIssuerKey)),
+            "an unpinned key must be refused (anti key-tagging)"
+        );
     }
 
     #[test]
