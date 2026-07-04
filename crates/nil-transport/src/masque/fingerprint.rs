@@ -80,8 +80,10 @@ fn client_initial_keys(dcid: &[u8]) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     )
 }
 
-/// Drive NIL's real client config to produce the first Initial packet (the ClientHello on the wire).
-fn capture_initial() -> Vec<u8> {
+/// Drive NIL's real client config to produce the client's first flight of Initial packets. A
+/// ClientHello carrying a post-quantum key share (~1.2 KiB) does not fit one 1200-byte Initial, so
+/// it spans several — all with the same DCID/Initial keys — hence we drain every datagram.
+fn capture_initials() -> Vec<Vec<u8>> {
     let mut config = super::build_client_config(super::MAX_UDP_PAYLOAD).expect("client config");
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     getrandom::getrandom(&mut scid).expect("scid entropy");
@@ -90,10 +92,20 @@ fn capture_initial() -> Vec<u8> {
     let peer = "127.0.0.1:443".parse().unwrap();
     let mut conn =
         quiche::connect(Some("fingerprint.invalid"), &scid, local, peer, &mut config).expect("connect");
-    let mut out = vec![0u8; 2048];
-    let (n, _) = conn.send(&mut out).expect("first Initial");
-    out.truncate(n);
-    out
+    let mut datagrams = Vec::new();
+    loop {
+        let mut buf = vec![0u8; 2048];
+        match conn.send(&mut buf) {
+            Ok((n, _)) => {
+                buf.truncate(n);
+                datagrams.push(buf);
+            }
+            Err(quiche::Error::Done) => break,
+            Err(e) => panic!("conn.send: {e}"),
+        }
+    }
+    assert!(!datagrams.is_empty(), "client produced no Initial packets");
+    datagrams
 }
 
 /// Decrypt a QUIC v1 client Initial packet → the plaintext QUIC frames.
@@ -142,9 +154,8 @@ fn decrypt_initial(pkt: &[u8]) -> Vec<u8> {
         .expect("Initial AEAD decrypt (a wrong key derivation would fail here)")
 }
 
-/// Reassemble the CRYPTO stream from decrypted frames (PADDING/PING skipped).
-fn crypto_stream(frames: &[u8]) -> Vec<u8> {
-    let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
+/// Collect CRYPTO frames (offset, data) from one packet's decrypted frames (PADDING/PING skipped).
+fn collect_crypto(frames: &[u8], chunks: &mut Vec<(u64, Vec<u8>)>) {
     let mut i = 0;
     while i < frames.len() {
         let (ftype, adv) = read_varint(&frames[i..]);
@@ -162,11 +173,21 @@ fn crypto_stream(frames: &[u8]) -> Vec<u8> {
             _ => break, // no other frame type precedes the ClientHello in a client Initial
         }
     }
+}
+
+/// Reassemble the contiguous CRYPTO stream (the TLS handshake) from collected offset chunks.
+fn reassemble(mut chunks: Vec<(u64, Vec<u8>)>) -> Vec<u8> {
     chunks.sort_by_key(|(o, _)| *o);
     let mut out = Vec::new();
     for (o, d) in chunks {
         if o as usize == out.len() {
             out.extend_from_slice(&d);
+        } else if (o as usize) < out.len() {
+            // Overlapping retransmit chunk — extend only the non-overlapping tail.
+            let skip = out.len() - o as usize;
+            if skip < d.len() {
+                out.extend_from_slice(&d[skip..]);
+            }
         }
     }
     out
@@ -347,10 +368,12 @@ fn parse_client_hello(hs: &[u8]) -> ClientHelloShape {
 }
 
 fn nil_client_hello_shape() -> ClientHelloShape {
-    let initial = capture_initial();
-    let frames = decrypt_initial(&initial);
-    let crypto = crypto_stream(&frames);
-    parse_client_hello(&crypto)
+    let mut chunks: Vec<(u64, Vec<u8>)> = Vec::new();
+    for datagram in capture_initials() {
+        let frames = decrypt_initial(&datagram);
+        collect_crypto(&frames, &mut chunks);
+    }
+    parse_client_hello(&reassemble(chunks))
 }
 
 #[test]
@@ -398,13 +421,20 @@ fn nil_outer_client_hello_fingerprint() {
     // Anti-drift pin: if NIL's outer handshake shape changes (quiche/BoringSSL bump, config change),
     // this fails and forces a review of whether the change moved NIL closer to or further from
     // browser parity. Update deliberately, never blindly.
-    // Pinned as of 2026-07 (quiche/BoringSSL in Cargo.lock): TLS1.3; ciphers 1301,1302,1303;
-    // groups X25519/secp256r1/secp384r1; key_share X25519 only; NO PQ key share; NO TLS GREASE;
-    // 8 extensions. Any drift (quiche/BoringSSL bump, config change) fails here — re-pin only after
-    // confirming the change moves toward, not away from, browser parity (the goal is to ADD the PQ
-    // key share + GREASE, which will change this digest intentionally).
+    // The two headline Chrome-parity gaps are now CLOSED via `build_client_config`'s BoringSSL
+    // shaping: NIL offers the X25519MLKEM768 PQ key share (groups 11ec,001d,0017,0018; key_share
+    // 11ec,001d — both, like Chrome) and adds TLS-level GREASE. Assert those substantive properties
+    // directly (robust to future re-pins), then pin the full digest for anti-drift. Any drift
+    // (quiche/BoringSSL bump, config change) fails here — re-pin only after confirming the change
+    // keeps NIL at or closer to browser parity.
+    assert!(pq, "regression: NIL's outer ClientHello must offer the X25519MLKEM768 PQ key share");
+    assert!(sh.grease_present, "regression: NIL's outer ClientHello must carry TLS GREASE");
+    // Pinned 2026-07 (quiche 0.22 boring-crate + boring 4.22 pq-experimental): TLS1.3; ciphers
+    // 1301/1302/1303; groups 11ec,001d,0017,0018; key_share 11ec,001d; GREASE on; 8 extensions.
+    // Remaining finer gap (not the headline ones): Chrome carries a larger extension SET/ORDER —
+    // full JA4_c parity is a deeper follow-up (see THREAT_MODEL.md / the architecture plan).
     assert_eq!(
-        digest, "e1051ca8952d8227",
+        digest, "9ea0d65febe48970",
         "NIL's outer ClientHello fingerprint changed (see the printed breakdown). If intentional, \
          re-pin; if not, the handshake shape drifted."
     );
