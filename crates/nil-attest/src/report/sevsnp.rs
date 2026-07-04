@@ -48,6 +48,17 @@ fn appraise_report(report: &AttestationReport) -> Result<Evidence, AttestError> 
         ));
     }
 
+    // Reject a guest whose policy permits MIGRATION. A migratable guest can be live-migrated by the
+    // host — via a migration agent — to another machine the operator controls, moving the running
+    // node (and whatever transient state it holds) outside the attested measurement's guarantees.
+    // For a no-logs privacy node that must never be relocatable by the host, migration must be
+    // disabled; fail closed like DEBUG.
+    if report.policy.migrate_ma_allowed() {
+        return Err(AttestError::PolicyViolation(
+            "SEV-SNP guest policy permits migration (MIGRATE_MA)".into(),
+        ));
+    }
+
     // TCB status (parity with the TDX path, which propagates a signed verdict). SEV-SNP carries
     // no signed status string, but the report does carry the running `current_tcb` and the
     // platform's `committed_tcb` — the minimum the firmware promised never to drop below. A
@@ -98,8 +109,9 @@ mod tests {
     /// safe guest policy, current TCB at or above committed. Mutate it per test.
     fn baseline_report() -> AttestationReport {
         let mut report = AttestationReport::default();
-        // Default GuestPolicy has DEBUG clear; be explicit so the baseline can't silently drift.
+        // Default GuestPolicy has DEBUG + MIGRATE_MA clear; be explicit so the baseline can't drift.
         report.policy.set_debug_allowed(false);
+        report.policy.set_migrate_ma_allowed(false);
         let tcb = TcbVersion::new(None, 5, 0, 10, 20);
         report.committed_tcb = tcb;
         report.current_tcb = tcb;
@@ -122,6 +134,18 @@ mod tests {
         match appraise_report(&report) {
             Err(AttestError::PolicyViolation(_)) => {}
             other => panic!("DEBUG-enabled guest policy must be a PolicyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migration_enabled_policy_is_rejected() {
+        let mut report = baseline_report();
+        // Migratable guest: the host can relocate the running node to a machine it controls,
+        // outside the attested measurement's guarantees. Must fail closed.
+        report.policy.set_migrate_ma_allowed(true);
+        match appraise_report(&report) {
+            Err(AttestError::PolicyViolation(_)) => {}
+            other => panic!("MIGRATE_MA-enabled guest policy must be a PolicyViolation, got {other:?}"),
         }
     }
 

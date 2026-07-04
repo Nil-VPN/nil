@@ -2,8 +2,13 @@
 //!
 //! Two KEMs, combined the way Mullvad's `cme-mlkem` does: **ML-KEM-1024** (FIPS 203, the
 //! forward-secrecy half) and **Classic McEliece 460896** (code-based, the authentication
-//! half). Their two 32-byte shared secrets are concatenated and run through HKDF-SHA256 to
-//! produce the 32-byte WireGuard PSK. The tunnel is safe if *either* KEM holds.
+//! half). Their two 32-byte shared secrets are concatenated (ML-KEM first) as the HKDF-SHA256
+//! input keying material, and the **KEM handshake transcript** (both public keys + both
+//! ciphertexts) is bound into the HKDF `info`, producing the 32-byte WireGuard PSK. The tunnel is
+//! safe if *either* KEM holds. Both KEM keypairs are **ephemeral** (freshly generated per
+//! handshake by [`PqInitiator::generate`] and dropped after [`PqInitiator::finish`]); no long-term
+//! PQ private key is ever stored, so the PQ layer is forward-secret — a future key seizure cannot
+//! decrypt past sessions.
 //!
 //! Roles: the **client is the KEM initiator**. It generates both keypairs and ships the two
 //! public keys (the McEliece key is ~512 KiB — sent once, client→node). The **node**
@@ -22,7 +27,7 @@ use hkdf::Hkdf;
 use ml_kem::kem::{Decapsulate, Encapsulate, KeyExport, TryKeyInit};
 use ml_kem::{DecapsulationKey1024, EncapsulationKey1024, Kem, MlKem1024};
 use rand_core::OsRng;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 /// ML-KEM-1024 encapsulation-key and ciphertext sizes (FIPS 203), for wire validation.
@@ -32,8 +37,13 @@ pub const MLKEM_CT_LEN: usize = 1568;
 pub const MCELIECE_PK_LEN: usize = CRYPTO_PUBLICKEYBYTES;
 pub const MCELIECE_CT_LEN: usize = CRYPTO_CIPHERTEXTBYTES;
 
-const PSK_SALT: &[u8] = b"nil.psk.v1.hkdf-salt";
-const PSK_INFO: &[u8] = b"nil.psk.v1.wireguard-preshared-key";
+// v2: the PSK now binds the KEM transcript (both public keys + both ciphertexts) into the HKDF
+// `info`. The version bump makes the derivation change explicit — a v1 peer and a v2 peer derive
+// different PSKs and simply fail the WireGuard handshake rather than agreeing on a weaker key.
+const PSK_SALT: &[u8] = b"nil.psk.v2.hkdf-salt";
+const PSK_INFO: &[u8] = b"nil.psk.v2.wireguard-preshared-key";
+/// Domain-separation label prefixed to the bound KEM-transcript hash (v2).
+const PSK_TRANSCRIPT_LABEL: &[u8] = b"nil.psk.v2.kem-transcript";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PskError {
@@ -74,6 +84,11 @@ pub struct PqCiphertexts {
 pub struct PqInitiator {
     mlkem_dk: DecapsulationKey1024,
     mceliece_sk: SecretKey<'static>,
+    /// The offer's public keys, retained so `finish` can bind them into the PSK transcript. The
+    /// node binds the identical bytes it received in the offer, so both ends agree. Dropped with
+    /// the initiator after one handshake (these are ephemeral, not long-term identity keys).
+    mlkem_ek: Vec<u8>,
+    mceliece_pk: Vec<u8>,
 }
 
 impl PqInitiator {
@@ -81,14 +96,23 @@ impl PqInitiator {
     pub fn generate() -> (Self, PqOffer) {
         let (mlkem_dk, mlkem_ek) = MlKem1024::generate_keypair();
         let (mc_pk, mc_sk) = keypair_boxed(&mut OsRng);
-        let offer = PqOffer {
-            mlkem_ek: mlkem_ek.to_bytes().as_slice().to_vec(),
-            mceliece_pk: mc_pk.as_array().to_vec(),
-        };
-        (Self { mlkem_dk, mceliece_sk: mc_sk }, offer)
+        let mlkem_ek_bytes = mlkem_ek.to_bytes().as_slice().to_vec();
+        let mceliece_pk_bytes = mc_pk.as_array().to_vec();
+        let offer =
+            PqOffer { mlkem_ek: mlkem_ek_bytes.clone(), mceliece_pk: mceliece_pk_bytes.clone() };
+        (
+            Self {
+                mlkem_dk,
+                mceliece_sk: mc_sk,
+                mlkem_ek: mlkem_ek_bytes,
+                mceliece_pk: mceliece_pk_bytes,
+            },
+            offer,
+        )
     }
 
-    /// Client side: decapsulate the node's two ciphertexts and derive the PSK.
+    /// Client side: decapsulate the node's two ciphertexts and derive the PSK, binding the KEM
+    /// transcript (our offer's public keys + the node's ciphertexts).
     pub fn finish(&self, cts: &PqCiphertexts) -> Result<Psk, PskError> {
         let ss_mlkem = self
             .mlkem_dk
@@ -96,7 +120,13 @@ impl PqInitiator {
             .map_err(|_| PskError::BadCiphertext("ml-kem ciphertext length"))?;
         let mc_ct = mceliece_ct_from_bytes(&cts.mceliece_ct)?;
         let ss_mc = decapsulate_boxed(&mc_ct, &self.mceliece_sk);
-        Ok(combine(ss_mlkem.as_slice(), ss_mc.as_array()))
+        let transcript = PqTranscript {
+            mlkem_ek: &self.mlkem_ek,
+            mlkem_ct: &cts.mlkem_ct,
+            mceliece_pk: &self.mceliece_pk,
+            mceliece_ct: &cts.mceliece_ct,
+        };
+        Ok(combine(ss_mlkem.as_slice(), ss_mc.as_array(), &transcript))
     }
 }
 
@@ -113,23 +143,59 @@ pub fn responder_encapsulate(offer: &PqOffer) -> Result<(PqCiphertexts, Psk), Ps
         mlkem_ct: mlkem_ct.as_slice().to_vec(),
         mceliece_ct: mc_ct.as_array().to_vec(),
     };
-    Ok((cts, combine(ss_mlkem.as_slice(), ss_mc.as_array())))
+    let psk = {
+        let transcript = PqTranscript {
+            mlkem_ek: &offer.mlkem_ek,
+            mlkem_ct: &cts.mlkem_ct,
+            mceliece_pk: &offer.mceliece_pk,
+            mceliece_ct: &cts.mceliece_ct,
+        };
+        combine(ss_mlkem.as_slice(), ss_mc.as_array(), &transcript)
+    };
+    Ok((cts, psk))
 }
 
-/// `PSK = HKDF-SHA256(salt, ss_mlkem || ss_mceliece, 32)`. The concatenation order is part of
-/// the construction and both sides agree on it.
+/// The KEM handshake transcript bound into the PSK derivation: both public keys and both
+/// ciphertexts. The initiator and responder hold identical bytes for all four, so they compute
+/// the same transcript hash and therefore the same PSK.
+struct PqTranscript<'a> {
+    mlkem_ek: &'a [u8],
+    mlkem_ct: &'a [u8],
+    mceliece_pk: &'a [u8],
+    mceliece_ct: &'a [u8],
+}
+
+/// `PSK = HKDF-SHA256(salt, ss_mlkem || ss_mceliece, info = PSK_INFO || H(transcript))`.
 ///
-/// The ML-KEM shared secret is passed by slice and copied STRAIGHT into the `Zeroizing` `ikm`
-/// buffer — never into an intermediate plain `[u8; 32]`. That closes a defense-in-depth gap where a
-/// stale, un-zeroized copy of the shared secret could linger on the stack after the source
-/// `SharedKey` (which self-zeroizes on drop) was gone. `ikm` and `out` are both `Zeroizing`.
-fn combine(ss_mlkem: &[u8], ss_mceliece: &[u8; 32]) -> Psk {
+/// The two shared secrets (ML-KEM first — a fixed order both sides agree on, per SP 800-56Cr2) are
+/// the HKDF input keying material. The **transcript** (both KEM public keys + both ciphertexts) is
+/// hashed and bound into the HKDF `info`, so the derived PSK commits to the exact ciphertexts and
+/// keys of *this* handshake. ML-KEM is not a binding KEM (eprint 2024/523): without this binding, a
+/// re-encapsulation / substituted-ciphertext adversary could steer both ends toward a shared secret
+/// it can relate; binding ct+pk (MAL-BIND-K-CT / MAL-BIND-K-PK) closes that. The `ss_mlkem` slice is
+/// copied straight into the `Zeroizing` `ikm` (no intermediate plain copy); `ikm`/`out` are both
+/// `Zeroizing`. `info` is public KDF context (not secret).
+fn combine(ss_mlkem: &[u8], ss_mceliece: &[u8; 32], transcript: &PqTranscript) -> Psk {
     let mut ikm = Zeroizing::new([0u8; 64]);
     ikm[..32].copy_from_slice(ss_mlkem);
     ikm[32..].copy_from_slice(ss_mceliece);
+
+    // Length-prefixed, fixed-order hash of both public keys and both ciphertexts.
+    let mut th = Sha256::new();
+    th.update(PSK_TRANSCRIPT_LABEL);
+    for part in [transcript.mlkem_ek, transcript.mlkem_ct, transcript.mceliece_pk, transcript.mceliece_ct] {
+        th.update((part.len() as u32).to_be_bytes());
+        th.update(part);
+    }
+    let transcript_hash = th.finalize();
+
+    let mut info = Vec::with_capacity(PSK_INFO.len() + transcript_hash.len());
+    info.extend_from_slice(PSK_INFO);
+    info.extend_from_slice(&transcript_hash);
+
     let hk = Hkdf::<Sha256>::new(Some(PSK_SALT), ikm.as_ref());
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(PSK_INFO, out.as_mut_slice()).expect("32 bytes is within HKDF's output limit");
+    hk.expand(&info, out.as_mut_slice()).expect("32 bytes is within HKDF's output limit");
     Psk(out)
 }
 
@@ -176,15 +242,48 @@ mod tests {
         assert_ne!(other.as_bytes(), node_psk.as_bytes(), "corrupted ciphertext → PSKs differ");
     }
 
+    /// A fixed transcript for the KAT / binding tests (tiny stand-in byte strings).
+    fn kat_transcript() -> PqTranscript<'static> {
+        PqTranscript {
+            mlkem_ek: &[0x10u8; 4],
+            mlkem_ct: &[0x11u8; 4],
+            mceliece_pk: &[0x12u8; 4],
+            mceliece_ct: &[0x13u8; 4],
+        }
+    }
+
     #[test]
     fn combine_is_a_pinned_function_of_its_inputs() {
-        // Anti-drift KAT: fixed shared secrets must always map to this exact PSK, so the HKDF
-        // labels / concatenation order can never change silently.
-        let psk = combine(&[0x01u8; 32], &[0x02u8; 32]);
+        // Anti-drift KAT: fixed shared secrets + a fixed transcript must always map to this exact
+        // PSK, so the HKDF labels / ordering / transcript binding can never change silently.
+        let psk = combine(&[0x01u8; 32], &[0x02u8; 32], &kat_transcript());
         assert_eq!(
             hex::encode(psk.as_bytes()),
-            "9b8a9798517615ec75d3b77a79b9c33b1257c23dc39df8a65f9270ed226caf45"
+            "c3a34f7a9ef600bdea96ee43a6303c48bb5fdf6f278ef60ede212c4d291c1d2e"
         );
+    }
+
+    #[test]
+    fn combine_binds_the_kem_transcript() {
+        // Identical shared secrets but a different ciphertext in the transcript → a different PSK.
+        // This is the ML-KEM-non-binding mitigation: the PSK commits to the exact ct/pk.
+        let base = combine(&[0x01u8; 32], &[0x02u8; 32], &kat_transcript()).as_bytes().to_vec();
+        let altered_ct = PqTranscript { mlkem_ct: &[0x99u8; 4], ..kat_transcript() };
+        let altered = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_ct).as_bytes().to_vec();
+        assert_ne!(base, altered, "PSK must commit to the KEM transcript (ciphertext)");
+        let altered_pk = PqTranscript { mceliece_pk: &[0x88u8; 4], ..kat_transcript() };
+        let altered2 = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_pk).as_bytes().to_vec();
+        assert_ne!(base, altered2, "PSK must commit to the KEM transcript (public key)");
+    }
+
+    #[test]
+    fn keypairs_are_ephemeral_per_handshake() {
+        // Forward secrecy: each handshake generates fresh KEM keypairs, so two independent
+        // handshakes produce different offers. No long-term PQ key exists to seize.
+        let (_i1, o1) = PqInitiator::generate();
+        let (_i2, o2) = PqInitiator::generate();
+        assert_ne!(o1.mlkem_ek, o2.mlkem_ek, "fresh ML-KEM keypair per handshake");
+        assert_ne!(o1.mceliece_pk, o2.mceliece_pk, "fresh McEliece keypair per handshake");
     }
 
     #[test]
