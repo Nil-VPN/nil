@@ -63,3 +63,10 @@ futures-util = { workspace = true, optional = true }     # split the WS stream (
 [dev-dependencies]
 # A throwaway self-signed TLS cert for the in-crate wstunnel round-trip test's WS-TLS responder.
 rcgen = { workspace = true }
+# ClientHello fingerprint-parity harness (test-only): decrypt the QUIC v1 Initial NIL emits
+# (RFC 9001 initial secrets: HKDF-SHA256 + AES-128-ECB header protection + AES-128-GCM) and parse
+# the TLS ClientHello. Never in a release build.
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+aes = "0.8"
+aes-gcm = "0.10"

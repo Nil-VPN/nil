@@ -1029,6 +1029,9 @@ fn assigned_ip_of(list: &[quiche::h3::Header]) -> Option<Ipv4Addr> {
 }
 
 #[cfg(test)]
+mod fingerprint;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
