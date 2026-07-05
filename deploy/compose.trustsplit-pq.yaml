@@ -1,0 +1,19 @@
+# Overlay on compose.trustsplit.yaml: turn every hop into a PQ-WireGuard responder (NW_NODE_PQWG),
+# so the 3-hop onion is ALL-PQ — each hop terminates an inner ML-KEM-1024 + Classic McEliece
+# hybrid-PSK WireGuard session, not just plain nested MASQUE. Used by verify-trustsplit-pq.sh, which
+# captures each node's logged wg_pub and feeds the per-hop keys to the client via the NW_PATH
+# `@wg_pub` grammar. `environment` entries merge with the base per the Compose spec (adds this key).
+#   cd deploy && ./verify-trustsplit-pq.sh
+services:
+  entry:
+    environment:
+      - NW_NODE_PQWG=1
+  middle:
+    environment:
+      - NW_NODE_PQWG=1
+  exit:
+    environment:
+      - NW_NODE_PQWG=1
+  middle-rogue:
+    environment:
+      - NW_NODE_PQWG=1

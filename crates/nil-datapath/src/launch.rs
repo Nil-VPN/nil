@@ -264,9 +264,11 @@ fn wg_pub_from_env() -> Result<Option<[u8; 32]>> {
     Ok(Some(arr))
 }
 
-/// A multi-hop trust-split path from `NW_PATH` (`host:port,host:port,...`, entry first). Every
+/// A multi-hop trust-split path from `NW_PATH` (`host:port[@wg_pub_hex],...`, entry first). Every
 /// hop is pinned to the same `expected` measurement here; production gets a per-operator pin per
-/// hop from the Coordinator.
+/// hop from the Coordinator. An optional `@`-suffixed 32-byte hex WireGuard public key makes that
+/// hop an inner **PQ-WireGuard** carrier (the client PQ-wraps every hop that has one, so a path
+/// where every hop carries a key is an all-PQ onion); a hop with no `@key` stays plain nested MASQUE.
 fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<NodeEndpoint>>> {
     let Ok(spec) = std::env::var("NW_PATH") else {
         return Ok(None);
@@ -278,17 +280,13 @@ fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<Node
         .filter(|s| !s.is_empty())
         .enumerate()
     {
-        let (host, port) = item
-            .rsplit_once(':')
-            .ok_or_else(|| anyhow::anyhow!("NW_PATH hop {i} must be host:port, got {item:?}"))?;
-        let port: u16 = port
-            .parse()
-            .with_context(|| format!("NW_PATH hop {i} port {port:?}"))?;
+        let (host, port, wg_pub) =
+            parse_nw_path_hop(item).with_context(|| format!("NW_PATH hop {i}"))?;
         hops.push(NodeEndpoint {
-            host: host.to_string(),
+            host,
             port,
             kind: TransportKind::Masque,
-            wg_pub: None,
+            wg_pub,
             expected: expected.clone(),
             grant: None,
         });
@@ -297,6 +295,30 @@ fn path_from_env(expected: &Option<AttestExpectation>) -> Result<Option<Vec<Node
         anyhow::bail!("NW_PATH is set but lists no hops");
     }
     Ok(Some(hops))
+}
+
+/// Parse one `NW_PATH` hop: `host:port` (plain nested MASQUE) or `host:port@wg_pub_hex` (an inner
+/// PQ-WireGuard carrier — the client PQ-wraps that hop). Pure (no env) so the grammar is unit-tested.
+/// The `@`-split runs first: a WireGuard pubkey is 64 hex chars (no ':' or '@'), and '@' can't appear
+/// in a `host:port`, so this is unambiguous.
+fn parse_nw_path_hop(item: &str) -> Result<(String, u16, Option<[u8; 32]>)> {
+    let (hostport, wg_pub) = match item.split_once('@') {
+        Some((hp, key_hex)) => {
+            let bytes = connectip::from_hex(key_hex.trim().as_bytes())
+                .ok_or_else(|| anyhow::anyhow!("wg_pub is not hex"))?;
+            let key: [u8; 32] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("wg_pub must be 32 bytes"))?;
+            (hp, Some(key))
+        }
+        None => (item, None),
+    };
+    let (host, port) = hostport
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("must be host:port[@wg_pub], got {item:?}"))?;
+    let port: u16 = port.parse().with_context(|| format!("port {port:?}"))?;
+    Ok((host.to_string(), port, wg_pub))
 }
 
 /// Env-derived tunnel parameters shared by both launch entrypoints. The ONLY difference between
@@ -646,6 +668,32 @@ pub async fn from_env_with_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nw_path_hop_plain_is_masque_no_key() {
+        let (host, port, wg) = parse_nw_path_hop("entry.example:443").expect("plain host:port");
+        assert_eq!(host, "entry.example");
+        assert_eq!(port, 443);
+        assert_eq!(wg, None, "no @key ⇒ plain nested MASQUE (back-compat)");
+    }
+
+    #[test]
+    fn nw_path_hop_with_key_is_pq_carrier() {
+        let key_hex = "ab".repeat(32); // 32 bytes
+        let (host, port, wg) =
+            parse_nw_path_hop(&format!("exit.example:443@{key_hex}")).expect("host:port@key");
+        assert_eq!(host, "exit.example");
+        assert_eq!(port, 443);
+        assert_eq!(wg, Some([0xab; 32]), "an @wg_pub makes the hop a PQ-WireGuard carrier");
+    }
+
+    #[test]
+    fn nw_path_hop_rejects_bad_key() {
+        // Non-hex and wrong-length keys must fail (fail closed — never silently drop the key).
+        assert!(parse_nw_path_hop("h:443@zz").is_err(), "non-hex key");
+        assert!(parse_nw_path_hop("h:443@abcd").is_err(), "wrong-length key (not 32 bytes)");
+        assert!(parse_nw_path_hop("no-port").is_err(), "missing :port");
+    }
 
     fn measurement(byte: u8) -> AttestExpectation {
         AttestExpectation {

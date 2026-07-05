@@ -217,8 +217,18 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                             }
                         }
                     }
-                    // Plain MASQUE: the datagram is a raw IP packet.
                     None => {
+                        if pqwg_enabled {
+                            // PQ-WireGuard node, but this client's inner tunnel is NOT yet
+                            // established: a datagram here is a premature/opening WG message, NEVER a
+                            // raw IP packet. Drop it (fail closed) rather than mis-route it to the
+                            // TUN — the client retransmits its WG handshake init until the responder
+                            // (built from the control-channel PQ offer) has created `tunn`. This also
+                            // means a PQ node never routes un-encapsulated inner traffic. (Required
+                            // for the all-PQ multi-hop onion, where every hop is a PQ responder.)
+                            continue;
+                        }
+                        // Plain MASQUE node: the datagram is a raw IP packet.
                         if learn_client_route(&mut client_routes, client_id, assigned, payload) {
                             to_tun.push(payload.to_vec());
                         }

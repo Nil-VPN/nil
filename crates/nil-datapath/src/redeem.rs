@@ -231,11 +231,10 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
         WireTee::SevSnp => Tee::SevSnp,
         WireTee::Tdx => Tee::Tdx,
     };
-    // A hop's `wg_pub`, when present, drives per-hop PQ-WireGuard-over-MASQUE: `PathTransport`
-    // PQ-keys the EXIT hop's data plane with it (the highest-value rung — it carries the real
-    // client IP packets). Intermediate-hop keys are parsed/validated here but not yet consumed
-    // (PQ-keying inner carriers is a deeper nesting change — see `PathTransport::connect`). A
-    // malformed key still fails closed regardless of which hop it is.
+    // A hop's `wg_pub`, when present, drives per-hop PQ-WireGuard-over-MASQUE. `PathTransport`
+    // PQ-wraps EVERY hop that carries a key (not just the exit): the carrier for hop N+1 is hop N's
+    // PQ-WG session, so each leg rides the hybrid PSK (see `PathTransport::connect`). A malformed key
+    // fails the path closed regardless of which hop it is.
     let wg_pub =
         match h.wg_pub {
             Some(s) => {
