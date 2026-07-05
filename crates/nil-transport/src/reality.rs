@@ -270,7 +270,16 @@ impl Transport for RealityTransport {
             WgStep::Network(keepalive) => write_record(&mut tls, &keepalive).await?,
             other => return Err(Error::Transport(format!("reality handshake failed: {other:?}"))),
         }
-        tracing::info!("reality tunnel established (WireGuard over VLESS-gated TLS)");
+        // Honest posture (surface the limit where the rung is actually used, not only in the docs):
+        // the outer TLS is a genuine self-signed handshake with a rustls (not browser) ClientHello,
+        // so an ACTIVE PROBER can still distinguish it from the SNI'd site — this is a
+        // censorship-survival fallback, NOT active-prober-resistant — and its inner WireGuard is
+        // classical (non-PQ). No address/identity is logged (PD-3).
+        tracing::warn!(
+            "connected via the REALITY fallback rung: its outer shape is a real self-signed TLS \
+             session (not a borrowed foreign-site handshake), so it is NOT active-prober-resistant, \
+             and its inner WireGuard is classical (non-PQ) — use only as the last-resort fallback"
+        );
 
         let (to_tx, to_rx) = mpsc::channel(REALITY_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(REALITY_QUEUE);

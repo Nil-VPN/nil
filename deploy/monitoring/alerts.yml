@@ -1,0 +1,34 @@
+# Alert rules over the blackbox probe results. These fire on the operator's OWN control-surface
+# liveness/latency — no user data is involved.
+groups:
+  - name: nil-control-plane
+    rules:
+      - alert: ControlPlaneDown
+        expr: probe_success == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NIL control surface {{ $labels.instance }} is failing its health probe"
+          description: >
+            The Portal or Coordinator /healthz probe has failed for over 2 minutes. The payment
+            (Portal) or path-redemption/attestation (Coordinator) surface may be down — new clients
+            cannot get tokens or paths. Investigate the affected service.
+
+      - alert: ControlPlaneCertExpiringSoon
+        expr: probe_ssl_earliest_cert_expiry - time() < 86400 * 14
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "TLS cert for {{ $labels.instance }} expires in < 14 days"
+          description: "Renew the control-surface TLS certificate before it lapses (clients fail-closed on TLS)."
+
+      - alert: ControlPlaneSlow
+        expr: probe_http_duration_seconds > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NIL control surface {{ $labels.instance }} is slow ( >3s )"
+          description: "Sustained high latency on a control surface; check load / upstream."

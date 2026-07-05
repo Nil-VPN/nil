@@ -377,8 +377,43 @@ async fn main() -> Result<()> {
 /// Rotation (zero downtime): generate a new key, add its public DER to the Coordinator's
 /// `NW_TOKEN_PUBKEY` list (it accepts a comma-separated set), switch the Portal to the new key,
 /// then drop the old public key once outstanding old-key tokens have expired.
+/// A key-file mode is safe only if no group/other bits are set — the issuer key must be owner-only.
+/// Pure so it can be unit-tested without touching the filesystem. (Only consulted on Unix, where the
+/// deploy target runs; on non-Unix it is exercised solely by the test.)
+#[cfg_attr(not(unix), allow(dead_code))]
+fn key_file_mode_is_safe(mode: u32) -> bool {
+    mode & 0o077 == 0
+}
+
+/// Refuse to load an issuer key from a group/world-accessible file: a readable private key means
+/// anyone with local access can mint unlimited free tokens (full payment bypass). Fail closed unless
+/// the dev override is set. No-op on non-Unix (Windows perms are ACL-based; not the deploy target).
+#[cfg(unix)]
+fn ensure_key_file_perms(path: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("stat NW_TOKEN_SECRET_FILE {path}: {e}"))?
+        .permissions()
+        .mode();
+    if !key_file_mode_is_safe(mode) && !nil_core::net::env_flag("NW_ALLOW_DEV_FALLBACKS") {
+        anyhow::bail!(
+            "NW_TOKEN_SECRET_FILE {path} is group/world-accessible (mode {:o}); the issuer private \
+             key must be owner-only (chmod 600) — a readable key means anyone with local access can \
+             mint unlimited free tokens. Fix the permissions, or set NW_ALLOW_DEV_FALLBACKS=1 to \
+             override in dev.",
+            mode & 0o7777
+        );
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn ensure_key_file_perms(_path: &str) -> Result<()> {
+    Ok(())
+}
+
 fn load_or_generate_issuer() -> Result<Issuer> {
     if let Ok(path) = std::env::var("NW_TOKEN_SECRET_FILE") {
+        ensure_key_file_perms(&path)?;
         let der = std::fs::read(&path).map_err(|e| anyhow::anyhow!("read NW_TOKEN_SECRET_FILE {path}: {e}"))?;
         return Issuer::from_secret_der(&der).map_err(|e| anyhow::anyhow!("NW_TOKEN_SECRET_FILE: {e}"));
     }
@@ -441,5 +476,19 @@ mod tests {
     fn malformed_minimum_is_rejected_even_with_dev_fallback() {
         // A present-but-garbage value is always an error (a typo must never silently mean 0).
         assert!(resolve_min_atomic(Some("nope".into()), true).is_err());
+    }
+
+    #[test]
+    fn issuer_key_file_perms_are_owner_only() {
+        use super::key_file_mode_is_safe;
+        // Owner-only variants are safe.
+        assert!(key_file_mode_is_safe(0o600), "0600 is owner rw only");
+        assert!(key_file_mode_is_safe(0o400), "0400 is owner r only");
+        assert!(key_file_mode_is_safe(0o700), "0700 (owner rwx) has no group/other bits");
+        // Any group or other bit → unsafe (a readable key = free minting).
+        assert!(!key_file_mode_is_safe(0o640), "group-readable is unsafe");
+        assert!(!key_file_mode_is_safe(0o604), "other-readable is unsafe");
+        assert!(!key_file_mode_is_safe(0o644), "group+other readable is unsafe");
+        assert!(!key_file_mode_is_safe(0o660), "group-writable is unsafe");
     }
 }

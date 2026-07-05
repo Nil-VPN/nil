@@ -1,0 +1,42 @@
+# Prometheus: blackbox-probe the NIL control surfaces (Portal + Coordinator /healthz) and evaluate
+# the alert rules in alerts.yml. It scrapes NO application metrics endpoint (there is none) — only
+# the blackbox exporter's probe results. See README.md for the privacy rationale.
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  # Blackbox HTTP probe of each control-surface /healthz via the blackbox exporter.
+  - job_name: nil-control-blackbox
+    metrics_path: /probe
+    params:
+      module: [healthz_2xx]
+    static_configs:
+      - targets:
+          # REPLACE with your real endpoints (behind TLS). NOTE: only the Portal + Coordinator —
+          # never a node (nodes are logless; do not create availability metadata for the datapath).
+          - https://api.example.invalid/healthz # Portal (business plane)
+          - https://ctrl.example.invalid/healthz # Coordinator (control plane)
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+
+  # Prometheus + blackbox exporter self-health (so the monitor's own liveness is visible).
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+  - job_name: blackbox-exporter
+    static_configs:
+      - targets: ["blackbox:9115"]
