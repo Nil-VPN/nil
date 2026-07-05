@@ -57,6 +57,7 @@ fn main() {
         expected: Some(AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(measurement),
+            min_tcb_sevsnp: None,
         }),
         grant: None,
     };

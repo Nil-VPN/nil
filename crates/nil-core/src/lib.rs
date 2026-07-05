@@ -71,12 +71,49 @@ pub enum Tee {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measurement(pub Vec<u8>);
 
+/// A pinned minimum AMD SEV-SNP platform TCB (firmware patch levels). A node whose report shows a
+/// `current_tcb` below this floor — even if it has NOT rolled back below its own `committed_tcb` —
+/// is running an old patch level that may lack fixes for known SEV-SNP vulnerabilities, so it is
+/// treated as out-of-date and refused under default policy. The floor value is deployment-specific
+/// (it advances as AMD ships microcode/firmware) and is sourced from `snpguest report` on validated
+/// hardware, then pinned by the Coordinator / client — never fetched online. `None` enforces no floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SevSnpTcbFloor {
+    /// Firmware (FMC) patch level — present only on Turin+; `None` means "don't require an FMC floor".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fmc: Option<u8>,
+    pub bootloader: u8,
+    pub tee: u8,
+    pub snp: u8,
+    pub microcode: u8,
+}
+
+impl SevSnpTcbFloor {
+    /// True iff every reported TCB component is at or above this floor, compared COMPONENT-WISE
+    /// (not the lexicographic `TcbVersion` order): a node ahead on one component but behind on
+    /// another must fail, since any lagging component can be the one carrying a security fix.
+    pub fn is_met_by(&self, fmc: Option<u8>, bootloader: u8, tee: u8, snp: u8, microcode: u8) -> bool {
+        bootloader >= self.bootloader
+            && tee >= self.tee
+            && snp >= self.snp
+            && microcode >= self.microcode
+            && match self.fmc {
+                Some(required) => fmc.unwrap_or(0) >= required,
+                None => true,
+            }
+    }
+}
+
 /// What the client expects a node to attest to — the Coordinator publishes this and the
 /// client refuses to tunnel unless the node's report matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestExpectation {
     pub tee: Tee,
     pub measurement: Measurement,
+    /// Optional pinned minimum SEV-SNP platform TCB. `None` (the default, and the only value for a
+    /// TDX endpoint) enforces no floor; a `Some` is checked offline during appraisal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_tcb_sevsnp: Option<SevSnpTcbFloor>,
 }
 
 /// Where to reach a node, plus (from Phase 2) the node's WireGuard static public key and the

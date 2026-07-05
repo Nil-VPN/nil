@@ -205,6 +205,7 @@ fn endpoint(port: u16, measurement: [u8; 48]) -> NodeEndpoint {
         expected: Some(AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(measurement.to_vec()),
+            min_tcb_sevsnp: None,
         }),
         grant: None,
     }

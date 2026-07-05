@@ -1,7 +1,7 @@
 //! Appraisal policy + verdict. The policy is what the Coordinator pins and the client
 //! enforces; the verdict is the positive result the transport gates the tunnel on.
 
-pub use nil_core::{Measurement, Tee};
+pub use nil_core::{Measurement, SevSnpTcbFloor, Tee};
 
 /// Platform Trusted Computing Base status distilled from a report/quote.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,11 +20,20 @@ pub struct AppraisalPolicy {
     pub expected_measurement: Measurement,
     /// If false (the default), an out-of-date TCB is rejected even when the report verifies.
     pub allow_tcb_out_of_date: bool,
+    /// Pinned minimum SEV-SNP platform TCB, enforced offline during appraisal. `None` = no floor.
+    /// Ignored for TDX (its patch level comes from the signed DCAP verdict, not a pinned floor).
+    pub min_tcb_sevsnp: Option<SevSnpTcbFloor>,
 }
 
 impl AppraisalPolicy {
     pub fn new(tee: Tee, expected_measurement: Measurement) -> Self {
-        Self { tee, expected_measurement, allow_tcb_out_of_date: false }
+        Self { tee, expected_measurement, allow_tcb_out_of_date: false, min_tcb_sevsnp: None }
+    }
+
+    /// Pin a minimum SEV-SNP TCB floor (builder). No-op semantics for TDX policies.
+    pub fn with_min_tcb_sevsnp(mut self, floor: Option<SevSnpTcbFloor>) -> Self {
+        self.min_tcb_sevsnp = floor;
+        self
     }
 }
 

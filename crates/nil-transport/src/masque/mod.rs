@@ -430,7 +430,7 @@ fn policy_for(target: &NodeEndpoint) -> Option<AppraisalPolicy> {
     target
         .expected
         .as_ref()
-        .map(|e| AppraisalPolicy::new(e.tee, e.measurement.clone()))
+        .map(|e| AppraisalPolicy::new(e.tee, e.measurement.clone()).with_min_tcb_sevsnp(e.min_tcb_sevsnp))
 }
 
 /// How a driver moves QUIC packets to and from its peer. The outermost hop uses a real UDP

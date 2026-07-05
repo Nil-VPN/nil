@@ -117,6 +117,7 @@ pub unsafe extern "C" fn nil_start(
                 Some(b) => Some(AttestExpectation {
                     tee,
                     measurement: Measurement(b),
+                    min_tcb_sevsnp: None,
                 }),
                 None => return std::ptr::null_mut(),
             },

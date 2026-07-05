@@ -23,7 +23,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 pub use error::AttestError;
-pub use policy::{AppraisalPolicy, Measurement, TcbStatus, Tee, Verdict};
+pub use policy::{AppraisalPolicy, Measurement, SevSnpTcbFloor, TcbStatus, Tee, Verdict};
 pub use report::Evidence;
 
 /// Appraise a node's attestation `evidence` (the `[tag][parts]` blob the node returned over
@@ -45,7 +45,7 @@ pub fn appraise(
 
     let report = match tag {
         ratls::TAG_SEVSNP => match parts.as_slice() {
-            [report, vcek] => report::sevsnp::verify(report, vcek)?,
+            [report, vcek] => report::sevsnp::verify(report, vcek, policy.min_tcb_sevsnp)?,
             _ => return Err(AttestError::Malformed("SEV-SNP evidence expects [report, vcek]".into())),
         },
         ratls::TAG_TDX => match parts.as_slice() {
