@@ -797,7 +797,9 @@ async fn driver_run(
             loop {
                 match conn.dgram_recv(&mut buf) {
                     Ok(len) => match connectip::decode_datagram(&buf[..len]) {
-                        Ok((fid, ip)) if fid == flow_id => {
+                        // Only real inner IP packets on our flow reach the TUN; cover-traffic
+                        // padding (context id 1), other flows, and malformed datagrams are dropped.
+                        Ok((fid, connectip::DatagramPayload::Ip(ip))) if fid == flow_id => {
                             let _ = from_tx.try_send(IpPacket::new(ip.to_vec()));
                         }
                         _ => {}
