@@ -1,0 +1,17 @@
+# Alertmanager routing. The receiver below is a PLACEHOLDER — replace the webhook URL with a real
+# destination (a private ops channel / on-call). Keep alert payloads free of any user data: these
+# alerts only carry the operator's own service instance + severity, never user-linkable fields.
+route:
+  receiver: ops
+  group_by: ["alertname", "instance"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 3h
+
+receivers:
+  - name: ops
+    webhook_configs:
+      # REPLACE: your private on-call webhook (e.g. an internal alert relay). Do not point this at a
+      # third-party analytics/SaaS that would receive operational metadata you don't control.
+      - url: "http://example.invalid/alert-webhook"
+        send_resolved: true
