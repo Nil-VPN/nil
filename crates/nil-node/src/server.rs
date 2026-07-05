@@ -189,8 +189,12 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             // tunnel cannot register arbitrary/unbounded inner sources.
             let assigned = client.assigned_ip;
             for dg in raw {
-                let Ok((_fid, payload)) = connectip::decode_datagram(&dg) else {
-                    continue;
+                // Cover-traffic padding (context id 1) and malformed datagrams are dropped here —
+                // padding must never reach the exit TUN (it carries no inner packet).
+                let payload = match connectip::decode_datagram(&dg) {
+                    Ok((_fid, connectip::DatagramPayload::Ip(ip))) => ip,
+                    Ok((_fid, connectip::DatagramPayload::Padding)) => continue,
+                    Err(_) => continue,
                 };
                 match client.pqwg.as_mut().and_then(|p| p.tunn.as_mut()) {
                     // PQ-WireGuard active: the datagram is a WG transport message.

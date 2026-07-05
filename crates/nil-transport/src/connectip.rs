@@ -18,6 +18,20 @@ use nil_core::{Error, Result};
 
 /// Context ID for a full IP packet (RFC 9484 §6). The only context used in Phase 1.
 pub const CONTEXT_ID_IP_PACKET: u64 = 0;
+/// Cover-traffic padding for a traffic-analysis defense (Maybenot/DAITA). A datagram with this
+/// context id carries NO inner IP packet — the receiving peer MUST discard it and never forward it
+/// to the exit TUN. RFC 9484 leaves non-zero context ids to the extension; this is NIL's private
+/// client↔node convention for the padding channel.
+pub const CONTEXT_ID_PADDING: u64 = 1;
+
+/// Decoded CONNECT-IP datagram payload: a real inner IP packet, or cover-traffic padding to drop.
+#[derive(Debug)]
+pub enum DatagramPayload<'a> {
+    /// A full inner IP packet (context id 0) — forward it.
+    Ip(&'a [u8]),
+    /// Cover-traffic padding (context id 1) — discard; it must never reach the TUN.
+    Padding,
+}
 
 /// The CONNECT-IP `:path` template for an unrestricted full tunnel (RFC 9484 §3).
 /// Both client and node reference this one constant so the handshake can't drift.
@@ -138,13 +152,29 @@ pub fn encode_datagram(flow_id: u64, ip: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decode a full H3 datagram (as returned by `Connection::dgram_recv`) into
-/// `(flow_id, ip)`. Validates the context id is 0 (full IP packet).
-pub fn decode_datagram(buf: &[u8]) -> Result<(u64, &[u8])> {
+/// Encode a padding datagram (cover traffic): `varint(flow_id) || varint(1) || <pad_len zero bytes>`.
+/// The peer discards it (see [`CONTEXT_ID_PADDING`]); it carries no inner packet.
+pub fn encode_padding_datagram(flow_id: u64, pad_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(pad_len + 2);
+    encode_varint(flow_id, &mut out);
+    encode_varint(CONTEXT_ID_PADDING, &mut out);
+    out.resize(out.len() + pad_len, 0);
+    out
+}
+
+/// Decode a full H3 datagram (as returned by `Connection::dgram_recv`) into `(flow_id, payload)`,
+/// distinguishing a real IP packet (context 0) from cover-traffic padding (context 1). Any other
+/// context id is rejected.
+pub fn decode_datagram(buf: &[u8]) -> Result<(u64, DatagramPayload<'_>)> {
     let (flow_id, rest) =
         decode_varint(buf).ok_or_else(|| Error::InvalidPacket("truncated flow-id".into()))?;
-    let ip = decode(rest)?;
-    Ok((flow_id, ip))
+    let (ctx, payload) =
+        decode_varint(rest).ok_or_else(|| Error::InvalidPacket("truncated context-id".into()))?;
+    match ctx {
+        CONTEXT_ID_IP_PACKET => Ok((flow_id, DatagramPayload::Ip(payload))),
+        CONTEXT_ID_PADDING => Ok((flow_id, DatagramPayload::Padding)),
+        other => Err(Error::InvalidPacket(format!("unsupported context id {other}"))),
+    }
 }
 
 // ---- QUIC variable-length integers (RFC 9000 §16) ----
@@ -246,10 +276,31 @@ mod tests {
         let ip = b"\x45\x00\x00\x3c hello tunnel".to_vec();
         for flow_id in [0u64, 1, 63, 64, 16_383, 16_384] {
             let dg = encode_datagram(flow_id, &ip);
-            let (got_flow, got_ip) = decode_datagram(&dg).expect("decode datagram");
+            let (got_flow, payload) = decode_datagram(&dg).expect("decode datagram");
             assert_eq!(got_flow, flow_id);
-            assert_eq!(got_ip, &ip[..]);
+            match payload {
+                DatagramPayload::Ip(got_ip) => assert_eq!(got_ip, &ip[..]),
+                DatagramPayload::Padding => panic!("IP datagram decoded as padding"),
+            }
         }
+    }
+
+    #[test]
+    fn padding_datagram_round_trips_and_is_distinct_from_ip() {
+        for flow_id in [0u64, 42, 16_384] {
+            for pad_len in [0usize, 1, 300, 1200] {
+                let dg = encode_padding_datagram(flow_id, pad_len);
+                let (got_flow, payload) = decode_datagram(&dg).expect("decode padding");
+                assert_eq!(got_flow, flow_id);
+                assert!(
+                    matches!(payload, DatagramPayload::Padding),
+                    "context id 1 must decode as Padding (never as a forwardable IP packet)"
+                );
+            }
+        }
+        // A real IP datagram is NOT mistaken for padding.
+        let ip = encode_datagram(7, b"\x45\x00 real");
+        assert!(matches!(decode_datagram(&ip).unwrap().1, DatagramPayload::Ip(_)));
     }
 
     #[test]
