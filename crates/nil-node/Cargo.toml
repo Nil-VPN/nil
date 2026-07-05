@@ -39,3 +39,10 @@ tokio-tungstenite = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 futures-util = { workspace = true }
+
+# UDP GSO (generic segmentation offload) for the egress hot path — batch many equal-size QUIC
+# packets to one peer into a single sendmsg (a big per-node throughput win, Tailscale-proven). Linux
+# kernel feature; the code is cfg(target_os="linux") with a per-packet fallback, so this dep is
+# Linux-only and other targets keep the plain path.
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.29", features = ["net", "uio"] }  # net → UDP_SEGMENT cmsg + addr conversions; uio → sendmsg/ControlMessage
