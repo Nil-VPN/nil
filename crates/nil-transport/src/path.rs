@@ -26,11 +26,17 @@
 //! session is a valid nesting carrier with no change to the nesting code. A hop with no `wg_pub`
 //! stays plain nested MASQUE and forwards the next hop over its MASQUE session.
 //!
-//! **Live status (honest):** this is the CLIENT-side assembly. A *live* all-PQ onion also needs each
-//! intermediate node to terminate its PQ-WireGuard responder and forward the decapsulated inner QUIC
-//! to the next hop; that node-side forwarding is not built yet (see `nil-node` config), so an all-PQ
-//! path is in-process-proven here but not yet live-testable past the exit. A 3-hop all-PQ path is
-//! also MTU-tight — `connect_nested` fails closed below the QUIC floor rather than corrupt.
+//! **Live status (honest):** a *live* all-PQ onion needs each intermediate node to terminate its
+//! PQ-WireGuard responder and forward the decapsulated inner QUIC to the next hop. Both the node PQ
+//! responder (`nil-node`, behind `NW_NODE_PQWG`) and the forwarding (the decapsulated inner packet —
+//! the next hop's UDP/443 QUIC — goes to the node's TUN and the role-scoped NAT forwards it) exist,
+//! and `deploy/verify-trustsplit-pq.sh` proves a **2-hop** all-PQ onion carries real traffic with the
+//! trust-split intact (per-hop keys via the `NW_PATH` `@wg_pub` grammar; a non-exit PQ hop forwards).
+//! MTU LIMIT (measured, honest): each PQ hop adds WireGuard's 32 B on top of the CONNECT-IP + udpip
+//! nesting tax, so a **3-hop** all-PQ onion overruns the 1200 B QUIC floor on a standard (≤1500 B)
+//! path and `connect_nested` **fails closed** (refuses, never corrupts) — the harness asserts this.
+//! A 3-hop trust-split therefore uses plain nested MASQUE today; trimming the per-hop tax to fit
+//! 3-hop all-PQ is a separate encapsulation change.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
