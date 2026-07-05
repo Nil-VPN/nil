@@ -23,8 +23,11 @@ fn main() {
 
     use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, SockaddrStorage};
 
-    const SEG: usize = 1400; // one MSS-ish segment
-    const BATCH: usize = 64; // segments per GSO sendmsg (kernel max)
+    // Linux caps a single UDP_SEGMENT super-buffer at both <=64 segments AND <=65535 total bytes,
+    // so SEG*BATCH must stay under 65535 (else sendmsg returns EMSGSIZE). 1200 B mirrors NIL's
+    // conservative QUIC MTU floor; 50 segments = 60000 B, safely inside both limits.
+    const SEG: usize = 1200; // QUIC segment (NIL's 1200 B MTU floor)
+    const BATCH: usize = 50; // segments per GSO sendmsg (60000 B < 65535 cap)
     const TOTAL: usize = 2_000_000; // total packets per mode
 
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -73,7 +76,14 @@ fn main() {
                 Ok(_) => break,
                 Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => continue,
                 Err(e) => {
-                    eprintln!("gso_bench: sendmsg failed ({e}); kernel may lack UDP_SEGMENT");
+                    let hint = match e {
+                        nix::errno::Errno::EMSGSIZE => "batch exceeds the ~64 KiB GSO cap",
+                        nix::errno::Errno::ENOPROTOOPT | nix::errno::Errno::EINVAL => {
+                            "kernel may lack UDP_SEGMENT"
+                        }
+                        _ => "unexpected send error",
+                    };
+                    eprintln!("gso_bench: sendmsg failed ({e}); {hint}");
                     stop.store(true, Ordering::Relaxed);
                     let _ = drain.join();
                     return;
