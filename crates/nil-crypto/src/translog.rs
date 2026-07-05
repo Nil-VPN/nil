@@ -56,6 +56,65 @@ pub struct LogProof {
     pub checkpoint_sig: Vec<u8>,
 }
 
+impl LogProof {
+    /// Serialize for stapling alongside attestation evidence. Self-describing, big-endian:
+    /// `[u16 origin_len][origin][u64 tree_size][u64 leaf_index][32 root][u16 path_len][path*32]
+    /// [u16 sig_len][sig]`. The deploy pipeline emits this from a real Rekor bundle; the client
+    /// decodes it with [`LogProof::decode`] and never trusts it until [`verify_logged`] passes.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let origin = self.origin.as_bytes();
+        out.extend_from_slice(&(origin.len() as u16).to_be_bytes());
+        out.extend_from_slice(origin);
+        out.extend_from_slice(&self.tree_size.to_be_bytes());
+        out.extend_from_slice(&self.leaf_index.to_be_bytes());
+        out.extend_from_slice(&self.root);
+        out.extend_from_slice(&(self.audit_path.len() as u16).to_be_bytes());
+        for h in &self.audit_path {
+            out.extend_from_slice(h);
+        }
+        out.extend_from_slice(&(self.checkpoint_sig.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.checkpoint_sig);
+        out
+    }
+
+    /// Parse bytes produced by [`LogProof::encode`]. `None` on any truncation, bad UTF-8 origin, or
+    /// trailing garbage — an unparseable proof is treated as no proof (the caller fails closed).
+    pub fn decode(mut b: &[u8]) -> Option<Self> {
+        let olen = take_u16(&mut b)? as usize;
+        let origin = String::from_utf8(take(&mut b, olen)?.to_vec()).ok()?;
+        let tree_size = u64::from_be_bytes(take(&mut b, 8)?.try_into().ok()?);
+        let leaf_index = u64::from_be_bytes(take(&mut b, 8)?.try_into().ok()?);
+        let root: [u8; 32] = take(&mut b, 32)?.try_into().ok()?;
+        let plen = take_u16(&mut b)? as usize;
+        let mut audit_path = Vec::with_capacity(plen);
+        for _ in 0..plen {
+            audit_path.push(take(&mut b, 32)?.try_into().ok()?);
+        }
+        let slen = take_u16(&mut b)? as usize;
+        let checkpoint_sig = take(&mut b, slen)?.to_vec();
+        if !b.is_empty() {
+            return None; // trailing garbage ⇒ reject rather than silently ignore
+        }
+        Some(LogProof { origin, tree_size, leaf_index, root, audit_path, checkpoint_sig })
+    }
+}
+
+/// Split the first `n` bytes off `b`, advancing it; `None` if fewer than `n` remain.
+fn take<'a>(b: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if b.len() < n {
+        return None;
+    }
+    let (head, tail) = b.split_at(n);
+    *b = tail;
+    Some(head)
+}
+
+/// Read a big-endian `u16`, advancing `b`.
+fn take_u16(b: &mut &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(take(b, 2)?.try_into().ok()?))
+}
+
 /// Reconstruct the Merkle root a leaf-at-index proves to, via the standard RFC 6962 inclusion-proof
 /// decomposition. `None` if the index/size/path lengths are inconsistent.
 fn root_from_inclusion(
@@ -232,5 +291,38 @@ mod tests {
         let mut bad_idx = good.clone();
         bad_idx.leaf_index = 6;
         assert!(!verify_logged(&leaves[5], &bad_idx, &pk), "wrong index rejected");
+    }
+
+    #[test]
+    fn encode_decode_round_trips_and_still_verifies() {
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let leaves: Vec<Vec<u8>> = (0..13).map(|i| vec![i as u8; 48]).collect();
+        let proof = proof_for(9, &leaves, &sk, "nil.transparency.v1");
+
+        let bytes = proof.encode();
+        let back = LogProof::decode(&bytes).expect("round-trips");
+        assert_eq!(back.origin, proof.origin);
+        assert_eq!(back.tree_size, proof.tree_size);
+        assert_eq!(back.leaf_index, proof.leaf_index);
+        assert_eq!(back.root, proof.root);
+        assert_eq!(back.audit_path, proof.audit_path);
+        assert_eq!(back.checkpoint_sig, proof.checkpoint_sig);
+        // The decoded proof still verifies against the same pinned key + leaf.
+        assert!(verify_logged(&leaves[9], &back, &pk), "decoded proof must still verify");
+    }
+
+    #[test]
+    fn decode_rejects_truncation_and_trailing_garbage() {
+        let sk = SigningKey::from_bytes(&[4u8; 32]);
+        let leaves: Vec<Vec<u8>> = (0..7).map(|i| vec![i as u8; 48]).collect();
+        let bytes = proof_for(2, &leaves, &sk, "nil.transparency.v1").encode();
+
+        for cut in 0..bytes.len() {
+            assert!(LogProof::decode(&bytes[..cut]).is_none(), "truncated at {cut} must be None");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(LogProof::decode(&extra).is_none(), "trailing garbage must be None");
     }
 }

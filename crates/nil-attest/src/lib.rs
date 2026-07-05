@@ -4,7 +4,9 @@
 //! RA-TLS certificate (the report embedded in an X.509 extension) against a measurement the
 //! Coordinator publishes. The client refuses to tunnel unless the report's signature chain
 //! verifies to the hardware vendor root, the measurement matches the pinned policy, and a
-//! client nonce is bound into `report_data` to prove freshness — "prove it, don't promise it".
+//! client nonce is bound into `report_data` to prove freshness, and — when a transparency-log key
+//! is pinned — the measurement is proven present in the public log via a stapled inclusion proof:
+//! "prove it, don't promise it".
 //!
 //! [`appraise`] is the single entrypoint the transport calls — with the node's report
 //! evidence (delivered over the established channel) and the TLS key it's bound to (the SPKI
@@ -43,20 +45,38 @@ pub fn appraise(
         .ok_or_else(|| AttestError::Malformed("empty attestation evidence".into()))?;
     let parts = ratls::decode_parts(rest)?;
 
+    // A node MAY staple a transparency-log inclusion proof as one extra trailing evidence part.
+    // Peel it off up front (backward compatible: evidence without a proof has exactly the base part
+    // count) so each TEE arm matches only its own parts. The base count also validates the tag.
+    let base = match tag {
+        ratls::TAG_SEVSNP | ratls::TAG_TDX => 2,
+        #[cfg(feature = "synthetic")]
+        ratls::TAG_SYNTHETIC => 1,
+        other => return Err(AttestError::UnsupportedTee(other)),
+    };
+    let (base_parts, stapled): (&[&[u8]], Option<&[u8]>) = if parts.len() == base {
+        (&parts, None)
+    } else if parts.len() == base + 1 {
+        (&parts[..base], Some(parts[base]))
+    } else {
+        return Err(AttestError::Malformed("unexpected attestation evidence part count".into()));
+    };
+
     let report = match tag {
-        ratls::TAG_SEVSNP => match parts.as_slice() {
+        ratls::TAG_SEVSNP => match base_parts {
             [report, vcek] => report::sevsnp::verify(report, vcek, policy.min_tcb_sevsnp)?,
             _ => return Err(AttestError::Malformed("SEV-SNP evidence expects [report, vcek]".into())),
         },
-        ratls::TAG_TDX => match parts.as_slice() {
+        ratls::TAG_TDX => match base_parts {
             [quote, collateral] => report::tdx::verify(quote, collateral, now_unix())?,
             _ => return Err(AttestError::Malformed("TDX evidence expects [quote, collateral]".into())),
         },
         #[cfg(feature = "synthetic")]
-        ratls::TAG_SYNTHETIC => match parts.as_slice() {
+        ratls::TAG_SYNTHETIC => match base_parts {
             [synthetic] => testkit::verify(synthetic)?,
             _ => return Err(AttestError::Malformed("synthetic evidence expects [report]".into())),
         },
+        // Unreachable: `base` above already rejected any other tag. Kept for match exhaustiveness.
         other => return Err(AttestError::UnsupportedTee(other)),
     };
 
@@ -83,6 +103,24 @@ pub fn appraise(
     if let TcbStatus::OutOfDate(reason) = &report.tcb_status {
         if !policy.allow_tcb_out_of_date {
             return Err(AttestError::TcbNotUpToDate(reason.clone()));
+        }
+    }
+
+    // Transparency gate (fail closed): when a log key is pinned, the now-verified measurement must
+    // be provably present in that public append-only log via the stapled RFC 6962 inclusion proof.
+    // This is the "asserted → client-verified" step — even a coerced Coordinator cannot pin a
+    // measurement that was never publicly logged without leaving a log-detectable trace (PD-5/PD-7).
+    // Offline by design: the proof + signed checkpoint are stapled, so the client never phones the
+    // log (which would leak which node it is verifying, PD-3).
+    if let Some(log_key) = &policy.transparency_log_key {
+        let proof_bytes = stapled
+            .ok_or_else(|| AttestError::TransparencyNotLogged("no stapled inclusion proof".into()))?;
+        let proof = nil_crypto::translog::LogProof::decode(proof_bytes)
+            .ok_or_else(|| AttestError::TransparencyNotLogged("malformed inclusion proof".into()))?;
+        if !nil_crypto::translog::verify_logged(&report.measurement, &proof, log_key) {
+            return Err(AttestError::TransparencyNotLogged(
+                "measurement not included under the pinned log checkpoint".into(),
+            ));
         }
     }
 

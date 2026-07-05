@@ -58,6 +58,7 @@ fn main() {
             tee: Tee::SevSnp,
             measurement: Measurement(measurement),
             min_tcb_sevsnp: None,
+            transparency_log_key: None,
         }),
         grant: None,
     };

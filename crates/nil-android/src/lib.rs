@@ -99,6 +99,7 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
                 tee: parse_tee(&tee_name),
                 measurement: Measurement(b),
                 min_tcb_sevsnp: None,
+                transparency_log_key: None,
             }),
             None => {
                 log::error!("measurement is not valid hex");

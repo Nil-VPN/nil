@@ -28,21 +28,46 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// `nonce`. Errors if the TSM interface or the provisioned VCEK/collateral is unavailable; the
 /// caller then returns no report and the client fails closed.
 pub fn report_evidence(tee: Tee, spki: &[u8], nonce: &[u8; 32]) -> Result<Vec<u8>> {
-    let report_data = nil_attest::ratls::bind_report_data(spki, nonce);
+    use nil_attest::ratls;
+
+    let report_data = ratls::bind_report_data(spki, nonce);
     let outblob = fetch_outblob(&report_data).context("configfs-TSM report fetch")?;
-    match tee {
+    // Optional stapled transparency-log inclusion proof (the client verifies it iff it pinned a log
+    // key). Appended as one trailing evidence part, which the codec already tolerates.
+    let stapled = transparency_bundle()?;
+    let (tag, base): (u8, Vec<Vec<u8>>) = match tee {
         Tee::SevSnp => {
             let path = std::env::var("NW_VCEK_PATH")
                 .map_err(|_| anyhow::anyhow!("NW_VCEK_PATH unset (need the VCEK DER for offline SEV-SNP verification)"))?;
             let vcek = std::fs::read(&path).with_context(|| format!("read VCEK {path}"))?;
-            Ok(nil_attest::ratls::encode_sevsnp(&outblob, &vcek))
+            (ratls::TAG_SEVSNP, vec![outblob, vcek])
         }
         Tee::Tdx => {
             let path = std::env::var("NW_TDX_COLLATERAL")
                 .map_err(|_| anyhow::anyhow!("NW_TDX_COLLATERAL unset (need DCAP collateral JSON for offline TDX verification)"))?;
             let collateral = std::fs::read(&path).with_context(|| format!("read TDX collateral {path}"))?;
-            Ok(nil_attest::ratls::encode_tdx(&outblob, &collateral))
+            (ratls::TAG_TDX, vec![outblob, collateral])
         }
+    };
+    let mut parts: Vec<&[u8]> = base.iter().map(Vec::as_slice).collect();
+    if let Some(proof) = &stapled {
+        parts.push(proof);
+    }
+    Ok(ratls::encode(tag, &parts))
+}
+
+/// Read the operator-provisioned stapled transparency-log inclusion proof, if any.
+/// `NW_TRANSPARENCY_BUNDLE` points at a file of serialized `nil_crypto::translog::LogProof` bytes
+/// (the deploy pipeline emits it from a Rekor bundle). Unset ⇒ `None` ⇒ evidence carries no proof,
+/// and a client that pins a log key will then refuse — fail closed, never silently unlogged.
+fn transparency_bundle() -> Result<Option<Vec<u8>>> {
+    match std::env::var("NW_TRANSPARENCY_BUNDLE") {
+        Ok(path) => {
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("read transparency bundle {path}"))?;
+            Ok(Some(bytes))
+        }
+        Err(_) => Ok(None),
     }
 }
 

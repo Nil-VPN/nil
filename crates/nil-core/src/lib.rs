@@ -114,6 +114,11 @@ pub struct AttestExpectation {
     /// TDX endpoint) enforces no floor; a `Some` is checked offline during appraisal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_tcb_sevsnp: Option<SevSnpTcbFloor>,
+    /// Optional pinned transparency-log Ed25519 public key (32 bytes). When set, the client requires
+    /// the node's measurement to be proven present in that log via a stapled RFC 6962 inclusion
+    /// proof before any packet flows; `None` (the default) gates on the measurement pin alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transparency_log_key: Option<[u8; 32]>,
 }
 
 /// Where to reach a node, plus (from Phase 2) the node's WireGuard static public key and the
