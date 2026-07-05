@@ -34,6 +34,11 @@ pub mod reality;
 // resistant set compiled, not just the trait.
 #[cfg(feature = "selector")]
 pub mod selector;
+// Maybenot/DAITA traffic-analysis defense driver (experimental): drives padding state machines over
+// the CONNECT-IP padding channel. Off by default; the defense-machine profile + efficacy are a
+// separate research step (see the module docs).
+#[cfg(feature = "daita")]
+pub mod daita;
 
 pub use transport::Transport;
 #[cfg(feature = "masque")]

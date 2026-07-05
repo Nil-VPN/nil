@@ -110,6 +110,12 @@ jobs:
       - name: Fast-path perf gate (nil-transport fast-path)
         run: cargo test -p nil-transport --features fast-path --locked
 
+      # Tier-2 Maybenot/DAITA defense driver (experimental, off by default): the driver engine + its
+      # deterministic real-machine test must build and pass so the padding-action scheduling can't
+      # bitrot. Live datapath wiring + the concrete defense-machine profile are a separate step.
+      - name: DAITA driver (nil-transport daita)
+        run: cargo test -p nil-transport --features daita --locked
+
       # Clustered double-spend nullifier: single-use insert + NoTls non-loopback refusal guard.
       - name: Coordinator nullifier (nil-coordinator postgres)
         run: cargo test -p nil-coordinator --features postgres --locked
