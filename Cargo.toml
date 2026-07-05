@@ -88,6 +88,11 @@ tokio-rustls = "0.26"                  # TLS for the WS envelope (rustls, the pr
 rustls = "0.23"                        # custom no-verify config (security is the inner WireGuard)
 futures-util = "0.3"                   # split the WebSocket stream for the bidirectional pump
 
+# --- Tier-2: Maybenot/DAITA traffic-analysis defense (optional `daita` feature on nil-transport) ---
+# Off by default: the padding-channel foundation ships in the default build; this pulls the
+# peer-reviewed state-machine framework that DRIVES padding/blocking actions on top of it.
+maybenot = "2.2.2"                     # Mullvad's DAITA framework (probabilistic defense state machines)
+
 # --- Clustered durable stores (optional `postgres` feature on nil-portal/nil-coordinator) ---
 # Off by default: the default build ships the file-backed durable stores and pulls no DB driver.
 # Production wires a rustls TLS connector (the connection is the deployment's responsibility).

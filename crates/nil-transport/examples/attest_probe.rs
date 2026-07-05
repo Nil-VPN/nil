@@ -11,12 +11,24 @@
 //!   cargo run -p nil-transport --features masque --example attest_probe
 //!
 //! Run (reject): add PROBE_TWEAK=1 to corrupt the pinned measurement — the gate MUST refuse.
+//!
+//! Requires the `masque` feature (it drives the real MASQUE transport); without it `main` is an
+//! inert stub so a masque-off feature build still compiles this example.
 
+#[cfg(not(feature = "masque"))]
+fn main() {
+    eprintln!("attest_probe requires --features masque");
+}
+
+#[cfg(feature = "masque")]
 use std::env;
 
+#[cfg(feature = "masque")]
 use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
+#[cfg(feature = "masque")]
 use nil_transport::{MasqueConfig, MasqueTransport, Transport};
 
+#[cfg(feature = "masque")]
 fn from_hex(s: &str) -> Vec<u8> {
     let s = s.trim();
     (0..s.len())
@@ -25,6 +37,7 @@ fn from_hex(s: &str) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(feature = "masque")]
 fn main() {
     let host = env::var("NODE_HOST").expect("set NODE_HOST");
     let port: u16 = env::var("NODE_PORT")

@@ -40,6 +40,10 @@ fast-path = ["pqwg"]
 # inside already-`masque`-gated code, log only counts/sizes/flow_id (never addresses/tokens, so
 # `no_pii_in_logs` stays green). Never enabled in a release/prod build.
 dev-trace = []
+# Tier-2 traffic-analysis defense: drive Maybenot/DAITA padding (+blocking) state machines over the
+# CONNECT-IP padding channel. Off by default — experimental, and the concrete defense-machine profile
+# + efficacy evaluation are separate. Enabling it pulls the peer-reviewed `maybenot` framework.
+daita = ["dep:maybenot", "dep:rand_core"]
 
 [dependencies]
 nil-core = { workspace = true }
@@ -60,6 +64,8 @@ tokio-rustls = { workspace = true, optional = true }     # TLS envelope (wstunne
 rustls = { workspace = true, optional = true }           # no-verify client config (wstunnel)
 futures-util = { workspace = true, optional = true }     # split the WS stream (wstunnel)
 boring = { workspace = true, optional = true }           # BoringSSL SslContextBuilder (masque: outer-ClientHello shaping)
+maybenot = { workspace = true, optional = true }         # DAITA defense state-machine framework (daita)
+rand_core = { version = "0.9", optional = true }         # RngCore bound for the DAITA framework (daita)
 
 [dev-dependencies]
 # A throwaway self-signed TLS cert for the in-crate wstunnel round-trip test's WS-TLS responder.
@@ -71,3 +77,6 @@ hkdf = { workspace = true }
 sha2 = { workspace = true }
 aes = "0.8"
 aes-gcm = "0.10"
+# DAITA driver test: a seeded RNG + a hand-built defense machine (enum-map must match maybenot's 2.7).
+rand = "0.9"
+enum-map = "2.7"
