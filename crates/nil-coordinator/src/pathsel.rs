@@ -65,6 +65,14 @@ struct RegistryFileNode {
     /// black-holes the data plane.
     #[serde(default)]
     role: Option<String>,
+    /// Optional per-node pinned minimum SEV-SNP TCB floor, published to the client and enforced
+    /// offline by its attestation gate. Absent ⇒ no floor.
+    #[serde(default)]
+    min_tcb_sevsnp: Option<nil_proto::path::SevSnpTcbFloor>,
+    /// Optional per-node pinned transparency-log Ed25519 pubkey (lowercase hex). Absent ⇒ the
+    /// measurement pin alone gates the hop.
+    #[serde(default)]
+    transparency_log_key: Option<String>,
 }
 
 fn default_tee() -> String {
@@ -86,6 +94,10 @@ pub struct RegistryNode {
     /// Position capability (see [`Role`]). `None` = universal (may fill any position) — the
     /// back-compat default for registries that don't declare roles.
     pub role: Option<Role>,
+    /// Pinned minimum SEV-SNP TCB floor published to the client for this node. `None` = no floor.
+    pub min_tcb_sevsnp: Option<nil_proto::path::SevSnpTcbFloor>,
+    /// Pinned transparency-log Ed25519 pubkey (lowercase hex). `None` = measurement pin alone.
+    pub transparency_log_key: Option<String>,
 }
 
 impl RegistryNode {
@@ -104,6 +116,8 @@ impl RegistryNode {
             wg_pub: self.wg_pub.clone(),
             grant: None,
             grant_nonce: None,
+            min_tcb_sevsnp: self.min_tcb_sevsnp,
+            transparency_log_key: self.transparency_log_key.clone(),
         }
     }
 }
@@ -192,6 +206,8 @@ impl NodeRegistry {
                     }
                     parsed
                 },
+                min_tcb_sevsnp: d.min_tcb_sevsnp,
+                transparency_log_key: d.transparency_log_key,
             })
             .collect();
         Ok(Self {
@@ -213,6 +229,8 @@ impl NodeRegistry {
             jurisdiction: jur.into(),
             wg_pub: None,
             role: Some(role),
+            min_tcb_sevsnp: None,
+            transparency_log_key: None,
         };
         Self {
             nodes: vec![
@@ -410,6 +428,35 @@ mod tests {
     }
 
     #[test]
+    fn registry_publishes_per_node_min_tcb_floor_and_transparency_key_into_the_hop() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "nil-coord-registry-tcb-{}-{}.json",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(
+            &path,
+            r#"[
+              {"host":"x.example","port":443,"tee":"sev-snp","measurement":"cc","operator":"op-c","jurisdiction":"CH",
+               "min_tcb_sevsnp":{"bootloader":3,"tee":0,"snp":8,"microcode":115},
+               "transparency_log_key":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}
+            ]"#,
+        )
+        .unwrap();
+        let reg = NodeRegistry::from_file(path.to_str().unwrap()).expect("parse registry");
+        // The published floor + key must survive load AND reach the emitted Hop (what the client reads).
+        let hop = reg.nodes[0].to_hop();
+        assert_eq!(
+            hop.min_tcb_sevsnp,
+            Some(nil_proto::path::SevSnpTcbFloor { fmc: None, bootloader: 3, tee: 0, snp: 8, microcode: 115 })
+        );
+        assert_eq!(hop.transparency_log_key.as_deref(), Some("cd".repeat(32).as_str()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn refuses_a_path_when_diversity_cannot_be_met() {
         // Two nodes, same operator → cannot build even a 2-hop diverse path.
         let reg = NodeRegistry {
@@ -423,6 +470,8 @@ mod tests {
                     jurisdiction: "US".into(),
                     wg_pub: None,
                     role: None,
+                    min_tcb_sevsnp: None,
+                    transparency_log_key: None,
                 },
                 RegistryNode {
                     host: "b".into(),
@@ -433,6 +482,8 @@ mod tests {
                     jurisdiction: "DE".into(),
                     wg_pub: None,
                     role: None,
+                    min_tcb_sevsnp: None,
+                    transparency_log_key: None,
                 },
             ],
             dead: Default::default(),
@@ -456,6 +507,8 @@ mod tests {
             jurisdiction: jur.into(),
             wg_pub: None,
             role: None,
+            min_tcb_sevsnp: None,
+            transparency_log_key: None,
         }
     }
 
@@ -599,6 +652,8 @@ mod tests {
             jurisdiction: jur,
             wg_pub: None,
             role: None,
+            min_tcb_sevsnp: None,
+            transparency_log_key: None,
         }
     }
 

@@ -9,7 +9,7 @@
 //! end to end without touching real networking.
 //!
 //! On **mobile** the real datapath is a separate-process `NEPacketTunnelProvider`/`VpnService`
-//! (built separately): the frontend routes Connect to the native plugin (`mobile_connect` in
+//! (built separately): the frontend routes Connect to the native plugin (`extension_connect` in
 //! `lib.rs` → the `nil-vpn` plugin), NOT to this engine, so the mobile Connect path is the real
 //! attested tunnel. This engine's loopback fallback is reached only on desktop with nothing
 //! configured (and in tests).
