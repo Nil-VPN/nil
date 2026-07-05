@@ -129,6 +129,12 @@ jobs:
       - name: Card payments (nil-portal card-payments)
         run: cargo test -p nil-portal --features card-payments --locked
 
+      # HSM/KMS-backed issuer key (PKCS#11). The blind-sign round-trip needs a live PKCS#11 module
+      # (SoftHSM) and runs via deploy/verify-hsm.sh; here we compile the feature + run the rest of the
+      # portal suite (the HSM test skips cleanly without NW_TOKEN_HSM_MODULE) so it can't bitrot.
+      - name: HSM issuer signer compiles (nil-portal hsm)
+        run: cargo test -p nil-portal --features hsm --locked
+
       # Synthetic RA-TLS datapath wiring (node report + client/datapath appraisal acceptance).
       - name: Synthetic-attest datapath (node + datapath + cli)
         run: |

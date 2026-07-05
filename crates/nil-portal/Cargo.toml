@@ -15,6 +15,10 @@ postgres = ["dep:tokio-postgres"]
 # checkout reference paid/revoked, mirroring the Monero watcher. Off by default — Monero-only build
 # pulls no HMAC deps. Sell strictly as a "VPN software subscription" (MoR AUP forbids "donation").
 card-payments = ["dep:hmac", "dep:subtle"]
+# HSM/KMS-backed issuer key via PKCS#11 (SoftHSM in test/CI, a real HSM in prod): the RSA private
+# key never leaves the device — the Portal blind-signs by asking the HSM to do a raw RSA op
+# (CKM_RSA_X_509), closing the plaintext-key-on-disk risk. Off by default (in-memory Issuer).
+hsm = ["dep:cryptoki", "dep:rsa"]
 
 [dependencies]
 nil-core = { workspace = true }     # durable one-token-per-payment + account stores
@@ -39,6 +43,10 @@ tokio-postgres = { workspace = true, optional = true }
 # Card (Merchant-of-Record) webhook signature verification, behind the `card-payments` feature.
 hmac = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
+# PKCS#11 client for the HSM-backed issuer key, behind the `hsm` feature.
+cryptoki = { version = "0.12", optional = true }
+# Build a SubjectPublicKeyInfo DER from the HSM public key's (modulus, exponent), behind `hsm`.
+rsa = { version = "0.9", default-features = false, features = ["std"], optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

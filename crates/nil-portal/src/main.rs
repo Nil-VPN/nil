@@ -11,6 +11,8 @@ mod app;
 mod billing;
 #[cfg(feature = "card-payments")]
 mod cards;
+#[cfg(feature = "hsm")]
+mod hsm;
 mod mint;
 mod monero;
 mod ratelimit;
@@ -81,6 +83,14 @@ async fn main() -> Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
+    // One-shot HSM provisioning: generate the issuer keypair in the device, then exit. An explicit
+    // ops step (never auto-provision on a normal start — a fresh key would invalidate every issued
+    // token and break the Coordinator pin).
+    #[cfg(feature = "hsm")]
+    if std::env::var("NW_TOKEN_HSM_PROVISION").is_ok() {
+        return hsm::provision_from_env();
+    }
+
     // Account store selection (ADR-0003), all PII-free:
     //  - clustered Postgres when NW_PORTAL_PG_URL is set and the `postgres` feature is built;
     //  - else durable JSON file when NW_PORTAL_STORE is set;
@@ -99,9 +109,10 @@ async fn main() -> Result<()> {
     #[cfg(not(feature = "postgres"))]
     let store: Arc<dyn Store> = file_or_memory_store()?;
 
-    // Privacy Pass issuer: reload from NW_TOKEN_SECRET (hex DER) or mint a fresh key. The
-    // PUBLIC key is logged so the operator can pin it in the Coordinator (NW_TOKEN_PUBKEY).
-    let issuer = Arc::new(load_or_generate_issuer()?);
+    // Privacy Pass issuer: an HSM/KMS-backed key (NW_TOKEN_HSM_MODULE, `hsm` feature) if configured,
+    // else an in-memory key from NW_TOKEN_SECRET / a fresh one. The PUBLIC key is logged so the
+    // operator can pin it in the Coordinator (NW_TOKEN_PUBKEY).
+    let issuer: Arc<dyn TokenSigner> = build_issuer()?;
     if let Ok(pk) = issuer.public_der() {
         tracing::info!(token_pubkey = %hex(&pk), "Privacy Pass issuer ready — pin this as the Coordinator's NW_TOKEN_PUBKEY");
     }
@@ -409,6 +420,31 @@ fn ensure_key_file_perms(path: &str) -> Result<()> {
 #[cfg(not(unix))]
 fn ensure_key_file_perms(_path: &str) -> Result<()> {
     Ok(())
+}
+
+/// Select the issuer signing backend: an HSM/KMS PKCS#11 key when `NW_TOKEN_HSM_MODULE` is set
+/// (requires the `hsm` feature — the key never leaves the device), else the in-memory key. Returned
+/// as `Arc<dyn TokenSigner>` so the rest of the Portal is agnostic to where the key lives.
+fn build_issuer() -> Result<Arc<dyn TokenSigner>> {
+    #[cfg(feature = "hsm")]
+    if let Ok(module) = std::env::var("NW_TOKEN_HSM_MODULE") {
+        let pin = std::env::var("NW_TOKEN_HSM_PIN")
+            .map_err(|_| anyhow::anyhow!("NW_TOKEN_HSM_MODULE is set but NW_TOKEN_HSM_PIN is not"))?;
+        let label =
+            std::env::var("NW_TOKEN_HSM_KEY_LABEL").unwrap_or_else(|_| "nil-issuer".to_string());
+        let slot = std::env::var("NW_TOKEN_HSM_SLOT").ok().and_then(|s| s.parse::<u64>().ok());
+        tracing::info!("issuer key: PKCS#11 HSM module {module} (key never leaves the device)");
+        return Ok(Arc::new(hsm::Pkcs11Signer::open(&module, slot, &pin, &label)?));
+    }
+    // A set-but-feature-disabled HSM module var is a config error, not a silent downgrade to a file key.
+    #[cfg(not(feature = "hsm"))]
+    if std::env::var("NW_TOKEN_HSM_MODULE").is_ok() {
+        anyhow::bail!(
+            "NW_TOKEN_HSM_MODULE is set but nil-portal was built without the `hsm` feature — rebuild \
+             with --features hsm, or unset it to use an in-memory key"
+        );
+    }
+    Ok(Arc::new(load_or_generate_issuer()?))
 }
 
 fn load_or_generate_issuer() -> Result<Issuer> {
