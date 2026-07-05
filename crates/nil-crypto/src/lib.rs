@@ -17,6 +17,7 @@
 pub mod account;
 pub mod psk;
 pub mod token;
+pub mod translog;
 mod error;
 
 pub use error::CryptoError;
