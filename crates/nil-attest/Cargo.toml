@@ -8,6 +8,7 @@ description = "NIL VPN attestation: SEV-SNP/TDX report parse + RA-TLS appraisal 
 
 [dependencies]
 nil-core = { workspace = true }                 # shared Tee / Measurement / AttestExpectation
+nil-crypto = { workspace = true }               # transparency-log inclusion proof verification (translog)
 sev = { workspace = true }                      # AMD SEV-SNP report parse + cert-chain verification
 dcap-qvl = { workspace = true }                 # Intel TDX DCAP quote verification (offline)
 x509-parser = { workspace = true }              # RA-TLS leaf cert + custom report extension
@@ -27,6 +28,7 @@ synthetic = ["dep:ed25519-dalek"]
 
 [dev-dependencies]
 hex = "0.4"
+data-encoding = { workspace = true }            # BASE64 for building synthetic transparency checkpoints
 serde_json = { workspace = true }
 chrono = "0.4"
 x509-cert = "0.2"

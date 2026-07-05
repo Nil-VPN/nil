@@ -167,7 +167,24 @@ pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
         tee,
         measurement: Measurement(bytes),
         min_tcb_sevsnp: min_tcb_sevsnp_from_env()?,
+        transparency_log_key: transparency_log_key_from_env()?,
     }))
+}
+
+/// Parse an optional pinned transparency-log Ed25519 public key from `NW_TRANSPARENCY_LOG_KEY`
+/// (64 hex chars = 32 bytes). When set, the client requires the node's measurement to be proven
+/// present in that log via a stapled inclusion proof; unset ⇒ `None` ⇒ measurement pin alone gates.
+fn transparency_log_key_from_env() -> Result<Option<[u8; 32]>> {
+    let Ok(hex) = std::env::var("NW_TRANSPARENCY_LOG_KEY") else {
+        return Ok(None);
+    };
+    let bytes = connectip::from_hex(hex.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_TRANSPARENCY_LOG_KEY is not valid hex"))?;
+    let key: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("NW_TRANSPARENCY_LOG_KEY must be 32 bytes (64 hex chars)"))?;
+    Ok(Some(key))
 }
 
 /// Parse an optional pinned SEV-SNP minimum-TCB floor from `NW_MIN_TCB_SEVSNP`. Format is four
@@ -635,6 +652,7 @@ mod tests {
             tee: Tee::SevSnp,
             measurement: Measurement(vec![byte; 48]),
             min_tcb_sevsnp: None,
+            transparency_log_key: None,
         }
     }
 

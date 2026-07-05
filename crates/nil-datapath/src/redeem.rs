@@ -273,8 +273,9 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
         expected: Some(AttestExpectation {
             tee,
             measurement: Measurement(measurement),
-            // Coordinator-published per-hop TCB floors are a follow-up; None = no floor for now.
+            // Coordinator-published per-hop TCB floors / transparency keys are a follow-up; None for now.
             min_tcb_sevsnp: None,
+            transparency_log_key: None,
         }),
         grant,
     })

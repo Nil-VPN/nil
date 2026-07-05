@@ -80,3 +80,17 @@ pub fn synthetic_evidence(tee: Tee, measurement: &[u8; 48], spki: &[u8], nonce: 
     let report = sign(tee, measurement, &report_data);
     ratls::encode(ratls::TAG_SYNTHETIC, &[&report])
 }
+
+/// Like [`synthetic_evidence`], but staples `log_proof` (serialized [`nil_crypto::translog::LogProof`]
+/// bytes) as the trailing evidence part — exercising the client's transparency-log gate end to end.
+pub fn synthetic_evidence_logged(
+    tee: Tee,
+    measurement: &[u8; 48],
+    spki: &[u8],
+    nonce: &[u8; 32],
+    log_proof: &[u8],
+) -> Vec<u8> {
+    let report_data = ratls::bind_report_data(spki, nonce);
+    let report = sign(tee, measurement, &report_data);
+    ratls::encode(ratls::TAG_SYNTHETIC, &[&report, log_proof])
+}

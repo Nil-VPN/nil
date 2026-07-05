@@ -38,4 +38,9 @@ pub enum AttestError {
     /// allowed, which permits the operator to read guest memory). Fail closed.
     #[error("attestation policy violation: {0}")]
     PolicyViolation(String),
+    /// A transparency-log key is pinned, but the node's measurement was not proven present in that
+    /// log (no stapled inclusion proof, a malformed one, or one that fails to verify). Fail closed —
+    /// this stops a coerced Coordinator from pinning a measurement that was never publicly logged.
+    #[error("measurement not proven in the pinned transparency log: {0}")]
+    TransparencyNotLogged(String),
 }

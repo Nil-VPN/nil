@@ -118,6 +118,7 @@ pub unsafe extern "C" fn nil_start(
                     tee,
                     measurement: Measurement(b),
                     min_tcb_sevsnp: None,
+                    transparency_log_key: None,
                 }),
                 None => return std::ptr::null_mut(),
             },
