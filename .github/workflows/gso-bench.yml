@@ -1,0 +1,42 @@
+name: gso-bench
+
+# Manual UDP-GSO egress micro-benchmark on a real Linux runner (free — no VPS needed).
+# Runs the nil-node `gso_bench` example, which A/Bs per-packet send_to vs GSO sendmsg batches and
+# prints packets/sec + the speedup ratio into the job log. Trigger from the Actions tab or with
+# `gh workflow run gso-bench.yml`. Absolute pps is runner-dependent; the RATIO is the result.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # nil-node (quiche/BoringSSL) build deps only — it does not pull the Tauri client, so no gtk/webkit.
+      - name: Install build deps (BoringSSL/quiche)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake clang pkg-config build-essential libssl-dev
+
+      - name: Kernel UDP_SEGMENT / runner info
+        run: |
+          uname -a
+          nproc
+          # UDP_GSO is a kernel constant; the bench itself reports if sendmsg rejects it.
+
+      - name: Run GSO egress benchmark
+        run: cargo run --release -p nil-node --example gso_bench --locked
