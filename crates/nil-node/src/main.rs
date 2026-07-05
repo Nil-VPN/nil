@@ -15,6 +15,7 @@ mod config;
 #[cfg(feature = "dev-trace")]
 mod devtrace;
 mod exit;
+mod gso;
 #[cfg(feature = "hw-attest")]
 mod hw;
 mod pool;

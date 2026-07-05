@@ -464,20 +464,84 @@ fn drive_h3(
 }
 
 async fn flush(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]) {
+    // Batch equal-size QUIC packets to the same peer and hand each run to the kernel via UDP GSO
+    // (one sendmsg on Linux); fall back to per-packet send_to otherwise. A packet SHORTER than the
+    // running segment size is the final segment of a GSO batch (GSO requires equal segments except
+    // the last), so it closes the current batch.
+    let mut batch: Vec<u8> = Vec::new();
+    let mut seg: usize = 0;
+    let mut dest: Option<SocketAddr> = None;
     loop {
         match conn.send(out) {
             Ok((len, info)) => {
-                if socket.send_to(&out[..len], info.to).await.is_err() {
-                    return;
+                // A destination change (rare within one connection) flushes the current batch first.
+                if let Some(d) = dest {
+                    if d != info.to {
+                        send_batch(socket, &batch, seg, d).await;
+                        batch.clear();
+                        seg = 0;
+                    }
+                }
+                dest = Some(info.to);
+                if seg == 0 || len == seg {
+                    if seg == 0 {
+                        seg = len;
+                    }
+                    batch.extend_from_slice(&out[..len]);
+                } else if len < seg {
+                    // Short packet: append as the final segment, then flush the batch.
+                    batch.extend_from_slice(&out[..len]);
+                    send_batch(socket, &batch, seg, info.to).await;
+                    batch.clear();
+                    seg = 0;
+                } else {
+                    // len > seg (a larger packet after a shorter run): flush, then start anew.
+                    send_batch(socket, &batch, seg, info.to).await;
+                    batch.clear();
+                    batch.extend_from_slice(&out[..len]);
+                    seg = len;
+                }
+                // Bound the batch to the kernel's ~64-segment / 64 KiB GSO limit.
+                if seg > 0 && (batch.len() >= 64 * seg || batch.len() >= 60_000) {
+                    send_batch(socket, &batch, seg, info.to).await;
+                    batch.clear();
+                    seg = 0;
                 }
             }
-            Err(quiche::Error::Done) => return,
+            Err(quiche::Error::Done) => break,
             Err(e) => {
                 tracing::warn!("conn.send: {e}");
                 let _ = conn.close(false, 0x1, b"send");
-                return;
+                break;
             }
         }
+    }
+    if let Some(d) = dest {
+        send_batch(socket, &batch, seg, d).await;
+    }
+}
+
+/// Emit one accumulated egress batch: a single `send_to` for one packet, a UDP GSO `sendmsg` for a
+/// multi-segment batch on Linux, or a per-segment `send_to` fallback (non-Linux, or a kernel without
+/// GSO). `batch` is a concatenation of `seg`-sized packets whose final segment may be shorter.
+async fn send_batch(socket: &UdpSocket, batch: &[u8], seg: usize, dest: SocketAddr) {
+    if batch.is_empty() || seg == 0 {
+        return;
+    }
+    if batch.len() <= seg {
+        let _ = socket.send_to(batch, dest).await;
+        return;
+    }
+    if crate::gso::send_segmented(socket, batch, seg, dest).await.is_ok() {
+        return;
+    }
+    let mut off = 0;
+    while off < batch.len() {
+        let end = (off + seg).min(batch.len());
+        if socket.send_to(&batch[off..end], dest).await.is_err() {
+            return;
+        }
+        off = end;
     }
 }
 
