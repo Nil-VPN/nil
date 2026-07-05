@@ -20,7 +20,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use nil_core::{AttestExpectation, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_core::{AttestExpectation, Measurement, NodeEndpoint, SevSnpTcbFloor, Tee, TransportKind};
 use nil_transport::cascade::{Cascade, CascadeTransport, DnsLivenessProbe};
 use nil_transport::{
     connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport,
@@ -166,6 +166,31 @@ pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
     Ok(Some(AttestExpectation {
         tee,
         measurement: Measurement(bytes),
+        min_tcb_sevsnp: min_tcb_sevsnp_from_env()?,
+    }))
+}
+
+/// Parse an optional pinned SEV-SNP minimum-TCB floor from `NW_MIN_TCB_SEVSNP`. Format is four
+/// dot-separated bytes `bootloader.tee.snp.microcode` (as read from `snpguest report` on validated
+/// hardware, e.g. `"3.0.8.115"`); unset ⇒ `None` ⇒ no floor. FMC (Turin) pinning is not yet exposed
+/// here — the floor's `fmc` stays `None` (don't-care), which is correct for the Milan/Genoa alpha.
+fn min_tcb_sevsnp_from_env() -> Result<Option<SevSnpTcbFloor>> {
+    let Ok(raw) = std::env::var("NW_MIN_TCB_SEVSNP") else {
+        return Ok(None);
+    };
+    let parts: Vec<&str> = raw.trim().split('.').collect();
+    let [bootloader, tee, snp, microcode] = parts.as_slice() else {
+        anyhow::bail!("NW_MIN_TCB_SEVSNP must be four dot-separated bytes bootloader.tee.snp.microcode");
+    };
+    let byte = |s: &str, name: &str| -> Result<u8> {
+        s.parse::<u8>().with_context(|| format!("NW_MIN_TCB_SEVSNP {name} is not a 0-255 integer"))
+    };
+    Ok(Some(SevSnpTcbFloor {
+        fmc: None,
+        bootloader: byte(bootloader, "bootloader")?,
+        tee: byte(tee, "tee")?,
+        snp: byte(snp, "snp")?,
+        microcode: byte(microcode, "microcode")?,
     }))
 }
 
@@ -609,6 +634,7 @@ mod tests {
         AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(vec![byte; 48]),
+            min_tcb_sevsnp: None,
         }
     }
 
