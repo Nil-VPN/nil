@@ -36,6 +36,24 @@ use crate::store::{file::FileStore, memory::InMemoryStore, Store};
 use crate::subscription::{subscription_router, SubscriptionState};
 use crate::tokens::{token_router, TokenSigner, TokenState};
 
+/// Resolve the minimum accepted Monero payment (atomic units) for a LIVE watcher. Fails closed: an
+/// unset/empty minimum would accept ANY confirmed amount — a dust payment would mint a full token
+/// (payment bypass) — so it is an error unless `dev_fallback` explicitly opts into accept-any.
+fn resolve_min_atomic(raw: Option<String>, dev_fallback: bool) -> anyhow::Result<u64> {
+    match raw.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => s
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("NW_MONERO_MIN_ATOMIC must be a u64 of atomic units")),
+        _ if dev_fallback => Ok(0),
+        _ => anyhow::bail!(
+            "NW_MONERO_RPC is set but NW_MONERO_MIN_ATOMIC is not: a live watcher with no minimum \
+             accepts ANY confirmed amount (a dust payment would mint a full token). Set \
+             NW_MONERO_MIN_ATOMIC to the per-plan price in atomic units (1 XMR = 1_000_000_000_000), \
+             or set NW_ALLOW_DEV_FALLBACKS=1 to explicitly accept any amount in dev."
+        ),
+    }
+}
+
 /// (composed payment watcher, optional card rail = (card watcher shared with the composite, the
 /// MoR signing secret)). Aliased so the dual-rail wiring below isn't a clippy::type_complexity wall.
 #[cfg(feature = "card-payments")]
@@ -93,19 +111,18 @@ async fn main() -> Result<()> {
         Ok(url) => {
             // Refuse a plaintext, non-loopback (unauthenticated) wallet-rpc before we ever poll it.
             monero::validate_rpc_url(&url)?;
-            // Minimum accepted payment, atomic units (1 XMR = 1e12). Unset ⇒ accept any confirmed
-            // amount (dev only) + a loud warning — the founder sets the per-plan price.
-            let min_atomic = match std::env::var("NW_MONERO_MIN_ATOMIC").ok().map(|s| s.parse::<u64>()) {
-                Some(Ok(v)) => v,
-                Some(Err(_)) => anyhow::bail!("NW_MONERO_MIN_ATOMIC must be a u64 of atomic units"),
-                None => {
-                    tracing::warn!(
-                        "NW_MONERO_MIN_ATOMIC unset — accepting ANY confirmed amount (dev only; set \
-                         the per-plan minimum in atomic units, 1 XMR = 1_000_000_000_000)"
-                    );
-                    0
-                }
-            };
+            // Minimum accepted payment, atomic units (1 XMR = 1e12). A LIVE watcher with no minimum
+            // accepts ANY confirmed amount — a dust payment would mint a full token (payment bypass) —
+            // so an unset minimum FAILS CLOSED unless the dev fallback is explicitly enabled.
+            let raw = std::env::var("NW_MONERO_MIN_ATOMIC").ok();
+            let dev_fallback = nil_core::net::env_flag("NW_ALLOW_DEV_FALLBACKS");
+            if raw.as_deref().map(str::trim).unwrap_or("").is_empty() && dev_fallback {
+                tracing::warn!(
+                    "NW_ALLOW_DEV_FALLBACKS=1: live Monero watcher accepting ANY confirmed amount \
+                     (NW_MONERO_MIN_ATOMIC unset) — DEV ONLY, never production"
+                );
+            }
+            let min_atomic = resolve_min_atomic(raw, dev_fallback)?;
             tracing::info!("watching self-hosted monero-wallet-rpc for confirmed payments");
             let w = Arc::new(MoneroRpcWatcher::new(url, min_atomic));
             tokio::spawn(w.clone().poll_loop(Duration::from_secs(30)));
@@ -397,4 +414,32 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
         }
     }
     h.chunks_exact(2).map(|p| Some((nib(p[0])? << 4) | nib(p[1])?)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_min_atomic;
+
+    #[test]
+    fn a_set_minimum_parses() {
+        assert_eq!(resolve_min_atomic(Some("300000000000".into()), false).unwrap(), 300_000_000_000);
+    }
+
+    #[test]
+    fn unset_minimum_fails_closed_without_dev_fallback() {
+        // The payment-bypass guard: a live watcher with no minimum must refuse to boot.
+        assert!(resolve_min_atomic(None, false).is_err(), "unset minimum must fail closed");
+        assert!(resolve_min_atomic(Some("   ".into()), false).is_err(), "blank minimum must fail closed");
+    }
+
+    #[test]
+    fn unset_minimum_allows_zero_only_with_dev_fallback() {
+        assert_eq!(resolve_min_atomic(None, true).unwrap(), 0, "dev fallback accepts any amount");
+    }
+
+    #[test]
+    fn malformed_minimum_is_rejected_even_with_dev_fallback() {
+        // A present-but-garbage value is always an error (a typo must never silently mean 0).
+        assert!(resolve_min_atomic(Some("nope".into()), true).is_err());
+    }
 }

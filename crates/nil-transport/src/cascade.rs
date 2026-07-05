@@ -21,13 +21,16 @@
 //! therefore (1) bounds each rung's `connect` with a **timeout** and (2) optionally runs a
 //! post-connect **liveness probe** before committing to a rung.
 //!
-//! MASQUE is fully implemented (the `masque` feature). The lower rungs are **scaffolds** at the
-//! `Transport` level: they carry the correct `kind()`/`fingerprint_profile()` and slot into the
-//! cascade, but their `connect` returns a clear error, so the cascade steps past them to MASQUE
-//! today. AmneziaWG's DPI-defeating obfuscation core (magic headers + junk that erase WG's
-//! 148/92-byte + message-type fingerprint) is implemented and tested in [`crate::amneziawg`],
-//! reusing the PQ-WireGuard crypto ([`crate::pqwg`]); only its live UDP datapath remains. wstunnel
-//! is WebSocket-over-TLS; REALITY borrows a real TLS handshake.
+//! All cascade rungs are implemented at the `Transport` level (not scaffolds): MASQUE (default,
+//! attested; `masque`), AmneziaWG (DPI-defeating obfuscated WireGuard over UDP — magic headers +
+//! junk erase WG's 148/92-byte + message-type fingerprint; `crate::amneziawg`), wstunnel (WireGuard
+//! over WebSocket-over-TLS, PQ-by-default; `crate::wstunnel`), and REALITY (WireGuard inside a
+//! VLESS-shared-key-gated TLS session; `crate::reality`). Each carries the correct
+//! `kind()`/`fingerprint_profile()` and a real `connect`.
+//!
+//! HONESTY CAVEATS: REALITY's TLS-borrow is cosmetic — a genuine self-signed handshake with a
+//! rustls (not browser) ClientHello — so it is NOT yet active-prober-resistant; and AmneziaWG /
+//! REALITY carry classical (non-PQ) WireGuard (only MASQUE + wstunnel are PQ). See each module.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

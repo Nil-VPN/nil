@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, SevSnpTcbFloor, Tee, TransportKind};
 use nil_proto::path::{Hop, PathResponse, Tee as WireTee};
 use nil_proto::token::RedeemRequest;
 use nil_transport::connectip;
@@ -265,18 +265,33 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
             "redeemed path hop {idx}: grant and grant_nonce must be provided together"
         ),
     };
+    // Per-hop offline attestation floors published by the Coordinator. Both are enforced by the
+    // MASQUE gate (`nil_attest::appraise`): a `current_tcb` below the floor, or a measurement absent
+    // from the pinned transparency log, fails the hop closed. Absent ⇒ measurement pin alone gates.
+    let min_tcb_sevsnp = h.min_tcb_sevsnp.map(|f| SevSnpTcbFloor {
+        fmc: f.fmc,
+        bootloader: f.bootloader,
+        tee: f.tee,
+        snp: f.snp,
+        microcode: f.microcode,
+    });
+    let transparency_log_key = match h.transparency_log_key {
+        Some(hex) => {
+            let bytes = connectip::from_hex(hex.trim().as_bytes()).ok_or_else(|| {
+                anyhow::anyhow!("redeemed path hop {idx}: transparency_log_key is not hex")
+            })?;
+            Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                anyhow::anyhow!("redeemed path hop {idx}: transparency_log_key must be 32 bytes")
+            })?)
+        }
+        None => None,
+    };
     Ok(NodeEndpoint {
         host: h.host,
         port: h.port,
         kind: TransportKind::Masque,
         wg_pub,
-        expected: Some(AttestExpectation {
-            tee,
-            measurement: Measurement(measurement),
-            // Coordinator-published per-hop TCB floors / transparency keys are a follow-up; None for now.
-            min_tcb_sevsnp: None,
-            transparency_log_key: None,
-        }),
+        expected: Some(AttestExpectation { tee, measurement: Measurement(measurement), min_tcb_sevsnp, transparency_log_key }),
         grant,
     })
 }
@@ -326,6 +341,62 @@ mod tests {
         let g = hops[0].grant.as_ref().expect("grant");
         assert_eq!(g.token, vec![0xcd; 90]);
         assert_eq!(g.nonce, [0x11; 32]);
+    }
+
+    #[test]
+    fn coordinator_hop_min_tcb_floor_and_transparency_key_reach_the_appraisal_policy() {
+        // A Coordinator-published hop carrying a min-TCB floor + a transparency-log key must surface
+        // them on the hop's AttestExpectation, so the MASQUE gate enforces them (they were previously
+        // dropped to None on the redeemed path, making both defenses inert in production).
+        let m = "ab".repeat(48);
+        let key = "cd".repeat(32); // 32-byte Ed25519 log key, hex
+        let body = format!(
+            r#"{{"hops":[{{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}",
+               "min_tcb_sevsnp":{{"bootloader":3,"tee":0,"snp":8,"microcode":115}},
+               "transparency_log_key":"{key}"}}]}}"#
+        );
+        let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
+        let exp = hops[0].expected.as_ref().expect("pinned expectation");
+        assert_eq!(
+            exp.min_tcb_sevsnp,
+            Some(SevSnpTcbFloor { fmc: None, bootloader: 3, tee: 0, snp: 8, microcode: 115 }),
+            "the per-hop TCB floor must reach the appraisal policy"
+        );
+        assert_eq!(
+            exp.transparency_log_key,
+            Some([0xcd; 32]),
+            "the per-hop transparency-log key must reach the appraisal policy"
+        );
+    }
+
+    #[test]
+    fn absent_floor_and_key_stay_none_backcompat() {
+        // A hop without the new fields keeps today's behavior: measurement pin alone (no floor/log).
+        let m = "ab".repeat(48);
+        let body =
+            format!(r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#);
+        let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
+        let exp = hops[0].expected.as_ref().expect("pinned expectation");
+        assert_eq!(exp.min_tcb_sevsnp, None);
+        assert_eq!(exp.transparency_log_key, None);
+    }
+
+    #[test]
+    fn malformed_transparency_log_key_fails_the_path_closed() {
+        let m = "ab".repeat(48);
+        // Not hex → whole path rejected (fail closed, no silently-dropped key).
+        let bad_hex = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","transparency_log_key":"zz"}}]}}"#
+        );
+        assert!(path_from_response(bad_hex.as_bytes(), NO_PINS).is_err(), "non-hex key must fail");
+        // Right hex, wrong length (not 32 bytes) → rejected too.
+        let wrong_len = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","transparency_log_key":"abcd"}}]}}"#
+        );
+        assert!(
+            path_from_response(wrong_len.as_bytes(), NO_PINS).is_err(),
+            "a non-32-byte key must fail"
+        );
     }
 
     #[test]

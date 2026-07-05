@@ -1,7 +1,8 @@
 //! The MASQUE / CONNECT-IP server: a quiche QUIC + HTTP/3 accept loop that answers the
 //! extended `CONNECT` with `200` and shuttles IP packets between QUIC DATAGRAMs and the
-//! node's TUN. Single-threaded loop (quiche `Connection` is `!Sync`); Phase 1 focuses on a
-//! single client (the demo). No identifying state is persisted.
+//! node's TUN. Single-threaded loop (quiche `Connection` is `!Sync`); serves many clients
+//! concurrently, each assigned a unique inner IP from an address pool and routed by destination IP
+//! (see `crate::pool` + `client_routes`). No identifying state is persisted.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
