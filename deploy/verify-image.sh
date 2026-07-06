@@ -3,8 +3,9 @@
 #
 # Proves a specific image *by digest* came from the project's signed release pipeline BEFORE you run
 # it: a cosign keyless signature (Fulcio identity == our release-images workflow), a required
-# CycloneDX SBOM attestation, and (warn-only) SLSA build provenance. PD-5 made operational — you
-# verify, you don't trust.
+# CycloneDX SBOM attestation, and (warn-only) SLSA build provenance. The two attestations are
+# GitHub attestations verified with `gh attestation verify`; the signature is cosign keyless.
+# PD-5 made operational — you verify, you don't trust. Requires: cosign (>= v2.4) and gh (authed).
 #
 # Usage:  ./deploy/verify-image.sh ghcr.io/nil-vpn/nil-node@sha256:<64-hex-digest>
 # A mutable tag is REFUSED: pin and verify the immutable @sha256: digest you will actually deploy.
@@ -33,6 +34,7 @@ printf '%s' "$digest" | grep -qE '^[0-9a-f]{64}$' \
   || die "malformed digest in '$IMG' (need @sha256:<64 lowercase hex>)"
 
 command -v cosign >/dev/null 2>&1 || die "cosign not found — install sigstore/cosign (>= v2.4)"
+command -v gh >/dev/null 2>&1 || die "gh not found — install the GitHub CLI (verifies the SBOM + provenance attestations)"
 
 # Escape regex dots so the identity matches LITERALLY (a bare '.' is a regex wildcard — a
 # security verifier must not widen the trusted identity). The trailing @refs/ stays open so any
@@ -55,25 +57,21 @@ else
 fi
 
 echo; echo "==> [2/3] SBOM attestation — CycloneDX (required)"
-if cosign verify-attestation --type cyclonedx \
-      --certificate-identity-regexp "$IDENTITY_RE" \
-      --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-      "$IMG" >/dev/null 2>&1; then
-  echo "  PASS: CycloneDX SBOM attestation present + verified"
+if gh attestation verify "oci://$IMG" --repo "$NIL_REPO" \
+      --signer-workflow "$NIL_REPO/$NIL_WORKFLOW" \
+      --predicate-type https://cyclonedx.org/bom >/dev/null 2>&1; then
+  echo "  PASS: CycloneDX SBOM attestation present + verified (from the release workflow)"
 else
   echo "  FAIL: missing / invalid CycloneDX SBOM attestation"; fail=1
 fi
 
 echo; echo "==> [3/3] SLSA build provenance (warn-only)"
-if cosign verify-attestation --type slsaprovenance \
-      --certificate-identity-regexp "$IDENTITY_RE" \
-      --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-      "$IMG" >/dev/null 2>&1; then
-  echo "  PASS: SLSA provenance attestation verified"
+if gh attestation verify "oci://$IMG" --repo "$NIL_REPO" \
+      --signer-workflow "$NIL_REPO/$NIL_WORKFLOW" >/dev/null 2>&1; then
+  echo "  PASS: SLSA build provenance verified (from the release workflow)"
 else
-  echo "  WARN: cosign did not verify SLSA provenance (it is attached as a GitHub attestation)."
-  echo "        Confirm it directly with:"
-  echo "          gh attestation verify oci://$IMG --repo $NIL_REPO"
+  echo "  WARN: could not verify SLSA provenance via gh (needs gh auth + network)."
+  echo "        Retry:  gh attestation verify oci://$IMG --repo $NIL_REPO"
 fi
 
 echo

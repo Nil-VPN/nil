@@ -154,14 +154,18 @@ jobs:
           output-file: sbom-${{ matrix.image }}.cdx.json
           artifact-name: sbom-${{ matrix.image }}.cdx.json
 
-      - name: cosign attest SBOM (CycloneDX, by digest)
+      - name: Attest CycloneDX SBOM (GitHub attestation — coexists with provenance)
         if: steps.mode.outputs.push == 'true'
-        env:
-          COSIGN_YES: "true"
-          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
-          IMAGE: ${{ matrix.image }}
-        run: |
-          cosign attest --type cyclonedx --predicate "sbom-${IMAGE}.cdx.json" "$REF"
+        # NOTE: use actions/attest-sbom (same mechanism as attest-build-provenance below) rather than
+        # `cosign attest`. Mixing cosign's .att storage with the GitHub attest actions on the same
+        # image caused the provenance step to CLOBBER the cosign SBOM (both exited 0, but only
+        # provenance survived). Both first-party attest actions coexist on one subject.
+        uses: actions/attest-sbom@v2
+        with:
+          subject-name: ${{ steps.ref.outputs.repo }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom-${{ matrix.image }}.cdx.json
+          push-to-registry: true
 
       - name: SLSA build provenance attestation
         if: steps.mode.outputs.push == 'true'
