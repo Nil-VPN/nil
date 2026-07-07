@@ -1,0 +1,84 @@
+# Host-safe multi-client verification: ONE MASQUE/CONNECT-IP node serving THREE concurrent
+# headless clients, all in throwaway containers on a private bridge. Nothing touches the host's
+# networking.
+#   cd deploy && ./verify-multiclient.sh
+#
+# Why this exists (ADR-0005): the node was once single-client (every client hardcoded the same
+# inner 10.74.0.2, and replies routed to "the first tunnel_up client"), so a second paying user
+# would have collided with / stolen the first's traffic. The node now hands each concurrent client
+# a UNIQUE inner /32 from an address pool (RFC 9484 ADDRESS_ASSIGN subset, `nil-node/src/pool.rs`)
+# and dispatches every internet reply by its inner DESTINATION IP (`client_routes` in
+# `nil-node/src/server.rs`). This harness is the end-to-end proof that a single node serves many
+# clients with correctly ISOLATED per-client routing — the concurrency guarantee a paid launch needs.
+#
+# All three clients dial the SAME node. Each is a plain single-hop tunnel (NW_FORCE_SINGLE_HOP=1 —
+# this test is about the node's multi-client capacity, not trust-split), pinned to the node's
+# synthetic measurement so RA-TLS appraisal runs on every client. Same image as the other harnesses
+# (built with `synthetic-attest`, so the node can attest without real TEE hardware).
+
+x-client-base: &client-base
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  command: ["sleep", "infinity"] # the tunnels + curls + assertions are driven by the script
+  cap_add: ["NET_ADMIN"]
+  devices: ["/dev/net/tun"]
+  depends_on: [node]
+
+services:
+  node:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    command: ["nil-node"]
+    environment:
+      - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_EGRESS=eth0
+      - NW_NODE_ROLE=exit
+      # Synthetic dev measurement the node attests to (image built with `synthetic-attest`); each
+      # client pins this exact value, so RA-TLS appraisal accepts on every concurrent connection.
+      - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_NODE_TEE=sev-snp
+      - NW_ALLOW_UNGRANTED=1
+      - RUST_LOG=info,nil_node=debug
+    cap_add: ["NET_ADMIN"]
+    devices: ["/dev/net/tun"]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    networks:
+      nilnet:
+        ipv4_address: 10.85.0.10
+
+  client1:
+    <<: *client-base
+    environment: &client-env
+      - NW_NODE_HOST=10.85.0.10
+      - NW_NODE_PORT=443
+      - NW_EXPECTED_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
+      - NW_EXPECTED_TEE=sev-snp
+      - NW_FORCE_SINGLE_HOP=1
+      - RUST_LOG=info,nil_datapath=debug,nil_transport=debug
+    networks:
+      nilnet:
+        ipv4_address: 10.85.0.31
+
+  client2:
+    <<: *client-base
+    environment: *client-env
+    networks:
+      nilnet:
+        ipv4_address: 10.85.0.32
+
+  client3:
+    <<: *client-base
+    environment: *client-env
+    networks:
+      nilnet:
+        ipv4_address: 10.85.0.33
+
+networks:
+  nilnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.85.0.0/24

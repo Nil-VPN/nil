@@ -28,3 +28,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: token -> redeem(200/409) -> 3-hop attested onion -> egress
         run: bash deploy/verify-e2e.sh
+
+  # ADR-0005 concurrency proof: one node, three concurrent clients, each assigned a unique inner
+  # IP (ADDRESS_ASSIGN) with replies routed by inner destination IP — no collision, no cross-talk.
+  multiclient:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: one node serves three concurrent isolated clients
+        run: bash deploy/verify-multiclient.sh
