@@ -27,7 +27,7 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 authors = ["Nil VPN"]
-homepage = "https://nilvpn.com"
+homepage = "https://nilvpn.net"
 rust-version = "1.77"
 
 # Versions pinned once, here, so every crate stays in lockstep.

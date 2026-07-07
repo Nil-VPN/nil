@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 
 /// Live production defaults (closed alpha). A fresh install already points at the real infra; the
 /// node is reached THROUGH the Coordinator's redeemed/attested path, never hardcoded here.
-const DEFAULT_PORTAL_URL: &str = "https://api.nilvpn.com";
-const DEFAULT_COORDINATOR_URL: &str = "https://ctrl.nilvpn.com";
+const DEFAULT_PORTAL_URL: &str = "https://api.nilvpn.net";
+const DEFAULT_COORDINATOR_URL: &str = "https://ctrl.nilvpn.net";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientConfig {
@@ -234,8 +234,8 @@ mod tests {
     #[test]
     fn live_defaults_point_at_production() {
         let d = ClientConfig::live_defaults();
-        assert!(d.portal_url.contains("api.nilvpn.com"));
-        assert!(d.coordinator_url.contains("ctrl.nilvpn.com"));
+        assert!(d.portal_url.contains("api.nilvpn.net"));
+        assert!(d.coordinator_url.contains("ctrl.nilvpn.net"));
         assert!(d.kill_switch, "kill-switch on by default (fail-closed)");
         assert!(
             d.expected_measurement.is_empty(),

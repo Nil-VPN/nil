@@ -46,8 +46,8 @@ pub fn security_router() -> Router {
 /// The `security.txt` body. Contact + canonical base are env-overridable so ops can point them at
 /// the real domain without a code change.
 fn security_txt_body(now: u64) -> String {
-    let base = env_or("NW_SECURITY_CANONICAL_BASE", "https://nilvpn.com");
-    let contact = env_or("NW_SECURITY_CONTACT", "mailto:security@nilvpn.com");
+    let base = env_or("NW_SECURITY_CANONICAL_BASE", "https://nilvpn.net");
+    let contact = env_or("NW_SECURITY_CONTACT", "mailto:security@nilvpn.net");
     let expires = iso8601_utc(now.saturating_add(EXPIRES_WINDOW_SECS));
     let mut body = String::new();
     body.push_str("# NIL VPN — security disclosure. Lawful by posture, empty by design.\n");
@@ -128,8 +128,8 @@ mod tests {
         // now = 1e9 → Expires must be strictly later, well-formed, and present with Contact/Canonical.
         let now = 1_000_000_000u64;
         let body = security_txt_body(now);
-        assert!(body.contains("Contact: mailto:security@nilvpn.com"), "default contact present");
-        assert!(body.contains("Canonical: https://nilvpn.com/.well-known/security.txt"));
+        assert!(body.contains("Contact: mailto:security@nilvpn.net"), "default contact present");
+        assert!(body.contains("Canonical: https://nilvpn.net/.well-known/security.txt"));
         let expires_line = body
             .lines()
             .find(|l| l.starts_with("Expires: "))

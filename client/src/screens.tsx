@@ -449,7 +449,7 @@ export function SubscribeScreen({
   );
 }
 
-/** Settings: operator endpoints + toggles. "Restore live defaults" points at api/ctrl.nilvpn.com. */
+/** Settings: operator endpoints + toggles. "Restore live defaults" points at api/ctrl.nilvpn.net. */
 export function SettingsScreen({
   onError,
   onBack,
@@ -572,9 +572,9 @@ export function SettingsScreen({
       </button>
       <button
         className="link"
-        onClick={() => set({ portal_url: "https://api.nilvpn.com", coordinator_url: "https://ctrl.nilvpn.com" })}
+        onClick={() => set({ portal_url: "https://api.nilvpn.net", coordinator_url: "https://ctrl.nilvpn.net" })}
       >
-        Restore live defaults (nilvpn.com)
+        Restore live defaults (nilvpn.net)
       </button>
       <button className="link" onClick={onBack}>
         ← Back

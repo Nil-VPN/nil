@@ -3,7 +3,7 @@
 #
 # Drives the EXACT engine path the Tauri GUI uses (anonymous account -> buy token ->
 # attested connect -> egress proof -> clean disconnect) on real macOS against the LIVE
-# infra (api/ctrl.nilvpn.com + the real SEV-SNP node). Reaching E2E-OK proves the full
+# infra (api/ctrl.nilvpn.net + the real SEV-SNP node). Reaching E2E-OK proves the full
 # chain end to end: token redeemed at the Coordinator, the node's hardware attestation
 # verified against the pinned measurement, the utun device up, routing + kill-switch armed.
 #
@@ -23,8 +23,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${NW_MACOS_E2E_ENV:-$ROOT/deploy/env/macos-e2e.env}"
 [ -f "$ENV_FILE" ] && . "$ENV_FILE"
 COMP_ID="${1:-${NW_PAYMENT_ID:-alpha-001}}"
-PORTAL_URL="${PORTAL_URL:-https://api.nilvpn.com}"
-COORD_URL="${NW_COORDINATOR_URL:-https://ctrl.nilvpn.com}"
+PORTAL_URL="${PORTAL_URL:-https://api.nilvpn.net}"
+COORD_URL="${NW_COORDINATOR_URL:-https://ctrl.nilvpn.net}"
 NODE_HOST="${NW_NODE_HOST:-}"
 NODE_PORT="${NW_NODE_PORT:-443}"
 MEAS="${NW_EXPECTED_MEASUREMENT:-}"
