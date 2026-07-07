@@ -48,7 +48,7 @@ GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown)
 PRED="$OUT/predicate.json"
 cat > "$PRED" <<JSON
 {
-  "buildType": "https://nilvpn.com/reproducible-build/v1",
+  "buildType": "https://nilvpn.net/reproducible-build/v1",
   "builder": { "id": "https://github.com/Nil-VPN/nil/.github/workflows/release-attest.yml" },
   "measurement": "$MEASUREMENT",
   "measurementKind": "dev-binary-sha256",

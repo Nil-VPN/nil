@@ -18,8 +18,8 @@ import {
 } from "./screens";
 
 const liveCfg: PortalConfig = {
-  portal_url: "https://api.nilvpn.com",
-  coordinator_url: "https://ctrl.nilvpn.com",
+  portal_url: "https://api.nilvpn.net",
+  coordinator_url: "https://ctrl.nilvpn.net",
   monero_address: "",
   expected_measurement: "",
   expected_tee: "sev-snp",
@@ -102,15 +102,15 @@ describe("BuyTokensScreen", () => {
 });
 
 describe("SettingsScreen", () => {
-  it("restore live defaults sets the nilvpn.com endpoints", async () => {
+  it("restore live defaults sets the nilvpn.net endpoints", async () => {
     routeInvoke({
       get_config: { ...liveCfg, portal_url: "http://127.0.0.1:8080", coordinator_url: "" },
     });
     render(<SettingsScreen onError={() => {}} onBack={() => {}} />);
     expect(await screen.findByDisplayValue("http://127.0.0.1:8080")).toBeInTheDocument();
     fireEvent.click(screen.getByText(/restore live defaults/i));
-    expect(await screen.findByDisplayValue("https://api.nilvpn.com")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("https://ctrl.nilvpn.com")).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("https://api.nilvpn.net")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("https://ctrl.nilvpn.net")).toBeInTheDocument();
   });
 });
 
