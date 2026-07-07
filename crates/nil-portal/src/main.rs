@@ -16,6 +16,7 @@ mod hsm;
 mod mint;
 mod monero;
 mod ratelimit;
+mod security;
 mod state;
 mod store;
 mod subscription;
@@ -358,7 +359,8 @@ async fn main() -> Result<()> {
         .merge(token_router(token_state.clone()))
         .merge(billing::billing_router(token_state))
         .merge(subscription_router(sub_state))
-        .merge(mint_router(mint_state));
+        .merge(mint_router(mint_state))
+        .merge(security::security_router());
     #[cfg(feature = "card-payments")]
     if let Some((card, secret)) = card_rail {
         app = app.merge(cards::cards_router(card, secret));

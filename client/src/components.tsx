@@ -66,6 +66,7 @@ export function HonestLimits() {
         <li><strong>Not anonymity.</strong> A VPN is not Tor; the exit node still sees your destinations.</li>
         <li><strong>Single-hop (alpha):</strong> the one node sees your IP and your destination — not yet trust-split across operators.</li>
         <li><strong>Attestation caveat (TEE.Fail, Oct 2025):</strong> an attacker with physical memory access to a node could forge a report. Vendor/jurisdiction diversity across hops is the mitigation; the alpha is single-hop, so this is a real limit.</li>
+        <li><strong>Client builds not yet reproducible (desktop/iOS):</strong> you can independently rebuild and verify the node's binary against its published measurement, but the desktop and iOS app builds aren't reproducible yet (Android is). Until then, trust in the app is by signature, not by independent rebuild.</li>
         <li><strong>Lose your 7-word phrase → lose the account.</strong> There's no email reset by design.</li>
       </ul>
     </div>
