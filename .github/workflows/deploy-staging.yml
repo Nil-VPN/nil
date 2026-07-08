@@ -1,0 +1,200 @@
+# Continuous deployment to STAGING — the agile loop's fast half.
+#
+# When `ci` succeeds on main, build the three service images from that commit, push them to GHCR
+# (:staging + :sha-<commit>, cosign-signed keyless), and auto-deploy the Portal + Coordinator to the
+# staging hosts by driving the host-side deploy.sh (canary + auto-rollback). The DATA-PLANE NODE is
+# NOT auto-deployed here: a node image change moves the attested guest-launch measurement, which is a
+# checkpoint that must be re-pinned on the staging CVM — that stays an operator step
+# (deploy/stage-node-repin.sh; see the CI/CD runbook). Staging runs Monero stagenet + Paddle sandbox,
+# so no real money or user identity is involved.
+#
+# STAGING ONLY. Production is never deployed from CI (PD-7: no standing CI->prod path); prod is an
+# operator-run promotion of a signed v* release — see deploy-production.yml + deploy/deploy.sh.
+#
+# Inert until the `staging` Environment secrets are provisioned (STAGING_SSH_KEY, STAGING_VPS,
+# STAGING_CANARY_PORTAL, STAGING_CANARY_COORD). No hostnames/IPs live in this file — all via secrets.
+#
+# Security: consumes no untrusted free-text; every expression used in a run: block is passed via env:.
+name: deploy-staging
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write      # push staging images to GHCR
+  id-token: write      # keyless cosign sign
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false   # let an in-flight deploy finish (canary+rollback) rather than cancel mid-SSH
+
+jobs:
+  # Build + push the three images from the exact commit CI passed on.
+  build:
+    # Only proceed when the upstream CI run succeeded (fail-closed on a manual dispatch too).
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: nil-portal
+            dockerfile: deploy/Dockerfile.portal
+          - image: nil-coordinator
+            dockerfile: deploy/Dockerfile.coordinator
+          - image: nil-node
+            dockerfile: deploy/Dockerfile.node
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Build the commit CI validated (workflow_run defaults to the default branch tip otherwise).
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Resolve commit + lowercase image ref
+        id: ref
+        env:
+          OWNER: ${{ github.repository_owner }}
+          IMAGE: ${{ matrix.image }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "repo=ghcr.io/${owner}/${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "sha=${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: SOURCE_DATE_EPOCH (HEAD commit time)
+        id: sde
+        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata (staging tags)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.ref.outputs.repo }}
+          tags: |
+            type=raw,value=staging
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=${{ matrix.image }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.ref.outputs.sha }}
+
+      - name: Build + push (staging)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.value }}
+          provenance: false
+
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v2.4.1
+
+      - name: cosign sign (keyless, by digest)
+        env:
+          COSIGN_YES: "true"
+          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+        run: cosign sign "$REF"
+
+  # Auto-deploy Portal + Coordinator to the staging VPS via the host-side deploy.sh (canary + rollback).
+  deploy-planes:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: staging
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        svc: [portal, coordinator]
+    steps:
+      - name: Preflight — staging Environment secrets present
+        env:
+          VPS: ${{ secrets.STAGING_VPS }}
+          KEY: ${{ secrets.STAGING_SSH_KEY }}
+          CANARY_PORTAL: ${{ secrets.STAGING_CANARY_PORTAL }}
+          CANARY_COORD: ${{ secrets.STAGING_CANARY_COORD }}
+        run: |
+          missing=""
+          [ -n "$VPS" ] || missing="$missing STAGING_VPS"
+          [ -n "$KEY" ] || missing="$missing STAGING_SSH_KEY"
+          [ -n "$CANARY_PORTAL" ] || missing="$missing STAGING_CANARY_PORTAL"
+          [ -n "$CANARY_COORD" ] || missing="$missing STAGING_CANARY_COORD"
+          if [ -n "$missing" ]; then
+            echo "staging Environment not provisioned — set:$missing (see the CI/CD runbook)"; exit 1
+          fi
+
+      - name: Log in to GHCR (resolve pushed digest)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Deploy ${{ matrix.svc }} to staging (host-side deploy.sh, canary + rollback)
+        env:
+          SVC: ${{ matrix.svc }}
+          OWNER: ${{ github.repository_owner }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          VPS: ${{ secrets.STAGING_VPS }}
+          KEY: ${{ secrets.STAGING_SSH_KEY }}
+          CANARY_PORTAL: ${{ secrets.STAGING_CANARY_PORTAL }}
+          CANARY_COORD: ${{ secrets.STAGING_CANARY_COORD }}
+          DEPLOY_DIR: ${{ secrets.STAGING_DEPLOY_DIR }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          repo="ghcr.io/${owner}/nil-${SVC}"
+          # Resolve the immutable digest of the image we just pushed for this commit.
+          digest="$(docker buildx imagetools inspect "${repo}:sha-${HEAD_SHA}" --format '{{.Manifest.Digest}}')"
+          case "$digest" in sha256:*) : ;; *) echo "could not resolve digest for ${repo}:sha-${HEAD_SHA}"; exit 1 ;; esac
+          img="${repo}@${digest}"
+          if [ "$SVC" = portal ]; then canary="$CANARY_PORTAL"; else canary="$CANARY_COORD"; fi
+          dir="${DEPLOY_DIR:-/root/nil/deploy}"
+
+          # Private SSH key (staging Environment secret) → run the host-side deploy.sh on the box.
+          # Trap-clean the key so it's removed even if ssh fails under `set -e`.
+          umask 077; keyfile="$(mktemp)"; trap 'rm -f "$keyfile"' EXIT
+          printf '%s\n' "$KEY" > "$keyfile"
+          # NW_VERIFY=0: staging pulls the digest we just built in this run; strict release-identity
+          # verification is a prod-only gate (deploy-production.yml + operator deploy.sh keep it).
+          ssh -i "$keyfile" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "$VPS" \
+            "NW_DEPLOY_SSH=local NW_VERIFY=0 NW_CANARY_URL='$canary' bash '$dir/deploy.sh' '$SVC' '$img' --apply"
+
+  # Post-deploy smoke: the staging control-surface is healthy end to end.
+  smoke:
+    needs: deploy-planes
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Health check staging Portal + Coordinator
+        env:
+          CANARY_PORTAL: ${{ secrets.STAGING_CANARY_PORTAL }}
+          CANARY_COORD: ${{ secrets.STAGING_CANARY_COORD }}
+        run: |
+          set -e
+          for url in "$CANARY_PORTAL" "$CANARY_COORD"; do
+            code="$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 10 "$url" || true)"
+            echo "  $url -> ${code:-none}"
+            [ "$code" = 200 ] || { echo "staging health check failed for $url"; exit 1; }
+          done
+          echo "staging control surface healthy ✅ (point a client at staging to exercise the datapath)"
