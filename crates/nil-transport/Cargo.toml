@@ -80,8 +80,8 @@ rcgen = { workspace = true }
 # the TLS ClientHello. Never in a release build.
 hkdf = { workspace = true }
 sha2 = { workspace = true }
-aes = "0.8"
-aes-gcm = "0.10"
+aes = "0.9"
+aes-gcm = "0.11"
 # DAITA driver test: a seeded RNG + a hand-built defense machine (enum-map must match maybenot's 2.7).
-rand = "0.9"
+rand = "0.10"
 enum-map = "2.7"
