@@ -6,7 +6,7 @@
 # fails closed (never an unattested tunnel). This image is NOT the Docker test harness
 # (deploy/Dockerfile, which uses synthetic-attest); it is the thing that runs in the cloud CVM.
 #
-# Operator runbook: deploy/PRODUCTION-NODE.md (configfs-TSM mount, VCEK/collateral provisioning,
+# Operator runbook (configfs-TSM mount, VCEK/collateral provisioning,
 # capturing + pinning the real guest-launch measurement, required env + caps).
 #
 # The builder stage is DELIBERATELY identical to deploy/Dockerfile.repro (same toolchain,
@@ -26,7 +26,10 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     TZ=UTC \
     RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY client/src-tauri/ ./client/src-tauri/
+COPY client/trust/ ./client/trust/
 # Hermetic, network-free compile: vendor every dep (deterministic from Cargo.lock + immutable
 # crates.io) into ./vendor, point cargo at it, and build OFFLINE — no cache mounts, so each clean
 # build is identical. With codegen-units=1 (Cargo.toml), the pinned toolchain (rust-toolchain.toml),
@@ -42,15 +45,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 iptables procps ethtool ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /nil-node /usr/local/bin/nil-node
 
-# Runtime contract (enforced by the guest provisioning, see deploy/PRODUCTION-NODE.md):
+# Runtime contract (enforced by the guest provisioning):
 #   /sys/kernel/config/tsm   configfs-TSM mounted in the guest (real SEV-SNP/TDX reports)
 #   NW_NODE_BIND             listen addr, e.g. 0.0.0.0:443
+#   NW_NODE_ID               stable registry id for this node (lowercase ASCII slug)
 #   NW_NODE_EGRESS           egress interface, e.g. eth0
 #   NW_NODE_TEE              sev-snp | tdx
 #   NW_NODE_MEASUREMENT      48-byte hex guest-launch measurement (captured on first real boot,
 #                            then pinned in the Coordinator registry)
-#   NW_GRANT_KEY_FILE        shared Coordinator→node grant key file (hex); required in production
+#   NW_NODE_TLS_KEY_FILE     owner-only persistent PKCS#8 node key created with
+#                            `nil-node tls-keygen PATH`; pin its printed tls_spki_sha256 in registry
+#   NW_GRANT_VERIFY_KEYS_FILE Ed25519 Coordinator PUBLIC-key ring (one lowercase key/line)
+#   NW_GRANT_REALM           deployment-specific grant realm; must match the Coordinator
 #   NW_VCEK_PATH             AMD VCEK DER (SEV-SNP) — fetched once from AMD KDS at provisioning
 #   NW_TDX_COLLATERAL        Intel DCAP collateral JSON (TDX) — from Intel PCS
+# The Coordinator's private grant-signing seed must never be provisioned on a node.
 # Needs CAP_NET_ADMIN + /dev/net/tun. Keeps NO disk logs (stdout only) — do not mount a log volume.
 ENTRYPOINT ["nil-node"]

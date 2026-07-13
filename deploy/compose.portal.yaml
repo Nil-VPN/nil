@@ -1,0 +1,207 @@
+# ===========================================================================
+# nil-portal (Business plane) — production stack
+# ===========================================================================
+# SECURITY STATUS: production remains NO-GO. This reviewed example intentionally has no mutable
+# Caddy default. Set CADDY_IMAGE to the exact approved @sha256 reference recorded in a future signed
+# release manifest; no such approved digest is currently published by this repository.
+# Three services in ONE trust domain (the Business plane), separate from the
+# Coordinator and the Node:
+#
+#   caddy              TLS-terminating reverse proxy. Gets a Let's Encrypt cert
+#                      for api.<domain> automatically and proxies HTTPS down to
+#                      nil-portal's plain HTTP. The ONLY service with published
+#                      ports (80/443). nil-portal is never exposed directly.
+#   portal             nil-portal — Privacy Pass issuer + PII-free accounts.
+#                      Plain HTTP on :8080, reachable only on the internal net.
+#   monero-wallet-rpc  self-hosted watch-only wallet the Portal polls for
+#                      confirmed payments. Bound to loopback inside its own
+#                      container; portal shares its network namespace and reaches
+#                      it at 127.0.0.1.
+#
+# Usage:
+#   cp deploy/env/portal.env.example deploy/env/portal.env   # then fill TODOs
+#   # Provision the non-extractable RSA issuer key in a reviewed HSM under the exact label/slot in
+#   # portal.env. Install its approved, release-manifest-hashed PKCS#11 module on the host; do not
+#   # copy/export the issuer private key. See deploy/PORTAL-HSM.md.
+#   mkdir -p deploy/secrets
+#   install -m 0400 /secure/provisioning/portal_hsm_pin deploy/secrets/portal_hsm_pin
+#   openssl rand -out deploy/secrets/portal_result_key.bin 32 && \
+#       chmod 600 deploy/secrets/portal_result_key.bin
+#   openssl rand -base64 48 > deploy/secrets/monero_wallet_password && \
+#       chmod 0400 deploy/secrets/monero_wallet_password
+#   sudo chown 10001:10001 deploy/secrets/portal_hsm_pin \
+#       deploy/secrets/portal_result_key.bin
+#   sudo chmod 0400 deploy/secrets/portal_hsm_pin deploy/secrets/portal_result_key.bin
+#   # Stop every old Portal instance, preserve issued.log, then set
+#   # NW_ISSUANCE_STOP_THE_WORLD_CUTOVER=1 in portal.env. Mixed versions are issuance-unsafe.
+#   # Preserve NW_ISSUED_PATH and NW_SUB_ACTIVATED_PATH during upgrades. The supplied image seeds
+#   # empty files into a brand-new Docker named volume; custom volume/orchestrator layouts must
+#   # provision them explicitly. Portal opens both read-only and refuses a missing fence.
+#   docker compose --env-file deploy/env/portal.env -f deploy/compose.portal.yaml up -d --build
+#   docker compose -f deploy/compose.portal.yaml logs -f portal   # grab token_pubkey=...
+#
+# Verify TLS + issuer pubkey once up (replace the host):
+#   curl -fsS https://api.example.com/v1/tokens/pubkey
+# That hex public_der is what you pin as the Coordinator's NW_TOKEN_PUBKEY.
+# ===========================================================================
+
+x-bounded-operational-logs: &bounded-operational-logs
+  # Application/wallet operational output is NOT assumed anonymous. Keep the local Docker log
+  # finite; host backups, support tooling, and provider collection need separate retention policy.
+  driver: local
+  options:
+    max-size: "5m"
+    max-file: "2"
+
+services:
+  caddy:
+    image: ${CADDY_IMAGE:?set CADDY_IMAGE to an approved immutable caddy@sha256 reference}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    cap_add: ["NET_BIND_SERVICE"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 128
+    mem_limit: ${CADDY_MEMORY_LIMIT:-256m}
+    cpus: ${CADDY_CPU_LIMIT:-1.0}
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    ports:
+      - "80:80"      # ACME HTTP-01 challenge + redirect to HTTPS
+      - "443:443"    # public HTTPS for api.<domain>
+      - "443:443/udp" # HTTP/3 (QUIC), optional but Caddy enables it by default
+    environment:
+      # Consumed by the Caddyfile (templated below) for the site name + ACME contact.
+      - PORTAL_PUBLIC_HOST=${PORTAL_PUBLIC_HOST}
+      - ACME_EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data      # persisted Let's Encrypt certs + account key
+      - caddy_config:/config
+    depends_on:
+      - portal
+    # HTTP access logging is absent from the Caddyfile. Discard Caddy's remaining operational
+    # stdout/stderr too; a troubleshooting override is a sensitive, separately reviewed surface.
+    logging:
+      driver: "none"
+    networks:
+      portalnet:
+        # The application accepts X-Nil-Client-IP only when the direct socket peer is this exact
+        # address. Keep it identical to NW_TRUSTED_PROXY_IP in portal.env.
+        ipv4_address: ${NW_TRUSTED_PROXY_IP:?set the fixed Caddy IP}
+
+  portal:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.portal
+    image: nil-portal:prod
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: ${PORTAL_MEMORY_LIMIT:-512m}
+    cpus: ${PORTAL_CPU_LIMIT:-2.0}
+    tmpfs:
+      - /tmp:size=32m,mode=1777,noexec,nosuid,nodev
+    # NO published ports: only Caddy (same internal network) reaches it.
+    env_file:
+      - env/portal.env
+    environment:
+      # Force the in-container bind regardless of the binary's 127.0.0.1 default
+      # so the proxy can reach it across the internal network.
+      - NW_PORTAL_ADDR=0.0.0.0:8080
+      # Release Portal signing is HSM-only. The module is code (not a private key) mounted read-only
+      # below; the PIN value arrives only through the Docker secret file.
+      - NW_TOKEN_HSM_MODULE=/opt/nil/pkcs11/provider.so
+      - NW_TOKEN_HSM_PIN_FILE=/run/secrets/portal_hsm_pin
+      - NW_TOKEN_HSM_KEY_LABEL=${NW_TOKEN_HSM_KEY_LABEL:?set the exact provisioned issuer key label}
+      - NW_TOKEN_HSM_SLOT=${NW_TOKEN_HSM_SLOT:?set the exact numeric token slot id}
+    volumes:
+      # Durable account/atomic-activation snapshot, checkout/issuance/binding replay state, and the
+      # read-only pre-atomic activation migration fence all live under this path. See portal.env.example
+      # for the fence retirement window; the current production build still requires its path.
+      - portal_state:/var/lib/nil-portal
+      # Approved vendor PKCS#11 client module. Its exact hash and ABI/dependencies are release
+      # inputs. The issuer PRIVATE key stays non-extractable inside the HSM.
+      - ${PORTAL_PKCS11_MODULE_FILE:?set the approved host PKCS#11 module path}:/opt/nil/pkcs11/provider.so:ro
+      # Separate shared AEAD key for encrypted completed-result payloads. Every replica using the
+      # same durable Store must mount the same exact 32 raw bytes.
+      - ./secrets/portal_result_key.bin:/etc/nil/portal_result_key.bin:ro
+    secrets:
+      - source: portal_hsm_pin
+        target: portal_hsm_pin
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    depends_on:
+      - monero-wallet-rpc
+    logging: *bounded-operational-logs
+    # Share wallet-rpc's network namespace so NW_MONERO_RPC=http://127.0.0.1:18082
+    # is a real loopback URL accepted by nil-portal's plaintext guard.
+    network_mode: "service:monero-wallet-rpc"
+
+  monero-wallet-rpc:
+    # This external dependency is also a release input. No approved digest is recorded yet, so the
+    # stack has no mutable fallback and refuses interpolation until an operator supplies one.
+    image: ${MONERO_WALLET_RPC_IMAGE:?set MONERO_WALLET_RPC_IMAGE to an approved immutable @sha256 reference}
+    restart: unless-stopped
+    read_only: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    pids_limit: 256
+    mem_limit: ${MONERO_WALLET_MEMORY_LIMIT:-512m}
+    cpus: ${MONERO_WALLET_CPU_LIMIT:-2.0}
+    tmpfs:
+      - /tmp:size=32m,mode=1777,noexec,nosuid,nodev
+    # No published wallet-rpc ports: bound to loopback inside this namespace. The
+    # portal process shares this namespace, and Caddy reaches portal's :8080 via
+    # this service's compose network alias.
+    command:
+      - --rpc-bind-ip=127.0.0.1
+      - --rpc-bind-port=18082
+      - --disable-rpc-login           # unauthenticated: safe only because it is loopback-only
+      - --daemon-address=${MONEROD_RPC}
+      - --wallet-file=/wallet/${MONERO_WALLET_FILE}
+      # Monero documents --password-file for unattended wallet access. The secret value therefore
+      # never appears in the Compose environment, rendered command, or /proc/<pid>/cmdline.
+      - --password-file=/run/secrets/monero_wallet_password
+      - --trusted-daemon
+      - --log-level=0
+      - --log-file=/dev/null
+    volumes:
+      # TODO: create the watch-only wallet (address + private view key) into this
+      #       volume ONCE with monero-wallet-cli before first boot. View-only: it
+      #       can see incoming payments but cannot spend.
+      - monero_wallet:/wallet
+    secrets:
+      - monero_wallet_password
+    logging: *bounded-operational-logs
+    networks:
+      portalnet:
+        # nil-portal shares this namespace/address and Caddy resolves the explicit `portal` alias.
+        ipv4_address: ${PORTAL_BACKEND_IP:-172.30.10.3}
+        aliases: [portal]
+
+volumes:
+  portal_state:    # account + billing replay/idempotency state (durable)
+  monero_wallet:   # watch-only wallet files
+  caddy_data:      # Let's Encrypt certs (durable — avoids ACME rate limits on restart)
+  caddy_config:
+
+secrets:
+  # HSM user PIN only; never put the value in portal.env or process arguments. Local Compose mounts
+  # this file read-only at /run/secrets/portal_hsm_pin for the fixed uid/gid 10001 Portal process.
+  portal_hsm_pin:
+    file: ${PORTAL_HSM_PIN_FILE:?set the host path to the owner-only HSM PIN file}
+  # Local Compose mounts this file at /run/secrets/monero_wallet_password. Provision it owner-only
+  # on the host and verify the approved wallet image's runtime UID can read the rendered mount.
+  monero_wallet_password:
+    file: ${MONERO_WALLET_PASSWORD_FILE:?set the host path to the owner-only wallet password file}
+
+networks:
+  portalnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${PORTAL_NETWORK_SUBNET:-172.30.10.0/24}

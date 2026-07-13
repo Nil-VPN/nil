@@ -2,14 +2,14 @@
 #
 # When `ci` succeeds on main, build the three service images from that commit, push them to GHCR
 # (:staging + :sha-<commit>, cosign-signed keyless), and auto-deploy the Portal + Coordinator to the
-# staging hosts by driving the host-side deploy.sh (canary + auto-rollback). The DATA-PLANE NODE is
+# staging hosts by driving the host-side deploy step (canary + auto-rollback). The DATA-PLANE NODE is
 # NOT auto-deployed here: a node image change moves the attested guest-launch measurement, which is a
 # checkpoint that must be re-pinned on the staging CVM — that stays an operator step
-# (deploy/stage-node-repin.sh; see the CI/CD runbook). Staging runs Monero stagenet + Paddle sandbox,
+# (re-pinned out of band by the operator). Staging runs Monero stagenet + Paddle sandbox,
 # so no real money or user identity is involved.
 #
 # STAGING ONLY. Production is never deployed from CI (PD-7: no standing CI->prod path); prod is an
-# operator-run promotion of a signed v* release — see deploy-production.yml + deploy/deploy.sh.
+# operator-run promotion of a signed v* release — see deploy-production.yml.
 #
 # Inert until the `staging` Environment secrets are provisioned (STAGING_SSH_KEY, STAGING_VPS,
 # STAGING_CANARY_PORTAL, STAGING_CANARY_COORD). No hostnames/IPs live in this file — all via secrets.
@@ -50,7 +50,7 @@ jobs:
           - image: nil-node
             dockerfile: deploy/Dockerfile.node
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # Build the commit CI validated (workflow_run defaults to the default branch tip otherwise).
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -70,10 +70,10 @@ jobs:
         id: sde
         run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -81,7 +81,7 @@ jobs:
 
       - name: Image metadata (staging tags)
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c1e51972afc2121e065aed6d45c65596fe445f3f # v5.8.0
         with:
           images: ${{ steps.ref.outputs.repo }}
           tags: |
@@ -94,7 +94,7 @@ jobs:
 
       - name: Build + push (staging)
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -106,7 +106,7 @@ jobs:
             SOURCE_DATE_EPOCH=${{ steps.sde.outputs.value }}
           provenance: false
 
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
         with:
           cosign-release: v2.4.1
 
@@ -144,7 +144,7 @@ jobs:
           fi
 
       - name: Log in to GHCR (resolve pushed digest)
-        uses: docker/login-action@v3
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

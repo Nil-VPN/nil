@@ -3,7 +3,7 @@
 # acquisition), and nil-node + nil-cli (data plane, built with `synthetic-attest` so the client
 # can attest the nodes' synthetic RA-TLS reports without real TEE hardware). Used by
 # deploy/verify-e2e.sh; nothing touches the host network.
-FROM rust:1.96.0-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.96.0-bookworm@sha256:19817ead3289c8c631c73df281e18b59b172f6a31f4f563290f69cddd06c30e9 AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake clang pkg-config && rm -rf /var/lib/apt/lists/*
 ARG SOURCE_DATE_EPOCH=0
@@ -13,19 +13,24 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     TZ=UTC \
     RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo"
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY client/src-tauri/ ./client/src-tauri/
+COPY client/trust/ ./client/trust/
+# All harness binaries use the optimized `e2e` profile: it preserves debug assertions so explicit
+# development capabilities remain available without weakening the true release profile.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
-    cargo build --release --locked -p nil-node --features synthetic-attest,dev-trace && \
-    cargo build --release --locked -p nil-cli --features synthetic-attest,dev-trace && \
-    cargo build --release --locked -p nil-portal && \
-    cargo build --release --locked -p nil-coordinator && \
-    cargo build --release --locked -p nil-provision && \
+    cargo build --profile e2e --locked -p nil-node --no-default-features --features synthetic-attest,dev-trace,dev-fallbacks && \
+    cargo build --profile e2e --locked -p nil-cli --features synthetic-attest,dev-trace,dev-fallbacks && \
+    cargo build --profile e2e --locked -p nil-portal && \
+    cargo build --profile e2e --locked -p nil-coordinator && \
+    cargo build --profile e2e --locked -p nil-provision && \
     mkdir -p /out && \
-    cp target/release/nil-node target/release/nil-cli target/release/nil-portal \
-       target/release/nil-coordinator target/release/nil-provision /out/
+    cp target/e2e/nil-node target/e2e/nil-cli target/e2e/nil-portal \
+       target/e2e/nil-coordinator target/e2e/nil-provision /out/
 
-FROM debian:bookworm-slim
+FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
 RUN apt-get update && apt-get install -y --no-install-recommends \
         iproute2 iptables procps ethtool curl ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/nil-node /usr/local/bin/nil-node

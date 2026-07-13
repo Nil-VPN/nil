@@ -1,38 +1,30 @@
-# Build, scan, push, sign, and attest the three NIL service images to GHCR.
-#
-# On a v* tag: publishes images pushed + signed BY DIGEST (cosign keyless), each with a CycloneDX
-# SBOM attestation and SLSA build provenance, gated behind a Trivy scan that fails the release on a
-# fixable HIGH/CRITICAL vuln. A manual run defaults to a build+scan DRY-RUN (no push, no signing).
-# This closes the PD-5 chain: reproducible source -> the exact running binary an operator can verify
-# with deploy/verify-image.sh (see deploy/IMAGES.md). Mirrors the keyless-OIDC style of
-# release-attest.yml. Does NOT run on pull_request — nothing is pushed during review.
-#
-# Security note: this workflow consumes no untrusted free-text (no issue/PR/comment/head_ref). Every
-# expression used in a run: block is still passed via env: (never inlined) per GitHub's injection
-# guidance.
-name: release-images
+name: release-image-candidates
 
+# Reusable release stage. release.yml is the sole v* entrypoint. All images are built, scanned,
+# SBOMed, and uploaded as secretless runner artifacts before this workflow receives package/OIDC
+# authority. GHCR has no cross-repository transaction, so this stage deliberately publishes only
+# run-scoped candidate refs. It never writes v* or latest tags.
 on:
-  push:
-    tags: ["v*"]
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      push:
-        description: "Push + sign + attest to GHCR (false = build & Trivy-scan only)"
-        type: boolean
-        default: false
+      expected_node_sha256:
+        description: Reproducible nil-node ELF hash produced by release-attest.yml
+        required: true
+        type: string
+    outputs:
+      image_manifest_sha256:
+        description: SHA-256 of the signed candidate image manifest
+        value: ${{ jobs.publish-candidates.outputs.image_manifest_sha256 }}
 
 permissions:
   contents: read
-  packages: write       # push to GHCR
-  id-token: write       # keyless cosign + provenance (Fulcio/Rekor OIDC) — as in release-attest.yml
-  attestations: write   # actions/attest-build-provenance
 
 jobs:
-  images:
+  build-scan-sbom:
+    name: build-scan-sbom (${{ matrix.image }})
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
           - image: nil-portal
@@ -42,153 +34,259 @@ jobs:
           - image: nil-node
             dockerfile: deploy/Dockerfile.node
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Decide push mode
-        id: mode
-        # Push on a v* tag always; on a manual run only when the input says so.
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_PUSH: ${{ inputs.push }}
-        run: |
-          if [ "$EVENT_NAME" = "push" ] || [ "$INPUT_PUSH" = "true" ]; then
-            echo "push=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "push=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Compute lowercase image ref
-        id: ref
-        # GHCR requires a lowercase owner (org is "Nil-VPN").
-        env:
-          OWNER: ${{ github.repository_owner }}
-          IMAGE: ${{ matrix.image }}
-        run: |
-          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          echo "repo=ghcr.io/${owner}/${IMAGE}" >> "$GITHUB_OUTPUT"
-
-      - name: SOURCE_DATE_EPOCH (HEAD commit time)
-        id: sde
-        run: echo "value=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        if: steps.mode.outputs.push == 'true'
-        uses: docker/login-action@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
 
-      - name: Image metadata (tags + OCI labels)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ steps.ref.outputs.repo }}
-          tags: |
-            type=ref,event=tag
-            type=sha,format=long
-            type=raw,value=latest,enable=${{ github.event_name == 'push' }}
-          labels: |
-            org.opencontainers.image.title=${{ matrix.image }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=AGPL-3.0-or-later
+      - name: Verify allowlisted Docker context and release workflow invariants
+        run: bash deploy/verify-release-config.sh
 
-      - name: Build (push only when enabled)
-        id: build
-        uses: docker/build-push-action@v6
+      - name: Resolve deterministic build inputs
+        id: inputs
+        run: |
+          set -euo pipefail
+          mkdir -p release-image
+          echo "source_date_epoch=$(git log -1 --pretty=%ct)" >> "$GITHUB_OUTPUT"
+          echo "local_ref=nil-release/${{ matrix.image }}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - name: Build locally (no registry credentials)
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
-          push: ${{ steps.mode.outputs.push == 'true' }}
-          load: ${{ steps.mode.outputs.push != 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            SOURCE_DATE_EPOCH=${{ steps.sde.outputs.value }}
-          provenance: false   # SLSA provenance is attached explicitly below (attest-build-provenance)
+          load: true
+          push: false
+          tags: ${{ steps.inputs.outputs.local_ref }}
+          build-args: SOURCE_DATE_EPOCH=${{ steps.inputs.outputs.source_date_epoch }}
+          provenance: false
 
-      - name: Resolve scan/sign target
-        id: target
-        # Immutable digest ref when pushed; first local tag in dry-run.
-        env:
-          PUSH: ${{ steps.mode.outputs.push }}
-          REPO: ${{ steps.ref.outputs.repo }}
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          if [ "$PUSH" = "true" ]; then
-            echo "ref=${REPO}@${DIGEST}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=$(printf '%s\n' "$TAGS" | head -n1)" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Trivy scan (fail on fixable HIGH/CRITICAL — before signing)
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0 (SHA-pinned: gates signing)
+      - name: Trivy scan (fixable HIGH/CRITICAL fail the candidate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.target.outputs.ref }}
+          image-ref: ${{ steps.inputs.outputs.local_ref }}
+          format: json
+          output: release-image/${{ matrix.image }}.trivy.json
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
           vuln-type: os,library
 
-      - uses: sigstore/cosign-installer@v3
+      - name: Generate image CycloneDX SBOM
+        uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
+        with:
+          image: ${{ steps.inputs.outputs.local_ref }}
+          format: cyclonedx-json
+          output-file: release-image/${{ matrix.image }}.cdx.json
+          upload-artifact: false
+
+      - name: Bind the candidate node image to the reproducible ELF
+        if: matrix.image == 'nil-node'
+        env:
+          EXPECTED_NODE_SHA256: ${{ inputs.expected_node_sha256 }}
+          LOCAL_REF: ${{ steps.inputs.outputs.local_ref }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$EXPECTED_NODE_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+            echo "invalid reproducible node hash" >&2; exit 1;
+          }
+          container="$(docker create "$LOCAL_REF")"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+          docker cp "$container:/usr/local/bin/nil-node" release-image/nil-node
+          actual="$(sha256sum release-image/nil-node | awk '{print $1}')"
+          [ "$actual" = "$EXPECTED_NODE_SHA256" ] || {
+            echo "candidate node ELF $actual != reproducible ELF $EXPECTED_NODE_SHA256" >&2
+            exit 1
+          }
+          printf '%s  %s\n' "$actual" nil-node > release-image/nil-node.SHA256SUMS
+
+      - name: Export scanned image archive
+        env:
+          LOCAL_REF: ${{ steps.inputs.outputs.local_ref }}
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-image
+          docker image save --output "release-image/${IMAGE}.tar" "$LOCAL_REF"
+          sha256sum "release-image/${IMAGE}.tar" > "release-image/${IMAGE}.tar.SHA256SUMS"
+
+      - name: Upload scanned candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: candidate-image-${{ matrix.image }}-${{ github.run_attempt }}
+          path: release-image
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  publish-candidates:
+    name: sign and attest complete candidate set
+    needs: build-scan-sbom
+    runs-on: ubuntu-latest
+    environment: release-candidates
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image_manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
+    steps:
+      # No checkout and no repository build scripts after package/OIDC authority is available.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: candidate-image-*-${{ github.run_attempt }}
+          path: candidate-images
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@e468171a9de216ec08956ac3ada2f0791b6bd435 # v3.11.1
+
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
         with:
           cosign-release: v2.4.1
 
-      - name: cosign sign (keyless, by digest)
-        if: steps.mode.outputs.push == 'true'
+      - name: Push the complete run-scoped candidate set
+        id: push
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          candidate="candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for image in nil-portal nil-coordinator nil-node; do
+            expected="$(awk '{print $1}' "candidate-images/${image}.tar.SHA256SUMS")"
+            actual="$(sha256sum "candidate-images/${image}.tar" | awk '{print $1}')"
+            [ "$actual" = "$expected" ] || { echo "$image archive hash mismatch" >&2; exit 1; }
+            docker image load --input "candidate-images/${image}.tar"
+            local_ref="nil-release/${image}:${GITHUB_SHA}"
+            repo="ghcr.io/${owner}/${image}"
+            docker image tag "$local_ref" "${repo}:${candidate}"
+            docker push "${repo}:${candidate}"
+            digest="$(docker buildx imagetools inspect "${repo}:${candidate}" --format '{{.Manifest.Digest}}')"
+            printf '%s' "$digest" | grep -Eq '^sha256:[0-9a-f]{64}$' || {
+              echo "invalid pushed digest for $image" >&2; exit 1;
+            }
+            key="${image#nil-}"
+            echo "${key}_name=${repo}" >> "$GITHUB_OUTPUT"
+            echo "${key}_digest=${digest}" >> "$GITHUB_OUTPUT"
+            echo "${key}_ref=${repo}@${digest}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Sign and attach CycloneDX attestations by digest
         env:
           COSIGN_YES: "true"
-          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
-        run: cosign sign "$REF"
+          PORTAL_REF: ${{ steps.push.outputs.portal_ref }}
+          COORDINATOR_REF: ${{ steps.push.outputs.coordinator_ref }}
+          NODE_REF: ${{ steps.push.outputs.node_ref }}
+        run: |
+          set -euo pipefail
+          for item in \
+            "nil-portal|$PORTAL_REF" \
+            "nil-coordinator|$COORDINATOR_REF" \
+            "nil-node|$NODE_REF"; do
+            image="${item%%|*}"
+            ref="${item#*|}"
+            cosign sign "$ref"
+            cosign attest --yes --type cyclonedx \
+              --predicate "candidate-images/${image}.cdx.json" "$ref"
+          done
 
-      - name: Generate CycloneDX SBOM
-        if: steps.mode.outputs.push == 'true'
-        uses: anchore/sbom-action@v0
+      - name: Portal provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          image: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
-          format: cyclonedx-json
-          output-file: sbom-${{ matrix.image }}.cdx.json
-          artifact-name: sbom-${{ matrix.image }}.cdx.json
-
-      - name: Attest CycloneDX SBOM (GitHub attestation — coexists with provenance)
-        if: steps.mode.outputs.push == 'true'
-        # NOTE: use actions/attest-sbom (same mechanism as attest-build-provenance below) rather than
-        # `cosign attest`. Mixing cosign's .att storage with the GitHub attest actions on the same
-        # image caused the provenance step to CLOBBER the cosign SBOM (both exited 0, but only
-        # provenance survived). Both first-party attest actions coexist on one subject.
-        uses: actions/attest-sbom@v2
-        with:
-          subject-name: ${{ steps.ref.outputs.repo }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: sbom-${{ matrix.image }}.cdx.json
+          subject-name: ${{ steps.push.outputs.portal_name }}
+          subject-digest: ${{ steps.push.outputs.portal_digest }}
           push-to-registry: true
 
-      - name: SLSA build provenance attestation
-        if: steps.mode.outputs.push == 'true'
-        uses: actions/attest-build-provenance@v2
+      - name: Coordinator provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ${{ steps.ref.outputs.repo }}
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-name: ${{ steps.push.outputs.coordinator_name }}
+          subject-digest: ${{ steps.push.outputs.coordinator_digest }}
           push-to-registry: true
 
-      - name: Job summary
+      - name: Node provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.push.outputs.node_name }}
+          subject-digest: ${{ steps.push.outputs.node_digest }}
+          push-to-registry: true
+
+      - name: Verify every candidate's signature, SBOM, and provenance
         env:
-          IMAGE: ${{ matrix.image }}
-          PUSH: ${{ steps.mode.outputs.push }}
-          REF: ${{ steps.ref.outputs.repo }}@${{ steps.build.outputs.digest }}
+          COSIGN_EXPERIMENTAL: "1"
+          PORTAL_REF: ${{ steps.push.outputs.portal_ref }}
+          COORDINATOR_REF: ${{ steps.push.outputs.coordinator_ref }}
+          NODE_REF: ${{ steps.push.outputs.node_ref }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          identity="^https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$"
+          issuer="https://token.actions.githubusercontent.com"
+          for ref in "$PORTAL_REF" "$COORDINATOR_REF" "$NODE_REF"; do
+            cosign verify --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" "$ref" >/dev/null
+            cosign verify-attestation --type cyclonedx \
+              --certificate-identity-regexp "$identity" \
+              --certificate-oidc-issuer "$issuer" "$ref" >/dev/null
+            gh attestation verify "oci://${ref}" --repo "$REPOSITORY" \
+              --signer-workflow "$REPOSITORY/.github/workflows/release.yml" >/dev/null
+          done
+
+      - name: Create and keyless-sign the candidate image manifest
+        id: manifest
+        env:
+          COSIGN_YES: "true"
+          EXPECTED_NODE_SHA256: ${{ inputs.expected_node_sha256 }}
+          PORTAL_REF: ${{ steps.push.outputs.portal_ref }}
+          COORDINATOR_REF: ${{ steps.push.outputs.coordinator_ref }}
+          NODE_REF: ${{ steps.push.outputs.node_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p image-manifest
+          jq -n \
+            --arg source_sha "$GITHUB_SHA" \
+            --arg github_run_id "$GITHUB_RUN_ID" \
+            --argjson github_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg portal "$PORTAL_REF" \
+            --arg coordinator "$COORDINATOR_REF" \
+            --arg node "$NODE_REF" \
+            --arg node_elf_sha256 "$EXPECTED_NODE_SHA256" \
+            --arg portal_sbom "$(sha256sum candidate-images/nil-portal.cdx.json | awk '{print $1}')" \
+            --arg coordinator_sbom "$(sha256sum candidate-images/nil-coordinator.cdx.json | awk '{print $1}')" \
+            --arg node_sbom "$(sha256sum candidate-images/nil-node.cdx.json | awk '{print $1}')" \
+            --arg portal_scan "$(sha256sum candidate-images/nil-portal.trivy.json | awk '{print $1}')" \
+            --arg coordinator_scan "$(sha256sum candidate-images/nil-coordinator.trivy.json | awk '{print $1}')" \
+            --arg node_scan "$(sha256sum candidate-images/nil-node.trivy.json | awk '{print $1}')" \
+            '{schema:"https://nilvpn.net/release-image-set/v1",source_sha:$source_sha,github_run_id:$github_run_id,github_run_attempt:$github_run_attempt,images:{portal:$portal,coordinator:$coordinator,node:$node},node_elf_sha256:$node_elf_sha256,sbom_sha256:{portal:$portal_sbom,coordinator:$coordinator_sbom,node:$node_sbom},trivy_report_sha256:{portal:$portal_scan,coordinator:$coordinator_scan,node:$node_scan},promotion:{version_tags:false,latest:false,reason:"GHCR provides no atomic cross-repository promotion"},unbound_external_inputs:["guest_image_digest","tee_launch_measurement"]}' \
+            > image-manifest/images.json
+          cp candidate-images/*.cdx.json candidate-images/*.trivy.json image-manifest/
+          sha="$(sha256sum image-manifest/images.json | awk '{print $1}')"
+          printf '%s  %s\n' "$sha" images.json > image-manifest/SHA256SUMS
+          cosign sign-blob --yes --bundle image-manifest/images.sigstore.json \
+            image-manifest/images.json
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed candidate manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-image-manifest-${{ github.run_attempt }}
+          path: image-manifest
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publication boundary summary
         run: |
           {
-            echo "### ${IMAGE}"
-            if [ "$PUSH" = "true" ]; then
-              echo "- Pushed + signed + attested (SBOM + SLSA) by digest:"
-              echo "  \`${REF}\`"
-              echo "- Verify before deploy:"
-              echo "  \`./deploy/verify-image.sh ${REF}\`"
-            else
-              echo "- Dry-run: built + Trivy-scanned, not pushed (re-run with push=true, or push a v* tag)."
-            fi
+            echo "## Candidate images complete"
+            echo "All three run-scoped digest refs are signed and carry mandatory CycloneDX and provenance attestations."
+            echo "No version or latest tag was written. Atomic registry/client promotion remains externally blocked; see RELEASE.md."
           } >> "$GITHUB_STEP_SUMMARY"

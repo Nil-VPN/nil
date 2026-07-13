@@ -1,105 +1,34 @@
-# Production promotion gate — PD-7-preserving (CI never touches prod).
-#
-# There is deliberately NO standing CI->prod path: CI holds no prod SSH keys, and this workflow does
-# NOT deploy. It is the *approval + verification* half of an operator-run promotion:
-#
-#   1. cut a `v*` tag  -> release-images.yml builds the three images pushed + cosign-signed + SBOM/SLSA
-#      attested by digest, and release-attest.yml publishes the reproducible nil-node measurement.
-#   2. run THIS workflow (workflow_dispatch, input = the tag). The `production` Environment's REQUIRED
-#      REVIEWER must approve it before it runs — that approval is the human gate.
-#   3. it verifies each image by digest with deploy/verify-image.sh (cosign signature + SBOM), then
-#      prints a PROMOTION MANIFEST: the exact operator-run `deploy.sh` commands + verified digests.
-#   4. YOU run those commands from your laptop (deploy/deploy.sh: canary + auto-rollback). Prod creds
-#      live only on your machine, never in CI.
-#
-# So a GitHub/Actions compromise can never push to production (PD-7: even we cannot betray the user).
-# Consumes one dispatch input (`tag`), validated against a strict pattern before any use.
-name: deploy-production
+name: deploy-production-blocked
 
+# Intentionally non-deploying. GitHub Actions/GHCR cannot atomically promote three OCI refs and
+# three signed client bundles as one transaction. release.yml therefore stops at signed run-scoped
+# candidates. Keep this protected Environment gate red until the external transactional promoter
+# described in RELEASE.md exists and independently verifies the signed release-set manifest.
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Signed release tag to promote, e.g. v1.2.3 (its images must already be built + signed by release-images)."
+      release_set:
+        description: "Candidate release-set identifier (informational; production remains blocked)"
         required: true
+        type: string
 
 permissions:
   contents: read
-  packages: read
-  attestations: read   # gh attestation verify (SBOM/provenance)
 
 concurrency:
   group: deploy-production
   cancel-in-progress: false
 
 jobs:
-  promote:
+  blocked:
     runs-on: ubuntu-latest
-    environment: production   # required-reviewer protection = the approval gate
+    environment: production
     steps:
-      - name: Validate the tag input (no untrusted free-text downstream)
+      - name: Fail closed until atomic external promotion exists
         env:
-          TAG: ${{ inputs.tag }}
+          RELEASE_SET: ${{ inputs.release_set }}
         run: |
-          printf '%s' "$TAG" | grep -qE '^v[0-9A-Za-z._-]+$' \
-            || { echo "refusing tag '$TAG' — expected v<semver-ish> (e.g. v1.2.3)"; exit 1; }
-
-      - uses: actions/checkout@v4
-
-      - uses: sigstore/cosign-installer@v3
-        with:
-          cosign-release: v2.4.1
-
-      - name: Log in to GHCR (read; resolve digests)
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Verify signed images + emit the operator promotion manifest
-        env:
-          TAG: ${{ inputs.tag }}
-          OWNER: ${{ github.repository_owner }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
-          {
-            echo "## Production promotion manifest — \`${TAG}\`"
-            echo ""
-            echo "Verified signed release images (cosign identity == release-images.yml + SBOM)."
-            echo "**CI does not deploy.** Run these from your laptop (canary + auto-rollback):"
-            echo ""
-            echo '```sh'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          fail=0
-          for svc in portal coordinator node; do
-            repo="ghcr.io/${owner}/nil-${svc}"
-            digest="$(docker buildx imagetools inspect "${repo}:${TAG}" --format '{{.Manifest.Digest}}' 2>/dev/null || true)"
-            if [ -z "$digest" ]; then
-              echo "  MISSING: ${repo}:${TAG} — was release-images built for this tag?"; fail=1; continue
-            fi
-            ref="${repo}@${digest}"
-            echo "==> verifying ${ref}"
-            if bash deploy/verify-image.sh "$ref"; then
-              echo "  verified ✅  $ref"
-              # Portal/Coordinator are promoted with deploy.sh; the node is provisioned per PRODUCTION-NODE.md.
-              if [ "$svc" = node ]; then
-                printf '# node: provision per deploy/PRODUCTION-NODE.md, pin measurement, then run the CVM\n# %s\n' "$ref" >> "$GITHUB_STEP_SUMMARY"
-              else
-                printf 'NW_DEPLOY_SSH=root@<%s-host> NW_CANARY_URL=<health-url> bash deploy/deploy.sh %s %s --apply\n' "$svc" "$svc" "$ref" >> "$GITHUB_STEP_SUMMARY"
-              fi
-            else
-              echo "  VERIFY FAILED ❌  $ref"; fail=1
-            fi
-          done
-
-          {
-            echo '```'
-            echo ""
-            [ "$fail" = 0 ] && echo "All release images verified. Approve + run the commands above to promote." \
-                            || echo "⚠️ One or more images failed verification / were missing — do NOT promote."
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit "$fail"
+          echo "Production promotion is blocked for candidate: $RELEASE_SET" >&2
+          echo "Required external gate: atomically publish all three verified OCI digests and all three signed client artifacts from one signed release-set manifest, then independently verify the committed result." >&2
+          echo "GitHub branch/tag protection, Environment reviewers, and the external promoter are administrative controls and cannot be enforced by this repository alone." >&2
+          exit 1

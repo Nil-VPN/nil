@@ -5,6 +5,7 @@
 exec > /tmp/verify.log 2>&1
 echo "[baseline] egress (no tunnel): $(curl -s --max-time 8 https://ifconfig.me)"
 sudo env NW_NODE_HOST=192.168.64.1 NW_NODE_PORT=443 NW_DNS=1.1.1.1 \
+  NW_ALLOW_UNATTESTED=1 NW_FORCE_SINGLE_HOP=1 \
   RUST_LOG=info,nil_datapath=debug,nil_transport=info /Users/admin/nil-cli > /tmp/cli.log 2>&1 &
 trap 'sudo pkill -INT -x nil-cli 2>/dev/null; sleep 3' EXIT
 for _ in $(seq 1 25); do grep -q "tunnel up" /tmp/cli.log 2>/dev/null && break; sleep 1; done

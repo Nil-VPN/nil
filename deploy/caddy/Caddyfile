@@ -1,0 +1,64 @@
+# TLS-terminating reverse proxy for nil-portal (Business plane).
+#
+# Caddy obtains and renews a Let's Encrypt certificate for {$PORTAL_PUBLIC_HOST}
+# automatically (HTTP-01 over the published :80) and proxies HTTPS down to
+# nil-portal's plain HTTP on the internal network. nil-portal is never exposed
+# directly; this proxy is the only public surface of the Business plane.
+
+{
+	# ACME account contact (expiry notices). Set via ACME_EMAIL in portal.env.
+	email {$ACME_EMAIL}
+}
+
+{$PORTAL_PUBLIC_HOST} {
+	# Upstream is nil-portal's plain-HTTP port in the shared wallet-rpc network
+	# namespace. Caddy resolves the namespace owner over the compose network.
+	#
+	# Proxy attribution boundary:
+	# - Never pass a caller-supplied forwarding, request-id, correlation, or trace header.
+	# - X-Nil-Client-IP is overwritten from Caddy's direct socket peer and is the ONLY header a
+	#   future application extractor may consider. That extractor must first authenticate the
+	#   immediate peer as this exact Caddy instance and require one canonical IP value.
+	# - Current application builds do not consume this header; their rate-limit peer remains Caddy.
+	reverse_proxy monero-wallet-rpc:8080 {
+		header_up -Forwarded
+		header_up -X-Forwarded-*
+		header_up -X-Real-IP
+		header_up -X-Original-Forwarded-For
+		header_up -X-Client-IP
+		header_up -X-Cluster-Client-IP
+		header_up -X-ProxyUser-Ip
+		header_up -CF-Connecting-IP
+		header_up -True-Client-IP
+		header_up -Fastly-Client-IP
+		header_up -Fly-Client-IP
+		header_up -X-Envoy-External-Address
+		header_up -X-Appengine-User-IP
+		header_up -X-Azure-ClientIP
+		header_up -X-Request-ID
+		header_up -Request-ID
+		header_up -X-Correlation-ID
+		header_up -Correlation-ID
+		header_up -Traceparent
+		header_up -Tracestate
+		header_up -Baggage
+		header_up -X-Amzn-Trace-Id
+		header_up -X-B3-*
+		header_up -B3
+		header_up -Uber-Trace-Id
+		header_up -X-Nil-Client-IP
+		header_up X-Nil-Client-IP {http.request.remote.host}
+	}
+
+	# Security headers. HSTS is safe here because every public path is HTTPS.
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Deliberately NO site `log` directive: public HTTP access logging is disabled. The production
+	# Compose file also discards Caddy's operational stdout/stderr. Any operator override is a new
+	# sensitive retention surface and must not be described as anonymous.
+}

@@ -1,0 +1,205 @@
+name: release-candidates
+
+# Sole version-tag entrypoint. It re-runs every required gate for the exact tag SHA, builds and
+# signs complete client/image candidate sets, and emits one signed release-set manifest. It does
+# not publish a GitHub Release or move GHCR v*/latest tags because neither system offers an atomic
+# cross-product promotion transaction.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      source_sha: ${{ steps.tag.outputs.source_sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+      tag_object_sha: ${{ steps.tag.outputs.tag_object_sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require an annotated, GitHub-verified tag on main at this exact SHA
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$' || {
+            echo "release tag is not canonical semver: $TAG" >&2; exit 1;
+          }
+          git show-ref --verify --quiet "refs/tags/${TAG}" || {
+            echo "tag not present in the checked-out repository" >&2; exit 1;
+          }
+          tag_object="$(git rev-parse "refs/tags/${TAG}")"
+          [ "$(git cat-file -t "$tag_object")" = tag ] || {
+            echo "lightweight release tags are forbidden" >&2; exit 1;
+          }
+          source_sha="$(git rev-parse "refs/tags/${TAG}^{commit}")"
+          [ "$source_sha" = "$EVENT_SHA" ] || {
+            echo "tag commit $source_sha != workflow event SHA $EVENT_SHA" >&2; exit 1;
+          }
+          verified="$(gh api "repos/${REPOSITORY}/git/tags/${tag_object}" --jq '.verification.verified')"
+          [ "$verified" = true ] || {
+            echo "GitHub did not verify the annotated tag signature" >&2; exit 1;
+          }
+          git show-ref --verify --quiet refs/remotes/origin/main || {
+            echo "fetch-depth: 0 did not provide origin/main" >&2; exit 1;
+          }
+          git merge-base --is-ancestor "$source_sha" origin/main || {
+            echo "release tag commit is not reachable from origin/main" >&2; exit 1;
+          }
+          [ "$(git rev-parse HEAD)" = "$source_sha" ] || {
+            echo "checkout does not match exact tag commit" >&2; exit 1;
+          }
+          client_version="$(jq -r '.version' client/package.json)"
+          workspace_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          [ "${TAG#v}" = "$client_version" ] && [ "$client_version" = "$workspace_version" ] || {
+            echo "tag/client/workspace versions differ: $TAG / $client_version / $workspace_version" >&2
+            exit 1
+          }
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "tag_object_sha=$tag_object" >> "$GITHUB_OUTPUT"
+
+      - name: Release configuration regression guard
+        run: bash deploy/verify-release-config.sh
+
+  exact-sha-ci:
+    needs: gate-tag
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  exact-sha-dataplane:
+    needs: gate-tag
+    uses: ./.github/workflows/dataplane-e2e.yml
+    permissions:
+      contents: read
+
+  node-evidence:
+    needs: [gate-tag, exact-sha-ci, exact-sha-dataplane]
+    uses: ./.github/workflows/release-attest.yml
+    permissions:
+      contents: read
+
+  client-candidates:
+    needs: [gate-tag, exact-sha-ci, exact-sha-dataplane]
+    uses: ./.github/workflows/release-sign.yml
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+
+  image-candidates:
+    needs: [gate-tag, node-evidence, client-candidates]
+    uses: ./.github/workflows/release-images.yml
+    with:
+      expected_node_sha256: ${{ needs.node-evidence.outputs.node_sha256 }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
+  release-set:
+    needs: [gate-tag, node-evidence, client-candidates, image-candidates]
+    runs-on: ubuntu-latest
+    environment: release-approval
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # This job has no checkout and executes no repository code after release approval.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-node-evidence-${{ github.run_attempt }}
+          path: release-set/node
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-client-manifest-${{ github.run_attempt }}
+          path: release-set/client
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-image-manifest-${{ github.run_attempt }}
+          path: release-set/images
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+        with:
+          cosign-release: v2.4.1
+
+      - name: Verify component manifests and sign the one release-set manifest
+        env:
+          COSIGN_YES: "true"
+          TAG: ${{ needs.gate-tag.outputs.tag }}
+          SOURCE_SHA: ${{ needs.gate-tag.outputs.source_sha }}
+          NODE_SHA256: ${{ needs.node-evidence.outputs.node_sha256 }}
+          NODE_EVIDENCE_SHA256: ${{ needs.node-evidence.outputs.evidence_sha256 }}
+          TAG_OBJECT_SHA: ${{ needs.gate-tag.outputs.tag_object_sha }}
+          CLIENT_MANIFEST_SHA256: ${{ needs.client-candidates.outputs.client_manifest_sha256 }}
+          IMAGE_MANIFEST_SHA256: ${{ needs.image-candidates.outputs.image_manifest_sha256 }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          identity="^https://github.com/${REPOSITORY}/.github/workflows/release.yml@refs/tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$"
+          issuer="https://token.actions.githubusercontent.com"
+          cosign verify-blob --bundle release-set/client/clients.sigstore.json \
+            --certificate-identity-regexp "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            release-set/client/clients.json >/dev/null
+          cosign verify-blob --bundle release-set/images/images.sigstore.json \
+            --certificate-identity-regexp "$identity" \
+            --certificate-oidc-issuer "$issuer" \
+            release-set/images/images.json >/dev/null
+          [ "$(sha256sum release-set/client/clients.json | awk '{print $1}')" = "$CLIENT_MANIFEST_SHA256" ]
+          [ "$(sha256sum release-set/images/images.json | awk '{print $1}')" = "$IMAGE_MANIFEST_SHA256" ]
+          [ "$(jq -r '.node_elf_sha256' release-set/images/images.json)" = "$NODE_SHA256" ]
+          [ "$(sha256sum release-set/node/evidence.json | awk '{print $1}')" = "$NODE_EVIDENCE_SHA256" ]
+          [ "$(jq -r '.source_sha' release-set/client/clients.json)" = "$SOURCE_SHA" ]
+          [ "$(jq -r '.source_sha' release-set/images/images.json)" = "$SOURCE_SHA" ]
+          [ "$(jq -r '.github_run_id' release-set/client/clients.json)" = "$GITHUB_RUN_ID" ]
+          [ "$(jq -r '.github_run_id' release-set/images/images.json)" = "$GITHUB_RUN_ID" ]
+          [ "$(jq -r '.github_run_attempt' release-set/client/clients.json)" = "$GITHUB_RUN_ATTEMPT" ]
+          [ "$(jq -r '.github_run_attempt' release-set/images/images.json)" = "$GITHUB_RUN_ATTEMPT" ]
+          jq -n \
+            --arg tag "$TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg github_run_id "$GITHUB_RUN_ID" \
+            --argjson github_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg tag_object_sha "$TAG_OBJECT_SHA" \
+            --arg node_elf_sha256 "$NODE_SHA256" \
+            --arg node_evidence_sha256 "$NODE_EVIDENCE_SHA256" \
+            --arg client_manifest_sha256 "$CLIENT_MANIFEST_SHA256" \
+            --arg image_manifest_sha256 "$IMAGE_MANIFEST_SHA256" \
+            '{schema:"https://nilvpn.net/release-set/v1",repository:$repository,tag:$tag,tag_object_sha:$tag_object_sha,source_sha:$source_sha,github_run_id:$github_run_id,github_run_attempt:$github_run_attempt,node_elf_sha256:$node_elf_sha256,node_evidence_sha256:$node_evidence_sha256,client_manifest_sha256:$client_manifest_sha256,image_manifest_sha256:$image_manifest_sha256,promotion:{status:"blocked",public_version_tags:false,github_release:false,required_external_gate:"transactional promotion of all three OCI digest refs and all three signed clients, followed by independent manifest verification"},unresolved_attestation_binding:["guest_image_digest","tee_launch_measurement"]}' \
+            > release-set/release.json
+          sha256sum release-set/release.json > release-set/SHA256SUMS
+          cosign sign-blob --yes --bundle release-set/release.sigstore.json release-set/release.json
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-set-${{ needs.gate-tag.outputs.tag }}-${{ github.run_attempt }}
+          path: release-set
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Fail-closed promotion summary
+        run: |
+          {
+            echo "## Release candidate set complete"
+            echo "The exact signed tag SHA passed CI, dataplane, reproducibility, image, client, SBOM, scan, and provenance gates."
+            echo "No public v*/latest image tags or GitHub Release were published because cross-product atomic promotion is unavailable."
+            echo "The externally required promotion control is documented in RELEASE.md."
+          } >> "$GITHUB_STEP_SUMMARY"

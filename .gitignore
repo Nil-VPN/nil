@@ -8,6 +8,7 @@ client/node_modules
 client/dist
 client/src-tauri/target
 client/src-tauri/gen
+.pnpm-store/
 
 # Secrets / local env — NEVER commit
 .env
@@ -18,3 +19,21 @@ client/.vscode/
 
 # macOS
 .DS_Store
+
+# Reviewed public deployment templates: versioned so the access-log/header policy and its CI
+# regression check can run. They remain production NO-GO templates, not deployment approval.
+!/deploy/caddy/
+!/deploy/caddy/Caddyfile
+!/deploy/caddy/Caddyfile.coordinator
+!/deploy/compose.coordinator.yaml
+!/deploy/compose.portal.yaml
+!/deploy/env/coordinator.env.example
+!/deploy/env/coordinator-staging.env.example
+!/deploy/env/portal.env.example
+!/deploy/env/portal-staging.env.example
+
+# Runtime trust bundles and deployment credentials are local inputs. Only the schema/example bundle
+# is public and versioned.
+/deploy/secrets/
+/client/trust/*.json
+!/client/trust/bundle.example.json

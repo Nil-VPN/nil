@@ -18,7 +18,10 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     TZ=UTC \
     RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY client/src-tauri/ ./client/src-tauri/
+COPY client/trust/ ./client/trust/
 # Hermetic, network-free compile: vendor every dep (deterministic from Cargo.lock + immutable
 # crates.io) into ./vendor, point cargo at it, and build OFFLINE — no cache mounts, so each clean
 # build is identical. With codegen-units=1 (Cargo.toml), the pinned toolchain (rust-toolchain.toml),

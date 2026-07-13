@@ -4,8 +4,9 @@
 # correctly ISOLATED per-client routing (no address collision, no reply cross-talk, no misroute).
 #
 # What it proves (and how a regression would fail it):
-#   1. All three clients' tunnels are up SIMULTANEOUSLY, and the node logs three CONNECT-IP tunnels
-#      (concurrency: the old single-client node could not hold three at once).
+#   1. All three clients' tunnels are up SIMULTANEOUSLY. The node deliberately does not log a
+#      per-tunnel event; the three live interfaces plus concurrent traffic below are the stronger,
+#      privacy-preserving concurrency proof (the old single-client node could not satisfy them).
 #   2. Each client's inner TUN address is DISTINCT and inside the pool CIDR — the node handed out
 #      three unique /32s via ADDRESS_ASSIGN (`nil-node/src/pool.rs`). The pre-fix bug hardcoded
 #      10.74.0.2 for everyone; this assertion catches that deterministically.
@@ -57,16 +58,6 @@ if [ "$allup" = 1 ]; then
   echo "  PASS: all three clients' tunnels are up simultaneously"
 else
   echo "  FAIL: not all three tunnels came up ($up_count/3)"; fail=1
-fi
-
-echo
-echo "==> the node accepted three concurrent CONNECT-IP tunnels"
-node_tunnels=$($DC logs node 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' | grep -c "CONNECT-IP tunnel up")
-echo "    node logged $node_tunnels CONNECT-IP tunnel-up event(s)"
-if [ "${node_tunnels:-0}" -ge 3 ]; then
-  echo "  PASS: one node is serving three concurrent clients"
-else
-  echo "  FAIL: node did not report three concurrent CONNECT-IP tunnels"; fail=1
 fi
 
 echo

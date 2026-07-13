@@ -1,5 +1,5 @@
-# blackbox_exporter: how to probe a NIL control-surface /healthz. A 2xx = healthy. We do NOT match
-# on body so the same module works for the Portal and Coordinator regardless of their /healthz body.
+# blackbox_exporter: probe an implemented NIL liveness URL. A 2xx = healthy. We do NOT match on
+# body, so the same module works for the Portal issuer-key route and Coordinator /healthz.
 modules:
   healthz_2xx:
     prober: http

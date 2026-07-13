@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Full-stack end-to-end verification — the WHOLE NIL pipeline in Docker, host untouched.
 #
-#   nil-portal   issues an unlinkable Privacy Pass token (gated on a confirmed payment)
+#   nil-portal   blind-signs a Privacy Pass token (gated on a confirmed payment)
 #        ↓ (blinded; the issuer never sees the token the verifier later does — Pillar 4)
-#   nil-coordinator  verifies the token, enforces single-use (nullifier), grants a trust-split path
+#   nil-coordinator  atomically spends the token and grants/replays one trust-split path
 #        ↓
 #   the datapath  redeems the token, builds the 3-hop attested MASQUE onion over the granted path
 #        ↓
@@ -19,6 +19,10 @@ DC="docker compose -f compose.e2e.yaml"
 
 # Must equal the entry/middle/exit NW_NODE_MEASUREMENT in compose.e2e.yaml.
 M="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+# RFC 8032 test vector 1. The corresponding PUBLIC key is the verifier key configured on each
+# E2E node in compose.e2e.yaml. This well-known seed is test-only and must never be reused.
+GRANT_SEED="9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60"
+GRANT_REALM="nil-e2e"
 PORTAL=10.82.0.5; COORD=10.82.0.6
 ENTRY=10.82.0.11; MIDDLE=10.82.0.12; EXIT=10.82.0.13
 DEST=1.1.1.1
@@ -37,27 +41,42 @@ if [ -z "$PUBKEY" ]; then
 fi
 echo "  issuer pubkey: ${PUBKEY:0:32}… (${#PUBKEY} hex chars)"
 
+echo "==> read each node's generated public TLS SPKI identity"
+ENTRY_TLS=$($DC exec -T entry cat /tmp/tls-meta 2>/dev/null | tr -d '\r' | cut -d= -f2)
+MIDDLE_TLS=$($DC exec -T middle cat /tmp/tls-meta 2>/dev/null | tr -d '\r' | cut -d= -f2)
+EXIT_TLS=$($DC exec -T exit cat /tmp/tls-meta 2>/dev/null | tr -d '\r' | cut -d= -f2)
+for identity in "$ENTRY_TLS" "$MIDDLE_TLS" "$EXIT_TLS"; do
+  if ! printf '%s' "$identity" | grep -Eq '^[0-9a-f]{64}$'; then
+    echo "  FAIL: node did not publish a valid TLS SPKI digest"
+    exit 1
+  fi
+done
+
 echo "==> write the Coordinator node registry (3 operator/jurisdiction-diverse nodes, all pinned to \$M)"
 # Each node's `role` MUST match its NW_NODE_ROLE: only the exit node has open egress, so path
 # selection must place it at the exit (last) position — an entry/middle node there DROPs the user's
 # real egress traffic (the open-relay guard) and the data plane silently black-holes (HTTP 000).
 $DC exec -T coordinator sh -c 'cat > /tmp/registry.json' <<EOF
 [
-  {"host":"$ENTRY","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-a","jurisdiction":"jur-a","role":"entry"},
-  {"host":"$MIDDLE","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-b","jurisdiction":"jur-b","role":"middle"},
-  {"host":"$EXIT","port":443,"tee":"sev-snp","measurement":"$M","operator":"op-c","jurisdiction":"jur-c","role":"exit"}
+  {"id":"entry","host":"$ENTRY","port":443,"tee":"sev-snp","measurement":"$M","tls_spki_sha256":"$ENTRY_TLS","operator":"op-a","jurisdiction":"US","role":"entry"},
+  {"id":"middle","host":"$MIDDLE","port":443,"tee":"sev-snp","measurement":"$M","tls_spki_sha256":"$MIDDLE_TLS","operator":"op-b","jurisdiction":"DE","role":"middle"},
+  {"id":"exit","host":"$EXIT","port":443,"tee":"sev-snp","measurement":"$M","tls_spki_sha256":"$EXIT_TLS","operator":"op-c","jurisdiction":"CH","role":"exit"}
 ]
 EOF
 
 echo "==> start the Coordinator (verifier = the Portal's PUBLIC key only; 3-hop diverse paths)"
-# NW_NULLIFIER_PATH points the spent-token set at a durable file, so this e2e exercises the REAL
-# production nullifier path (the fail-closed DurableSet with fsync) — not the volatile dev escape
+# NW_NULLIFIER_PATH points the redemption ledger at a durable file, so this e2e exercises the real
+# process-locked, encrypted, fsynced path — not the volatile development escape
 # hatch. The Coordinator refuses to boot with a volatile set unless NW_ALLOW_DEV_FALLBACKS=1; an
 # end-to-end test should prove the durable path composes, so we give it a real file rather than
 # opting out of the guard.
+$DC exec -T coordinator nil-coordinator redemption-keygen /tmp/redemption_result_key.bin \
+  >/dev/null || { echo "  FAIL: could not create Coordinator redemption-result key"; exit 1; }
 $DC exec -e NW_COORDINATOR_ADDR=0.0.0.0:9000 -e NW_TOKEN_PUBKEY="$PUBKEY" \
   -e NW_NODE_REGISTRY=/tmp/registry.json -e NW_PATH_HOPS=3 \
+  -e NW_GRANT_SIGNING_KEY="$GRANT_SEED" -e NW_GRANT_REALM="$GRANT_REALM" \
   -e NW_NULLIFIER_PATH=/tmp/nullifiers.log \
+  -e NW_REDEMPTION_RESULT_KEY_FILE=/tmp/redemption_result_key.bin \
   -d coordinator sh -c 'nil-coordinator > /tmp/coord.log 2>&1'
 cup=0
 for _ in $(seq 1 20); do
@@ -67,7 +86,9 @@ done
 [ "$cup" = 1 ] && echo "  coordinator listening" \
   || { echo "  FAIL: coordinator did not start"; $DC exec -T coordinator tail -n 15 /tmp/coord.log 2>/dev/null; exit 1; }
 
-# Acquire an unlinkable token via the REAL client flow. nil-provision now does the whole thing:
+# Acquire a blind-signed bearer token via the real client flow. Blinding removes a direct
+# cryptographic issuance join; this harness does not claim resistance to timing/network correlation.
+# nil-provision now does the whole thing:
 # POST /v1/billing/checkout to mint a server reference, then blind-issue against it. The Portal runs
 # with NW_MOCK_PAID_ALL=1, so the minted reference reads as paid (standing in for a confirmed Monero
 # payment) — but the front-running guard still requires it to be a reference we minted, so this
@@ -79,20 +100,27 @@ acquire() {
 }
 
 echo
-echo "================ CONTROL PLANE: issue → redeem → single-use ================"
+echo "================ CONTROL PLANE: issue → redeem → exact retry ================"
 prov=$(acquire)
 MSG=$(printf '%s\n' "$prov" | grep '^NW_TOKEN_MSG=' | cut -d= -f2)
 TOK=$(printf '%s\n' "$prov" | grep '^NW_TOKEN=' | cut -d= -f2)
 if [ -z "$MSG" ] || [ -z "$TOK" ]; then
   echo "  FAIL: token acquisition produced no token"; printf '%s\n' "$prov"; fail=1
 else
-  echo "  PASS: acquired an unlinkable token from the Portal (msg ${MSG:0:16}…)"
+  echo "  PASS: acquired a blind-signed bearer token from the Portal (msg ${MSG:0:16}…)"
   body="{\"msg\":\"$MSG\",\"token\":\"$TOK\"}"
-  c1=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
-  c2=$($DC exec -T client curl -s -o /dev/null -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
+  c1=$($DC exec -T client curl -s -o /tmp/redeem-first.json -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
+  c2=$($DC exec -T client curl -s -o /tmp/redeem-retry.json -w '%{http_code}' --max-time 10 -H 'content-type: application/json' -d "$body" "http://$COORD:9000/v1/redeem")
   echo "  redeem #1 → HTTP $c1   redeem #2 → HTTP $c2"
   [ "$c1" = "200" ] && echo "  PASS: first redemption granted a trust-split path" || { echo "  FAIL: first redemption not 200"; fail=1; }
-  [ "$c2" = "409" ] && echo "  PASS: replay rejected — single-use nullifier holds" || { echo "  FAIL: replay not rejected (want 409, got $c2)"; fail=1; }
+  [ "$c2" = "200" ] && echo "  PASS: grant-lifetime retry returned a path" || { echo "  FAIL: retry not 200 (got $c2)"; fail=1; }
+  first_response=$($DC exec -T client cat /tmp/redeem-first.json)
+  retry_response=$($DC exec -T client cat /tmp/redeem-retry.json)
+  if [ "$first_response" = "$retry_response" ]; then
+    echo "  PASS: retry returned the exact first grants/nonces — no second authorization"
+  else
+    echo "  FAIL: retry response differs from the authoritative first response"; fail=1
+  fi
 fi
 
 echo

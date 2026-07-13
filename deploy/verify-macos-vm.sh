@@ -23,10 +23,11 @@ SCP="scp -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownH
 VMIP=$(tart ip "$VM")
 
 echo "==> build macOS nil-cli + copy into VM"
-# No pinned measurement here, so the tunnel connects unattested (the client warns); this
-# harness exercises the macOS routing/kill-switch datapath, not attestation.
-( cd "$(dirname "$0")/.." && cargo build --release -p nil-cli )
-$SCP "$(dirname "$0")/../target/release/nil-cli" "admin@$VMIP:/Users/admin/nil-cli"
+# This is an explicitly weaker local datapath harness: its single-hop/unattested flags are compiled
+# out of true release artifacts. The optimized e2e profile retains debug assertions so the VM can
+# isolate and exercise macOS routing/kill-switch behavior without weakening a production binary.
+( cd "$(dirname "$0")/.." && cargo build --profile e2e --locked -p nil-cli )
+$SCP "$(dirname "$0")/../target/e2e/nil-cli" "admin@$VMIP:/Users/admin/nil-cli"
 $SCP "$(dirname "$0")/vm_verify.sh" "admin@$VMIP:/tmp/vm_verify.sh"
 ${=SSH} 'chmod +x ~/nil-cli /tmp/vm_verify.sh'
 
@@ -34,7 +35,8 @@ echo "==> start the Linux node on the host (Docker), UDP 443 published"
 docker rm -f nil-node-vm >/dev/null 2>&1 || true
 docker run -d --name nil-node-vm --cap-add=NET_ADMIN --device /dev/net/tun \
   --sysctl net.ipv4.ip_forward=1 -p 443:443/udp \
-  -e NW_NODE_BIND=0.0.0.0:443 -e NW_NODE_EGRESS=eth0 deploy-node nil-node
+  -e NW_NODE_BIND=0.0.0.0:443 -e NW_NODE_EGRESS=eth0 \
+  -e NW_ALLOW_UNGRANTED=1 deploy-node nil-node
 sleep 3
 
 echo "==> run the in-VM verification (detached) + stop node mid-window for the kill-switch test"

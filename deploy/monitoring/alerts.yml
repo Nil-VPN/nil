@@ -11,7 +11,7 @@ groups:
         annotations:
           summary: "NIL control surface {{ $labels.instance }} is failing its health probe"
           description: >
-            The Portal or Coordinator /healthz probe has failed for over 2 minutes. The payment
+            The Portal issuer-key or Coordinator /healthz probe has failed for over 2 minutes. The payment
             (Portal) or path-redemption/attestation (Coordinator) surface may be down — new clients
             cannot get tokens or paths. Investigate the affected service.
 

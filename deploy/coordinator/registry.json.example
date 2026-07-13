@@ -1,27 +1,39 @@
 [
   {
-    "host": "entry.example.net",
+    "id": "entry-1",
+    "host": "192.0.2.10",
     "port": 443,
     "tee": "sev-snp",
     "measurement": "REPLACE_WITH_48_BYTE_HEX_GUEST_LAUNCH_MEASUREMENT",
+    "tls_spki_sha256": "REPLACE_WITH_32_BYTE_HEX_FROM_NIL_NODE_TLS_KEYGEN",
+    "min_tcb_sevsnp": { "fmc": null, "bootloader": 0, "tee": 0, "snp": 0, "microcode": 0 },
+    "transparency_log_key": "REPLACE_WITH_32_BYTE_HEX_INDEPENDENT_LOG_KEY",
     "operator": "op-1",
     "jurisdiction": "BG",
     "role": "entry"
   },
   {
-    "host": "middle.example.net",
+    "id": "middle-1",
+    "host": "198.51.100.20",
     "port": 443,
     "tee": "sev-snp",
     "measurement": "REPLACE_WITH_48_BYTE_HEX_GUEST_LAUNCH_MEASUREMENT",
+    "tls_spki_sha256": "REPLACE_WITH_32_BYTE_HEX_FROM_NIL_NODE_TLS_KEYGEN",
+    "min_tcb_sevsnp": { "fmc": null, "bootloader": 0, "tee": 0, "snp": 0, "microcode": 0 },
+    "transparency_log_key": "REPLACE_WITH_32_BYTE_HEX_INDEPENDENT_LOG_KEY",
     "operator": "op-2",
     "jurisdiction": "CH",
     "role": "middle"
   },
   {
-    "host": "exit.example.net",
+    "id": "exit-1",
+    "host": "203.0.113.30",
     "port": 443,
     "tee": "sev-snp",
     "measurement": "REPLACE_WITH_48_BYTE_HEX_GUEST_LAUNCH_MEASUREMENT",
+    "tls_spki_sha256": "REPLACE_WITH_32_BYTE_HEX_FROM_NIL_NODE_TLS_KEYGEN",
+    "min_tcb_sevsnp": { "fmc": null, "bootloader": 0, "tee": 0, "snp": 0, "microcode": 0 },
+    "transparency_log_key": "REPLACE_WITH_32_BYTE_HEX_INDEPENDENT_LOG_KEY",
     "operator": "op-3",
     "jurisdiction": "IS",
     "role": "exit"
