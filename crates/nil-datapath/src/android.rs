@@ -23,7 +23,9 @@ impl NetControl for NoopNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
         Ok(())
     }
-    fn teardown(&mut self) {}
+    fn teardown(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 impl Tunnel {
@@ -39,6 +41,15 @@ impl Tunnel {
     ) -> anyhow::Result<Tunnel> {
         tracing::info!("connecting MASQUE tunnel (android, VpnService-provided TUN)");
 
+        // Adopt the detached fd immediately. Rust owns it on every return path, including a
+        // connection/attestation failure; delaying adoption would leak the OS VPN interface when
+        // `transport.connect` failed.
+        // SAFETY: `tun_fd` is an owned fd handed over by the VpnService via `detachFd()`.
+        let tun = Arc::new(
+            unsafe { tun_rs::AsyncDevice::from_fd(tun_fd) }
+                .map_err(|e| anyhow::anyhow!("adopt tun fd: {e}"))?,
+        );
+
         // Fresh per-connection nonce, bound into the node's attestation report (same as `up`).
         let mut nonce = [0u8; 32];
         getrandom::getrandom(&mut nonce).map_err(|e| anyhow::anyhow!("nonce entropy: {e}"))?;
@@ -53,11 +64,16 @@ impl Tunnel {
             .map_err(|e| anyhow::anyhow!("transport connect: {e}"))?;
         tracing::info!("tunnel session established (android)");
 
-        // SAFETY: `tun_fd` is an owned fd handed over by the VpnService via `detachFd()`.
-        let tun = Arc::new(
-            unsafe { tun_rs::AsyncDevice::from_fd(tun_fd) }
-                .map_err(|e| anyhow::anyhow!("adopt tun fd: {e}"))?,
-        );
+        // Android's VpnService must choose its address before handing us the fd. Until the JNI
+        // contract becomes two-phase, only the pool's configured fallback address is usable.
+        // Refuse a different ADDRESS_ASSIGN rather than reporting a tunnel whose packets the node
+        // will drop (the Apple provider can apply its assignment after connect).
+        if transport.assigned_ip(&session) != Some(cfg.client_ip) {
+            let _ = transport.close(session).await;
+            anyhow::bail!(
+                "node did not assign the exact inner address required by the current Android VpnService ABI"
+            );
+        }
 
         let net: Box<dyn NetControl> = Box::new(NoopNet);
         let cancel = CancellationToken::new();

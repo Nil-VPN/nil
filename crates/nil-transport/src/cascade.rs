@@ -38,7 +38,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 
 use crate::Transport;
 
@@ -66,7 +68,11 @@ impl Cascade {
     /// Build a cascade from an ordered rung list (e.g. `[masque, amnezia, wstunnel, reality]`),
     /// with the default connect timeout and no liveness probe.
     pub fn new(rungs: Vec<Arc<dyn Transport>>) -> Self {
-        Self { rungs, connect_timeout: DEFAULT_CONNECT_TIMEOUT, probe: None }
+        Self {
+            rungs,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            probe: None,
+        }
     }
 
     /// Override the per-rung connect timeout.
@@ -115,9 +121,14 @@ impl Cascade {
             // Connected — verify it actually carries traffic before committing.
             if let Some(probe) = &self.probe {
                 if !probe.is_alive(rung, &session).await {
-                    tracing::warn!(?kind, "cascade rung connected but failed liveness, stepping down");
+                    tracing::warn!(
+                        ?kind,
+                        "cascade rung connected but failed liveness, stepping down"
+                    );
                     let _ = rung.close(session).await;
-                    last = Some(Error::Transport(format!("{kind:?} connected but failed the liveness probe")));
+                    last = Some(Error::Transport(format!(
+                        "{kind:?} connected but failed the liveness probe"
+                    )));
                     continue;
                 }
             }
@@ -162,7 +173,10 @@ impl LivenessProbe for DnsLivenessProbe {
             return false;
         }
         // Any inbound packet within the window means the data path is live.
-        matches!(tokio::time::timeout(self.timeout, transport.recv(session)).await, Ok(Ok(_)))
+        matches!(
+            tokio::time::timeout(self.timeout, transport.recv(session)).await,
+            Ok(Ok(_))
+        )
     }
 }
 
@@ -198,7 +212,11 @@ pub struct CascadeTransport {
 
 impl CascadeTransport {
     pub fn new(cascade: Cascade) -> Self {
-        Self { cascade, winners: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            cascade,
+            winners: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn winner(&self, session: &Session) -> Result<Winner> {
@@ -240,7 +258,8 @@ impl Transport for CascadeTransport {
                 .winners
                 .lock()
                 .map_err(|_| Error::Transport("cascade map poisoned".into()))?;
-            map.remove(&session.id).ok_or(Error::SessionNotFound(session.id))?
+            map.remove(&session.id)
+                .ok_or(Error::SessionNotFound(session.id))?
         };
         t.close(inner).await
     }
@@ -270,7 +289,9 @@ macro_rules! scaffold_transport {
         #[async_trait]
         impl Transport for $name {
             async fn connect(&self, _target: NodeEndpoint, _creds: Grant) -> Result<Session> {
-                Err(Error::Transport(concat!($label, " transport is a Phase-4 scaffold").into()))
+                Err(Error::Transport(
+                    concat!($label, " transport is a Phase-4 scaffold").into(),
+                ))
             }
             async fn send(&self, _session: &Session, _packet: IpPacket) -> Result<()> {
                 Err(Error::Closed)
@@ -329,11 +350,21 @@ mod tests {
         async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
             Err(Error::Transport("blocked by DPI".into()))
         }
-        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Err(Error::Closed) }
-        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Err(Error::Closed) }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> {
+            Err(Error::Closed)
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            Err(Error::Closed)
+        }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
     /// A transport that always connects.
@@ -341,13 +372,26 @@ mod tests {
     #[async_trait]
     impl Transport for Working {
         async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
-            Ok(Session { id: SessionId(7), kind: self.0 })
+            Ok(Session {
+                id: SessionId(7),
+                kind: self.0,
+            })
         }
-        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Ok(()) }
-        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Err(Error::Closed) }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> {
+            Ok(())
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            Err(Error::Closed)
+        }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
     #[tokio::test]
@@ -363,7 +407,11 @@ mod tests {
             .connect(NodeEndpoint::loopback(), Grant::mock())
             .await
             .expect("cascade finds a working rung");
-        assert_eq!(t.kind(), TransportKind::Wstunnel, "stepped down past the blocked rungs");
+        assert_eq!(
+            t.kind(),
+            TransportKind::Wstunnel,
+            "stepped down past the blocked rungs"
+        );
         assert_eq!(session.kind, TransportKind::Wstunnel);
     }
 
@@ -376,15 +424,27 @@ mod tests {
             Arc::new(RealityTransport),
         ]);
         // All rungs fail (one blocked + three scaffolds) → no session, kill-switch holds.
-        assert!(cascade.connect(NodeEndpoint::loopback(), Grant::mock()).await.is_err());
+        assert!(cascade
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .is_err());
     }
 
     #[test]
     fn scaffolds_carry_the_right_wire_profiles() {
         assert_eq!(AmneziaWgTransport.kind(), TransportKind::AmneziaWg);
-        assert_eq!(AmneziaWgTransport.fingerprint_profile(), Profile::Wireguardish);
-        assert_eq!(WstunnelTransport.fingerprint_profile(), Profile::WebSocketTls);
-        assert_eq!(RealityTransport.fingerprint_profile(), Profile::RealTlsBorrowed);
+        assert_eq!(
+            AmneziaWgTransport.fingerprint_profile(),
+            Profile::Wireguardish
+        );
+        assert_eq!(
+            WstunnelTransport.fingerprint_profile(),
+            Profile::WebSocketTls
+        );
+        assert_eq!(
+            RealityTransport.fingerprint_profile(),
+            Profile::RealTlsBorrowed
+        );
     }
 
     /// A transport whose `connect` hangs forever — simulates a DPI block that drops the
@@ -396,11 +456,21 @@ mod tests {
             std::future::pending::<()>().await; // never resolves
             unreachable!()
         }
-        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Err(Error::Closed) }
-        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Err(Error::Closed) }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> {
+            Err(Error::Closed)
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            Err(Error::Closed)
+        }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
     #[tokio::test]
@@ -440,7 +510,11 @@ mod tests {
             .connect(NodeEndpoint::loopback(), Grant::mock())
             .await
             .expect("steps down past the dead rung");
-        assert_eq!(t.kind(), TransportKind::Wstunnel, "rejected the connected-but-dead MASQUE rung");
+        assert_eq!(
+            t.kind(),
+            TransportKind::Wstunnel,
+            "rejected the connected-but-dead MASQUE rung"
+        );
     }
 
     #[tokio::test]
@@ -451,7 +525,10 @@ mod tests {
             Arc::new(Working(TransportKind::Wstunnel)),
         ])
         .with_liveness_probe(Arc::new(AliveIf(TransportKind::Reality))); // never matches
-        assert!(cascade.connect(NodeEndpoint::loopback(), Grant::mock()).await.is_err());
+        assert!(cascade
+            .connect(NodeEndpoint::loopback(), Grant::mock())
+            .await
+            .is_err());
     }
 
     /// An in-process echo transport: `recv` returns whatever was last `send`, tagged with the
@@ -466,7 +543,10 @@ mod tests {
     #[async_trait]
     impl Transport for Echo {
         async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
-            Ok(Session { id: SessionId(1), kind: self.0 })
+            Ok(Session {
+                id: SessionId(1),
+                kind: self.0,
+            })
         }
         async fn send(&self, _s: &Session, p: IpPacket) -> Result<()> {
             let mut buf = p.into_bytes();
@@ -482,9 +562,15 @@ mod tests {
                 .map(IpPacket::new)
                 .ok_or(Error::Closed)
         }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
     #[tokio::test]
@@ -501,12 +587,19 @@ mod tests {
             .connect(NodeEndpoint::loopback(), Grant::mock())
             .await
             .expect("cascade lands on the working rung");
-        assert_eq!(session.kind, TransportKind::Wstunnel, "session carries the winner's kind");
+        assert_eq!(
+            session.kind,
+            TransportKind::Wstunnel,
+            "session carries the winner's kind"
+        );
 
         ct.send(&session, IpPacket::new(vec![0xAA, 0xBB]))
             .await
             .expect("send routes to the winning rung");
-        let got = ct.recv(&session).await.expect("recv routes to the winning rung");
+        let got = ct
+            .recv(&session)
+            .await
+            .expect("recv routes to the winning rung");
         assert_eq!(
             got.as_bytes(),
             &[TransportKind::Wstunnel as u8, 0xAA, 0xBB],
@@ -514,7 +607,9 @@ mod tests {
         );
 
         // After close, the session is gone and the seam reports SessionNotFound (no dangling rung).
-        ct.close(session).await.expect("close tears down the winner");
+        ct.close(session)
+            .await
+            .expect("close tears down the winner");
         assert!(matches!(
             ct.send(&session, IpPacket::new(vec![0])).await,
             Err(Error::SessionNotFound(_))
@@ -528,6 +623,10 @@ mod tests {
         assert_eq!(&q[4..6], &[0x00, 0x01], "one question");
         // 12-byte header + 1+7 "example" + 1+3 "com" + 1 root + 2 qtype + 2 qclass = 29 bytes.
         assert_eq!(q.len(), 29);
-        assert_eq!(&q[q.len() - 4..], &[0x00, 0x01, 0x00, 0x01], "QTYPE=A QCLASS=IN");
+        assert_eq!(
+            &q[q.len() - 4..],
+            &[0x00, 0x01, 0x00, 0x01],
+            "QTYPE=A QCLASS=IN"
+        );
     }
 }

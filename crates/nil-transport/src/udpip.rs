@@ -83,7 +83,11 @@ mod tests {
     #[test]
     fn rejects_non_udp_or_truncated() {
         assert!(unwrap(b"short").is_none());
-        let mut pkt = wrap("192.0.2.1:1".parse().unwrap(), "192.0.2.2:2".parse().unwrap(), b"x");
+        let mut pkt = wrap(
+            "192.0.2.1:1".parse().unwrap(),
+            "192.0.2.2:2".parse().unwrap(),
+            b"x",
+        );
         pkt[9] = 6; // TCP, not UDP
         assert!(unwrap(&pkt).is_none());
     }

@@ -40,6 +40,7 @@ serde_json = "1"
 async-trait = "0.1"
 thiserror = "1"
 anyhow = "1"
+libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.5", features = ["trace"] }
@@ -49,6 +50,7 @@ bip39 = "2"
 sha2 = "0.10"
 hmac = "0.12"                  # HMAC-SHA256 for the card (MoR) webhook signature (nil-portal)
 hkdf = "0.12"
+ed25519-dalek = { version = "2", features = ["zeroize"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
@@ -78,7 +80,7 @@ classic-mceliece-rust = { version = "3", features = ["mceliece460896", "alloc"] 
 # --- Declared for forward intent; activated in their phase step.
 boringtun = "0.7"                      # inner WireGuard Noise core (PQ PSK over MASQUE)
 
-# --- Phase 3: unlinkable payments (Privacy Pass blind tokens) ---
+# --- Phase 3: blind bearer tokens (no direct cryptographic issuance/redemption join) ---
 blind-rsa-signatures = "0.17"          # RFC 9474 blind RSA signatures (issuer private / verifier public)
 # quinn = "0.11"                       # prototyping alt QUIC
 
@@ -114,6 +116,14 @@ strip = true
 # for a stable nil-node measurement (deploy/reproducible-build.sh). Slower, but the reproducibly
 # built binary must match the one whose measurement is pinned + appraised.
 codegen-units = 1
+
+# Optimized integration-harness binaries. Security-weaker test features are guarded by
+# `debug_assertions` and deliberately fail to compile in the real release profile; this profile
+# keeps those assertions on while retaining release-like performance for Docker/VM datapath tests.
+[profile.e2e]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
 
 # Build the heavy post-quantum KEM crates OPTIMIZED even in the dev/test profile. Unoptimized
 # Classic McEliece keygen/encapsulation is ~100x slower (tens of seconds), which made the PQ

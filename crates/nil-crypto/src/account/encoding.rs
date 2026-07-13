@@ -1,9 +1,8 @@
-//! Crockford base32 encoding for account numbers and recovery codes.
+//! Crockford base32 display encoding for account numbers.
 //!
-//! Crockford's alphabet omits the ambiguous letters I, L, O, U, so codes are easy to
-//! read aloud and transcribe. We only ever *encode* (raw bytes → display string); the
-//! canonical account key is always the raw hash bytes, never the string, so no decode
-//! path is needed.
+//! Crockford's alphabet omits the ambiguous letters I, L, O, U, so account numbers are easy to
+//! read aloud and transcribe. We only ever *encode* (raw bytes → display string); the canonical
+//! account key is always the raw hash bytes, never the string, so no decode path is needed.
 
 use std::sync::OnceLock;
 

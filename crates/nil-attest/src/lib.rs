@@ -22,10 +22,13 @@ pub mod testkit;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 pub use error::AttestError;
-pub use policy::{AppraisalPolicy, Measurement, SevSnpTcbFloor, TcbStatus, Tee, Verdict};
+pub use policy::{
+    AppraisalPolicy, Measurement, SevSnpTcbFloor, TcbStatus, TdxPolicy, Tee, Verdict,
+};
 pub use report::Evidence;
 
 /// Appraise a node's attestation `evidence` (the `[tag][parts]` blob the node returned over
@@ -40,6 +43,15 @@ pub fn appraise(
     policy: &AppraisalPolicy,
     nonce: &[u8; 32],
 ) -> Result<Verdict, AttestError> {
+    // Registry identity gate: report_data proves that the report is bound to the live TLS key;
+    // this independent digest pin proves that the live key belongs to the selected registry node.
+    // Check it before parsing expensive vendor evidence, and compare in constant time.
+    if let Some(expected) = policy.tls_spki_sha256 {
+        let actual: [u8; 32] = Sha256::digest(tls_spki).into();
+        if !bool::from(actual.ct_eq(&expected)) {
+            return Err(AttestError::TlsSpkiMismatch);
+        }
+    }
     let (&tag, rest) = evidence
         .split_first()
         .ok_or_else(|| AttestError::Malformed("empty attestation evidence".into()))?;
@@ -59,22 +71,63 @@ pub fn appraise(
     } else if parts.len() == base + 1 {
         (&parts[..base], Some(parts[base]))
     } else {
-        return Err(AttestError::Malformed("unexpected attestation evidence part count".into()));
+        return Err(AttestError::Malformed(
+            "unexpected attestation evidence part count".into(),
+        ));
     };
 
     let report = match tag {
         ratls::TAG_SEVSNP => match base_parts {
             [report, vcek] => report::sevsnp::verify(report, vcek, policy.min_tcb_sevsnp)?,
-            _ => return Err(AttestError::Malformed("SEV-SNP evidence expects [report, vcek]".into())),
+            _ => {
+                return Err(AttestError::Malformed(
+                    "SEV-SNP evidence expects [report, vcek]".into(),
+                ))
+            }
         },
         ratls::TAG_TDX => match base_parts {
-            [quote, collateral] => report::tdx::verify(quote, collateral, now_unix())?,
-            _ => return Err(AttestError::Malformed("TDX evidence expects [quote, collateral]".into())),
+            [quote, collateral] => {
+                // Do not let a TDX quote fall back to an MRTD-only policy. The tag already tells us
+                // the evidence family, so a different expected family can fail before expensive
+                // DCAP verification without weakening the gate.
+                if policy.tee != Tee::Tdx {
+                    return Err(AttestError::TeeMismatch {
+                        expected: policy.tee,
+                        found: Tee::Tdx,
+                    });
+                }
+                if policy.min_tcb_sevsnp.is_some() {
+                    return Err(AttestError::PolicyViolation(
+                        "SEV-SNP TCB floor is invalid for a TDX policy".into(),
+                    ));
+                }
+                if policy.allow_tcb_out_of_date {
+                    return Err(AttestError::PolicyViolation(
+                        "TDX policy must require an UpToDate collateral verdict with no advisories"
+                            .into(),
+                    ));
+                }
+                let tdx_policy = policy.tdx_policy.as_ref().ok_or_else(|| {
+                    AttestError::PolicyViolation(
+                        "TDX policy is incomplete: MRTD alone is not sufficient".into(),
+                    )
+                })?;
+                report::tdx::verify(quote, collateral, now_unix(), tdx_policy)?
+            }
+            _ => {
+                return Err(AttestError::Malformed(
+                    "TDX evidence expects [quote, collateral]".into(),
+                ))
+            }
         },
         #[cfg(feature = "synthetic")]
         ratls::TAG_SYNTHETIC => match base_parts {
             [synthetic] => testkit::verify(synthetic)?,
-            _ => return Err(AttestError::Malformed("synthetic evidence expects [report]".into())),
+            _ => {
+                return Err(AttestError::Malformed(
+                    "synthetic evidence expects [report]".into(),
+                ))
+            }
         },
         // Unreachable: `base` above already rejected any other tag. Kept for match exhaustiveness.
         other => return Err(AttestError::UnsupportedTee(other)),
@@ -82,7 +135,16 @@ pub fn appraise(
 
     // The report must come from the TEE family the policy pinned.
     if report.tee != policy.tee {
-        return Err(AttestError::TeeMismatch { expected: policy.tee, found: report.tee });
+        return Err(AttestError::TeeMismatch {
+            expected: policy.tee,
+            found: report.tee,
+        });
+    }
+
+    if report.tee == Tee::SevSnp && policy.tdx_policy.is_some() {
+        return Err(AttestError::PolicyViolation(
+            "TDX workload policy is invalid for SEV-SNP evidence".into(),
+        ));
     }
 
     // Freshness + key binding: report_data must equal H(node's TLS key, this connection's nonce).
@@ -113,10 +175,12 @@ pub fn appraise(
     // Offline by design: the proof + signed checkpoint are stapled, so the client never phones the
     // log (which would leak which node it is verifying, PD-3).
     if let Some(log_key) = &policy.transparency_log_key {
-        let proof_bytes = stapled
-            .ok_or_else(|| AttestError::TransparencyNotLogged("no stapled inclusion proof".into()))?;
-        let proof = nil_crypto::translog::LogProof::decode(proof_bytes)
-            .ok_or_else(|| AttestError::TransparencyNotLogged("malformed inclusion proof".into()))?;
+        let proof_bytes = stapled.ok_or_else(|| {
+            AttestError::TransparencyNotLogged("no stapled inclusion proof".into())
+        })?;
+        let proof = nil_crypto::translog::LogProof::decode(proof_bytes).ok_or_else(|| {
+            AttestError::TransparencyNotLogged("malformed inclusion proof".into())
+        })?;
         if !nil_crypto::translog::verify_logged(&report.measurement, &proof, log_key) {
             return Err(AttestError::TransparencyNotLogged(
                 "measurement not included under the pinned log checkpoint".into(),
@@ -143,4 +207,52 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(u64::MAX / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_tdx_evidence() -> Vec<u8> {
+        // Policy-shape validation happens before the quote reaches DCAP. The blob only needs the
+        // correct evidence framing for these negative tests.
+        ratls::encode_tdx(&vec![0u8; 632], b"{}")
+    }
+
+    fn complete_tdx_policy() -> TdxPolicy {
+        TdxPolicy {
+            td_attributes: [0u8; 8],
+            xfam: [0u8; 8],
+            mr_config_id: [0u8; 48].into(),
+            mr_owner: [0u8; 48].into(),
+            mr_owner_config: [0u8; 48].into(),
+            rt_mr0: [1u8; 48].into(),
+            rt_mr1: [2u8; 48].into(),
+            rt_mr2: [3u8; 48].into(),
+            rt_mr3: [4u8; 48].into(),
+            mr_service_td: None,
+        }
+    }
+
+    #[test]
+    fn tdx_mrtd_only_policy_fails_before_quote_verification() {
+        let policy = AppraisalPolicy::new(Tee::Tdx, Measurement(vec![0u8; 48]));
+        let err = appraise(&dummy_tdx_evidence(), b"spki", &policy, &[0u8; 32]).unwrap_err();
+        assert!(matches!(
+            err,
+            AttestError::PolicyViolation(message) if message.contains("MRTD alone")
+        ));
+    }
+
+    #[test]
+    fn tdx_cannot_opt_out_of_clean_tcb_status() {
+        let mut policy = AppraisalPolicy::new(Tee::Tdx, Measurement(vec![0u8; 48]))
+            .with_tdx_policy(Some(complete_tdx_policy()));
+        policy.allow_tcb_out_of_date = true;
+        let err = appraise(&dummy_tdx_evidence(), b"spki", &policy, &[0u8; 32]).unwrap_err();
+        assert!(matches!(
+            err,
+            AttestError::PolicyViolation(message) if message.contains("UpToDate")
+        ));
+    }
 }

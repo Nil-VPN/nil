@@ -1,8 +1,8 @@
 //! Windows routing / DNS via `netsh`, plus the kill-switch seam.
 //!
-//! Status: **routing, DNS, and the fail-closed kill-switch are implemented and verified in a
-//! Windows-on-ARM VM (the host stays untouched), same discipline as the Linux (Docker) and macOS
-//! (tart VM) paths.** The TUN is wintun via `tun-rs`.
+//! Status: routing, DNS, and the fail-closed kill-switch are implemented and cross-compiled. A
+//! privileged Windows VM fault/crash/reboot matrix remains required before production claims. The
+//! TUN is wintun via `tun-rs`.
 //!
 //! Ordering mirrors Linux/macOS so there is never a leak window: pin the node route and arm
 //! the kill-switch *before* flipping the default route; on teardown remove our routes and
@@ -33,29 +33,37 @@
 use std::net::IpAddr;
 use std::process::Command;
 
-use crate::{ArmParams, NetControl};
+use crate::{ArmParams, CleanupErrors, NetControl};
+
+#[derive(Clone, Copy)]
+struct PinnedRoute {
+    ip: IpAddr,
+    interface: u32,
+}
 
 #[derive(Default)]
 pub struct WinNet {
     armed: bool,
-    node_ip: Option<IpAddr>,
-    tun_name: Option<String>,
     /// Interface index of the TUN (wintun) adapter.
     tun_idx: Option<u32>,
-    /// Interface index of the original default-route adapter (for the node /32 pin).
-    orig_idx: Option<u32>,
-    kill_switch: bool,
+    firewall_touched: bool,
     /// Saved per-profile `DefaultOutboundAction` (e.g. `Domain=Allow;Private=Allow;Public=Allow`)
     /// to restore on teardown.
     ks_saved: Option<String>,
-    /// Extra node IPs host-route-excepted (cascade fallback nodes), to clean up on teardown.
-    also_except: Vec<IpAddr>,
+    low_default_added: bool,
+    high_default_added: bool,
+    /// Host routes that this instance actually added. Pre-existing routes are never deleted.
+    pinned_routes: Vec<PinnedRoute>,
 }
 
 impl NetControl for WinNet {
     fn arm(&mut self, p: &ArmParams) -> anyhow::Result<()> {
-        self.node_ip = Some(p.node_ip);
-        self.tun_name = Some(p.tun_name.clone());
+        if self.armed {
+            anyhow::bail!("Windows datapath is already armed or still requires rollback");
+        }
+        // Routing can fail partway even when the user disabled the kill-switch. Record rollback
+        // eligibility before the first host mutation in every mode.
+        self.armed = true;
 
         // Fail-closed: arm the kill-switch BEFORE flipping the default route (no leak window).
         // Any cmdlet error aborts the whole bring-up rather than running unprotected. The
@@ -68,11 +76,9 @@ impl NetControl for WinNet {
             // by teardown. Mark armed-for-teardown before the rules go in.
             let saved = capture_default_outbound()?;
             self.ks_saved = Some(saved);
-            self.kill_switch = true;
-            self.armed = true; // so teardown runs even if a later step below fails
+            self.firewall_touched = true;
             apply_kill_switch(p.node_ip, &p.also_except, &p.tun_name)?;
         }
-        self.also_except = p.also_except.clone();
 
         // Resolve interface indices we need for routing.
         let tun_idx = if_index_for_name(&p.tun_name).ok_or_else(|| {
@@ -84,11 +90,10 @@ impl NetControl for WinNet {
         //    packets to the node bypass the TUN (best-effort: an on-link node is already
         //    covered by its connected route).
         if let Some((orig_idx, gw)) = default_route() {
-            self.orig_idx = Some(orig_idx);
             let pfx = format!("prefix={}/32", p.node_ip);
             let ifc = format!("interface={orig_idx}");
             let nh = format!("nexthop={gw}");
-            if let Err(e) = sh(
+            match sh(
                 "netsh",
                 &[
                     "interface",
@@ -102,12 +107,16 @@ impl NetControl for WinNet {
                     "store=active",
                 ],
             ) {
-                tracing::warn!("pin node route (continuing; may be on-link): {e}");
+                Ok(()) => self.pinned_routes.push(PinnedRoute {
+                    ip: p.node_ip,
+                    interface: orig_idx,
+                }),
+                Err(e) => tracing::warn!("pin node route (continuing; may be on-link): {e}"),
             }
             // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
             for ip in &p.also_except {
                 let pfx = format!("prefix={ip}/32");
-                if let Err(e) = sh(
+                match sh(
                     "netsh",
                     &[
                         "interface",
@@ -121,7 +130,11 @@ impl NetControl for WinNet {
                         "store=active",
                     ],
                 ) {
-                    tracing::warn!("pin fallback node route (continuing): {e}");
+                    Ok(()) => self.pinned_routes.push(PinnedRoute {
+                        ip: *ip,
+                        interface: orig_idx,
+                    }),
+                    Err(e) => tracing::warn!("pin fallback node route (continuing): {e}"),
                 }
             }
         } else {
@@ -143,6 +156,7 @@ impl NetControl for WinNet {
                 "store=active",
             ],
         )?;
+        self.low_default_added = true;
         sh(
             "netsh",
             &[
@@ -155,6 +169,7 @@ impl NetControl for WinNet {
                 "store=active",
             ],
         )?;
+        self.high_default_added = true;
 
         // 3. Point the TUN adapter's DNS at the tunnel resolver(s). With the TUN as the
         //    default route, the system prefers its resolvers; the (future) WFP kill-switch
@@ -163,80 +178,100 @@ impl NetControl for WinNet {
             set_dns(&p.tun_name, &p.dns);
         }
 
-        self.armed = true;
         tracing::info!(tun = %p.tun_name, tun_idx, kill_switch = p.kill_switch, "Windows datapath armed");
         Ok(())
     }
 
-    fn teardown(&mut self) {
+    fn teardown(&mut self) -> anyhow::Result<()> {
         if !self.armed {
-            return;
+            return Ok(());
         }
+        let mut errors = CleanupErrors::default();
+
         // Remove our default routes.
         if let Some(idx) = self.tun_idx {
             let ifc = format!("interface={idx}");
-            let _ = sh(
-                "netsh",
-                &[
-                    "interface",
-                    "ipv4",
-                    "delete",
-                    "route",
-                    "prefix=0.0.0.0/1",
-                    &ifc,
-                ],
-            );
-            let _ = sh(
-                "netsh",
-                &[
-                    "interface",
-                    "ipv4",
-                    "delete",
-                    "route",
-                    "prefix=128.0.0.0/1",
-                    &ifc,
-                ],
-            );
+            if self.high_default_added
+                && errors.attempt(
+                    "remove upper tunnel route",
+                    sh(
+                        "netsh",
+                        &[
+                            "interface",
+                            "ipv4",
+                            "delete",
+                            "route",
+                            "prefix=128.0.0.0/1",
+                            &ifc,
+                        ],
+                    ),
+                )
+            {
+                self.high_default_added = false;
+            }
+            if self.low_default_added
+                && errors.attempt(
+                    "remove lower tunnel route",
+                    sh(
+                        "netsh",
+                        &[
+                            "interface",
+                            "ipv4",
+                            "delete",
+                            "route",
+                            "prefix=0.0.0.0/1",
+                            &ifc,
+                        ],
+                    ),
+                )
+            {
+                self.low_default_added = false;
+            }
         }
-        // Remove the pinned node route(s).
-        if let Some(orig) = self.orig_idx {
-            let ifc = format!("interface={orig}");
-            if let Some(ip) = self.node_ip {
-                let _ = sh(
+
+        let mut failed_routes = Vec::new();
+        for route in self.pinned_routes.drain(..) {
+            let ifc = format!("interface={}", route.interface);
+            if !errors.attempt(
+                "remove pinned node route",
+                sh(
                     "netsh",
                     &[
                         "interface",
                         "ipv4",
                         "delete",
                         "route",
-                        &format!("prefix={ip}/32"),
+                        &format!("prefix={}/32", route.ip),
                         &ifc,
                     ],
-                );
-            }
-            for ip in &self.also_except {
-                let _ = sh(
-                    "netsh",
-                    &[
-                        "interface",
-                        "ipv4",
-                        "delete",
-                        "route",
-                        &format!("prefix={ip}/32"),
-                        &ifc,
-                    ],
-                );
+                ),
+            ) {
+                failed_routes.push(route);
             }
         }
+        self.pinned_routes = failed_routes;
         // The wintun adapter (and its per-interface DNS) disappears when tun-rs drops the
         // device, so there is no host DNS state to restore.
         //
         // Disarm the kill-switch LAST so connectivity only returns once routes are sane.
-        if self.kill_switch {
-            disarm_kill_switch(self.ks_saved.as_deref());
+        if errors.is_empty()
+            && self.firewall_touched
+            && errors.attempt(
+                "restore Windows Firewall profiles",
+                disarm_kill_switch(self.ks_saved.as_deref()),
+            )
+        {
+            self.firewall_touched = false;
         }
-        self.armed = false;
-        tracing::info!("Windows datapath torn down; networking restored");
+
+        self.armed = self.low_default_added
+            || self.high_default_added
+            || !self.pinned_routes.is_empty()
+            || self.firewall_touched;
+        if !self.armed {
+            tracing::info!("Windows datapath torn down; networking restored");
+        }
+        errors.finish()
     }
 }
 
@@ -332,14 +367,36 @@ const KS_GROUP: &str = "NIL-VPN-killswitch";
 /// so teardown can restore it. Done as its own step, BEFORE any rule is added, so the saved value
 /// is recorded even if the rule application below fails partway (teardown then restores + cleans).
 fn capture_default_outbound() -> anyhow::Result<String> {
-    ps("(Get-NetFirewallProfile -Profile Domain,Private,Public | \
-         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'")
+    let saved = ps("(Get-NetFirewallProfile -Profile Domain,Private,Public | \
+         ForEach-Object { \"$($_.Name)=$($_.DefaultOutboundAction)\" }) -join ';'")?;
+    saved_firewall_profiles(&saved)?;
+    Ok(saved)
+}
+
+fn saved_firewall_profiles(saved: &str) -> anyhow::Result<Vec<(&str, &str)>> {
+    let mut profiles = Vec::new();
+    for entry in saved.split(';') {
+        let (name, action) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("malformed saved firewall profile"))?;
+        let (name, action) = (name.trim(), action.trim());
+        if !matches!(name, "Domain" | "Private" | "Public")
+            || !matches!(action, "Allow" | "Block" | "NotConfigured")
+            || profiles.iter().any(|(existing, _)| *existing == name)
+        {
+            anyhow::bail!("invalid or duplicate saved firewall profile");
+        }
+        profiles.push((name, action));
+    }
+    if profiles.len() != 3 {
+        anyhow::bail!("saved firewall state does not contain exactly three profiles");
+    }
+    Ok(profiles)
 }
 
 /// Arm the fail-closed kill-switch via the Windows Firewall (NetSecurity cmdlets).
 ///
-/// VERIFIED in a Windows-on-ARM VM (the host stays untouched), same discipline as the Linux
-/// (Docker) and macOS (tart VM) paths. The mechanism:
+/// Source implementation (privileged runtime validation remains required). The mechanism:
 ///   1. add Allow rules (our group) for the TUN interface and the encapsulated QUIC/TCP to the
 ///      node — loopback is firewall-exempt by default,
 ///   2. flip the default outbound action to Block, so any egress not matching an Allow (i.e.
@@ -358,9 +415,9 @@ fn capture_default_outbound() -> anyhow::Result<String> {
 fn apply_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyhow::Result<()> {
     let node = node_ip.to_string();
     // Clear any stale rules from a previous run (idempotent).
-    let _ = ps(&format!(
+    ps(&format!(
         "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
-    ));
+    ))?;
     // 1. Allow the tunnel interface and the encapsulated QUIC/TCP to the node.
     ps(&format!(
         "New-NetFirewallRule -DisplayName 'NIL allow TUN' -Group '{KS_GROUP}' -Direction Outbound \
@@ -388,22 +445,41 @@ fn apply_kill_switch(node_ip: IpAddr, also_except: &[IpAddr], tun: &str) -> anyh
 }
 
 /// Tear down the kill-switch: restore each profile's saved default action, then remove our rules.
-fn disarm_kill_switch(saved: Option<&str>) {
+fn disarm_kill_switch(saved: Option<&str>) -> anyhow::Result<()> {
+    let mut errors = CleanupErrors::default();
     if let Some(saved) = saved {
-        for entry in saved.split(';') {
-            if let Some((name, action)) = entry.split_once('=') {
-                let (name, action) = (name.trim(), action.trim());
-                if !name.is_empty() && !action.is_empty() {
-                    let _ = ps(&format!(
-                        "Set-NetFirewallProfile -Profile {name} -DefaultOutboundAction {action}"
-                    ));
+        match saved_firewall_profiles(saved) {
+            Ok(profiles) => {
+                for (name, action) in profiles {
+                    errors.attempt(
+                        "restore firewall profile",
+                        ps(&format!(
+                            "Set-NetFirewallProfile -Profile {name} -DefaultOutboundAction {action}"
+                        ))
+                        .map(|_| ()),
+                    );
                 }
             }
+            Err(error) => {
+                errors.attempt("validate saved firewall profiles", Err(error));
+            }
         }
+    } else {
+        errors.attempt(
+            "restore firewall profile",
+            Err(anyhow::anyhow!("saved profile defaults are missing")),
+        );
     }
-    let _ = ps(&format!(
-        "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
-    ));
+    if errors.is_empty() {
+        errors.attempt(
+            "remove NIL firewall rules",
+            ps(&format!(
+                "Remove-NetFirewallRule -Group '{KS_GROUP}' -ErrorAction SilentlyContinue"
+            ))
+            .map(|_| ()),
+        );
+    }
+    errors.finish()
 }
 
 /// Run a PowerShell command, returning trimmed stdout. Errors on a non-zero exit.

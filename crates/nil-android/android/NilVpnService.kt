@@ -6,8 +6,12 @@ import android.app.NotificationManager
 import android.content.Intent
 import android.net.VpnService
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.channels.FileLock
+import java.security.SecureRandom
 
 /**
  * The `:vpn` process. Configures the TUN via VpnService.Builder (routes/DNS/MTU set here at
@@ -31,6 +35,47 @@ class NilVpnService : VpnService() {
     @Volatile private var torndown = false
     private var poller: Thread? = null
     private var lastState: String = ""
+    private var currentReservationId: String = ""
+    // Kernel-released process-incarnation proof. The app process must observe this exclusive lock
+    // before it may treat an `up` status record as live; process death releases it immediately,
+    // closing the heartbeat's otherwise unavoidable freshness window.
+    private var statusLeaseFile: RandomAccessFile? = null
+    private var statusLease: FileLock? = null
+    private var statusIncarnationId: String = ""
+
+    override fun onCreate() {
+        super.onCreate()
+        var leaseFile: RandomAccessFile? = null
+        var lease: FileLock? = null
+        try {
+            leaseFile = RandomAccessFile(File(filesDir, STATUS_LEASE_FILE), "rw")
+            lease = leaseFile.channel.tryLock()
+            if (lease == null) {
+                leaseFile.close()
+                Log.e(TAG, "another VPN service process owns the status lease")
+            } else {
+                val incarnationBytes = ByteArray(32)
+                SecureRandom().nextBytes(incarnationBytes)
+                val incarnation = incarnationBytes.joinToString("") {
+                    "%02x".format(it.toInt() and 0xff)
+                }
+                incarnationBytes.fill(0)
+                leaseFile.setLength(0)
+                leaseFile.writeBytes(incarnation)
+                leaseFile.fd.sync()
+                statusIncarnationId = incarnation
+                statusLeaseFile = leaseFile
+                statusLease = lease
+                // Ownership moved to the service fields.
+                leaseFile = null
+                lease = null
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "could not acquire the VPN status lease", e)
+            try { lease?.release() } catch (_: Throwable) { /* ignore */ }
+            try { leaseFile?.close() } catch (_: Throwable) { /* ignore */ }
+        }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Disconnect path. `stopService` does NOT destroy a foreground VpnService (the system binds it
@@ -50,20 +95,48 @@ class NilVpnService : VpnService() {
 
     private fun onStart(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "onStartCommand flags=$flags startId=$startId hasIntent=${intent != null}")
+        if (statusLease == null) {
+            Log.e(TAG, "status lease unavailable — refusing to start")
+            writeStatus(DOWN)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        // Never overwrite a live/dead session's handle, TUN fd, or reservation binding with a
+        // second start intent. Rust explicitly stops a DEAD session before asking the user to retry.
+        if (handle != 0L || pfd != null || running) {
+            Log.e(TAG, "start requested while a VPN session still owns native resources")
+            return START_NOT_STICKY
+        }
         val nodeHost = intent?.getStringExtra("nodeHost") ?: run {
             Log.e(TAG, "no nodeHost extra — abort"); writeStatus(DOWN); return START_NOT_STICKY
+        }
+        currentReservationId = intent.getStringExtra("reservationId") ?: ""
+        if (!currentReservationId.matches(Regex("[0-9a-f]{64}"))) {
+            Log.e(TAG, "missing or invalid reservation id")
+            currentReservationId = ""
+            writeStatus(DOWN)
+            stopSelf()
+            return START_NOT_STICKY
         }
         val nodePort = intent.getIntExtra("nodePort", 443)
         val serverName = intent.getStringExtra("serverName") ?: nodeHost
         val measurement = intent.getStringExtra("measurementHex") ?: ""
+        val tlsSpkiSha256 = intent.getStringExtra("tlsSpkiSha256Hex") ?: ""
+        val transparencyLogKey = intent.getStringExtra("transparencyLogKeyHex") ?: ""
         val grant = intent.getStringExtra("grantHex") ?: ""
         val grantNonce = intent.getStringExtra("grantNonceHex") ?: ""
         val allowUnattested = intent.getBooleanExtra("allowUnattested", false)
         val teeName = intent.getStringExtra("teeName") ?: "sev-snp"
+        val minTcbPresent = intent.getBooleanExtra("minTcbPresent", false)
+        val minTcbFmc = intent.getIntExtra("minTcbFmc", -1)
+        val minTcbBootloader = intent.getIntExtra("minTcbBootloader", 0)
+        val minTcbTee = intent.getIntExtra("minTcbTee", 0)
+        val minTcbSnp = intent.getIntExtra("minTcbSnp", 0)
+        val minTcbMicrocode = intent.getIntExtra("minTcbMicrocode", 0)
         // SOUL §3 / PD-2: the node address (host/port/SNI) is a "destination" and MUST NOT reach
         // logcat (readable via adb / READ_LOGS apps / crash reporters) — it would link user→node→time.
         // The grant/nonce are a bearer credential + freshness nonce; log only lengths, never values.
-        Log.i(TAG, "extras measLen=${measurement.length} tee=$teeName grantLen=${grant.length} allowUnattested=$allowUnattested")
+        Log.i(TAG, "extras measLen=${measurement.length} logKeySet=${transparencyLogKey.isNotEmpty()} tee=$teeName grantLen=${grant.length} allowUnattested=$allowUnattested")
 
         try {
             // Not "Connected" yet — the attestation gate hasn't run. Claiming it here would be the
@@ -116,7 +189,12 @@ class NilVpnService : VpnService() {
         val fd = tun.detachFd()
         Log.i(TAG, "detachFd=$fd — calling nativeStart")
         handle = try {
-            NilNative.nativeStart(fd, nodeHost, nodePort, MTU, serverName, measurement, teeName, grant, grantNonce, allowUnattested, this)
+            NilNative.nativeStart(
+                fd, nodeHost, nodePort, MTU, serverName, measurement, tlsSpkiSha256,
+                transparencyLogKey, teeName,
+                minTcbPresent, minTcbFmc, minTcbBootloader, minTcbTee, minTcbSnp, minTcbMicrocode,
+                grant, grantNonce, allowUnattested, this,
+            )
         } catch (e: Throwable) {
             Log.e(TAG, "nativeStart threw", e); 0L
         }
@@ -146,12 +224,16 @@ class NilVpnService : VpnService() {
         poller = Thread {
             while (running) {
                 val state = engineState()
-                if (!stopping && state != lastState) {
-                    lastState = state
+                if (!stopping) {
+                    // Heartbeat even when state is unchanged. The app process may only reconcile a
+                    // pending token against a fresh record from this still-running service.
                     writeStatus(state)
-                    when (state) {
-                        DEAD -> updateNotification("Connection lost — traffic is blocked")
-                        UP -> updateNotification("Connected through an attested node")
+                    if (state != lastState) {
+                        lastState = state
+                        when (state) {
+                            DEAD -> updateNotification("Connection lost — traffic is blocked")
+                            UP -> updateNotification("Connected through an attested node")
+                        }
                     }
                 }
                 try { Thread.sleep(POLL_MS) } catch (e: InterruptedException) { break }
@@ -172,17 +254,24 @@ class NilVpnService : VpnService() {
     }
 
     /**
-     * Atomically publish the tunnel state to the app (WebView) process. Both processes share this
+     * Atomically publish the tunnel state to the app's Rust process. Both processes share this
      * app's private `filesDir`, so a temp-write + rename is a simple, dependency-free cross-process
-     * channel — no bound service / AIDL. NilVpnPlugin.statusVPN reads it. Carries only a state word,
-     * never any node/identity data (PD-2).
+     * channel — no bound service / AIDL. NilVpnPlugin.statusVpn reads it. The random local
+     * reservation id is echoed beside the state so stale service output cannot complete a newer
+     * pass; it carries no node/account/payment data (PD-2).
      */
     private fun writeStatus(state: String) {
         try {
             val tmp = File(filesDir, "$STATUS_FILE.tmp")
-            tmp.writeText(state)
+            val writtenAt = SystemClock.elapsedRealtime()
+            val record = if (currentReservationId.isEmpty()) {
+                "$state||$writtenAt|$statusIncarnationId"
+            } else {
+                "$state|$currentReservationId|$writtenAt|$statusIncarnationId"
+            }
+            tmp.writeText(record)
             if (!tmp.renameTo(File(filesDir, STATUS_FILE))) {
-                File(filesDir, STATUS_FILE).writeText(state) // fallback if rename is unavailable
+                File(filesDir, STATUS_FILE).writeText(record) // fallback if rename is unavailable
             }
         } catch (e: Throwable) {
             Log.e(TAG, "writeStatus failed", e)
@@ -211,6 +300,11 @@ class NilVpnService : VpnService() {
         }
         try { pfd?.close() } catch (e: Throwable) { /* ignore */ }
         pfd = null
+        try { statusLease?.release() } catch (e: Throwable) { /* kernel also releases on death */ }
+        statusLease = null
+        try { statusLeaseFile?.close() } catch (e: Throwable) { /* ignore */ }
+        statusLeaseFile = null
+        statusIncarnationId = ""
     }
 
     override fun onRevoke() {
@@ -260,6 +354,8 @@ class NilVpnService : VpnService() {
         private val STATE_RE = Regex("\"state\"\\s*:\\s*\"(\\w+)\"")
         /** Status file in the app's private filesDir — the app↔:vpn status channel. */
         const val STATUS_FILE = "nil_vpn_status"
+        /** Exclusive lifetime lease proving the separate `:vpn` process is still alive. */
+        const val STATUS_LEASE_FILE = "nil_vpn_status.lease"
         const val CONNECTING = "connecting"
         const val UP = "up"
         const val DEAD = "dead"

@@ -5,7 +5,6 @@ import type { AnonymousAccount } from "./lib/types";
 import { ErrorBanner } from "./components";
 import {
   BuyTokensScreen,
-  EmailSignupScreen,
   FirstRunScreen,
   MainScreen,
   RecoverAccountScreen,
@@ -16,7 +15,6 @@ import {
 
 type Screen =
   | "firstrun"
-  | "email"
   | "phrase"
   | "recover"
   | "main"
@@ -46,11 +44,13 @@ function App() {
     }
   }
 
-  async function handleEmail(email: string) {
+  async function handleConfirmAccount() {
+    if (!account) return;
     setBusy(true);
     setError(null);
     try {
-      await api.createEmailAccount(email);
+      await api.confirmAnonymousAccount(account.recovery_phrase, account.account_number);
+      setAccount(null);
       setScreen("main");
     } catch (e) {
       setError(String(e));
@@ -59,11 +59,11 @@ function App() {
     }
   }
 
-  async function handleRecover(phrase: string[], code: string) {
+  async function handleRecover(phrase: string[]) {
     setBusy(true);
     setError(null);
     try {
-      await api.recoverAccount(phrase, code);
+      await api.recoverAccount(phrase);
       setScreen("main");
     } catch (e) {
       setError(String(e));
@@ -95,23 +95,17 @@ function App() {
         <FirstRunScreen
           busy={busy}
           onAnonymous={handleAnonymous}
-          onEmail={() => setScreen("email")}
           onRecover={() => setScreen("recover")}
         />
       )}
-      {screen === "email" && (
-        <EmailSignupScreen busy={busy} onSubmit={handleEmail} onBack={() => setScreen("firstrun")} />
-      )}
       {screen === "phrase" && account && (
-        // Drop the recovery phrase / code / account number from app state once the user leaves the
+        // Drop the recovery phrase / account number from app state once the user leaves the
         // display screen — the frontend has no further need for them, so they must not linger in the
         // JS heap (DevTools / heap dump / XSS reach) for the rest of the session (SOUL §3, PD-2).
         <RecoveryPhraseScreen
           account={account}
-          onContinue={() => {
-            setAccount(null);
-            setScreen("main");
-          }}
+          busy={busy}
+          onContinue={handleConfirmAccount}
         />
       )}
       {screen === "recover" && (

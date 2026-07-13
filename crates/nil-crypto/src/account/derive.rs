@@ -1,6 +1,6 @@
 //! Key derivation: phrase entropy → 256-bit account secret → account number.
 //!
-//! All inputs are domain-separated with versioned labels (`nil.account.v1.*`) so the
+//! All inputs are domain-separated with versioned labels (`nil.account.v2.*`) so the
 //! scheme can evolve without ambiguity and the same material is never reused across
 //! contexts.
 
@@ -10,10 +10,10 @@ use zeroize::Zeroizing;
 
 use super::phrase::PhraseEntropy;
 
-const HKDF_SALT: &[u8] = b"nil.account.v1.hkdf-salt";
-const SECRET_INFO: &[u8] = b"nil.account.v1.secret";
-const ACCOUNT_DOMAIN: &[u8] = b"nil.account.v1.number";
-const AUTH_SEED_INFO: &[u8] = b"nil.account.v1.auth-ed25519-seed";
+const HKDF_SALT: &[u8] = b"nil.account.v2.hkdf-salt";
+const SECRET_INFO: &[u8] = b"nil.account.v2.secret";
+const ACCOUNT_DOMAIN: &[u8] = b"nil.account.v2.number";
+const AUTH_SEED_INFO: &[u8] = b"nil.account.v2.auth-ed25519-seed";
 
 /// Derive the 256-bit account secret from the phrase entropy via HKDF-SHA256.
 /// Returned wrapped so it is zeroized on drop.
@@ -42,8 +42,8 @@ pub(crate) fn auth_seed_from_entropy(e: &PhraseEntropy) -> Zeroizing<[u8; 32]> {
 }
 
 /// `account_number = SHA-256(domain || secret)` — the 32-byte canonical identifier.
-/// This is the only thing the Portal persists for an anonymous account (plus the
-/// recovery-code hash and entitlement).
+/// This is the anonymous account identifier the Portal persists alongside the
+/// account's public authentication key and entitlement.
 pub(crate) fn account_hash(secret: &[u8; 32]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(ACCOUNT_DOMAIN);

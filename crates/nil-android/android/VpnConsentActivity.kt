@@ -44,7 +44,15 @@ class VpnConsentActivity : Activity() {
             putExtra("nodePort", intent.getIntExtra("nodePort", 443))
             putExtra("serverName", intent.getStringExtra("serverName"))
             putExtra("measurementHex", intent.getStringExtra("measurementHex"))
+            putExtra("tlsSpkiSha256Hex", intent.getStringExtra("tlsSpkiSha256Hex"))
+            putExtra("transparencyLogKeyHex", intent.getStringExtra("transparencyLogKeyHex"))
             putExtra("teeName", intent.getStringExtra("teeName"))
+            putExtra("minTcbPresent", intent.getBooleanExtra("minTcbPresent", false))
+            putExtra("minTcbFmc", intent.getIntExtra("minTcbFmc", -1))
+            putExtra("minTcbBootloader", intent.getIntExtra("minTcbBootloader", 0))
+            putExtra("minTcbTee", intent.getIntExtra("minTcbTee", 0))
+            putExtra("minTcbSnp", intent.getIntExtra("minTcbSnp", 0))
+            putExtra("minTcbMicrocode", intent.getIntExtra("minTcbMicrocode", 0))
             // Forward the Coordinator grant so the consent-flow entry point starts the SAME attested,
             // granted tunnel as the plugin path (never an ungranted one).
             putExtra("grantHex", intent.getStringExtra("grantHex"))

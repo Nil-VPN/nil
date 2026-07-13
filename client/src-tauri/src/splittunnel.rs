@@ -38,7 +38,10 @@ fn validate(enabled: bool, apps: &[String]) -> anyhow::Result<SplitTunnelConfig>
         }
         bypass_apps.push(a.to_string());
     }
-    Ok(SplitTunnelConfig { enabled, bypass_apps })
+    Ok(SplitTunnelConfig {
+        enabled,
+        bypass_apps,
+    })
 }
 
 #[cfg(test)]

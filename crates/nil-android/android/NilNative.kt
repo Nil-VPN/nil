@@ -15,7 +15,15 @@ object NilNative {
         mtu: Int,
         serverName: String,
         measurementHex: String,   // "" when allowUnattested
+        tlsSpkiSha256Hex: String,  // stable node TLS SPKI identity; 32-byte SHA-256 hex
+        transparencyLogKeyHex: String, // Ed25519 log key; mandatory in release attested mode
         teeName: String,          // "sev-snp" or "tdx"
+        minTcbPresent: Boolean,
+        minTcbFmc: Int,           // -1 means no FMC requirement; otherwise 0..255
+        minTcbBootloader: Int,
+        minTcbTee: Int,
+        minTcbSnp: Int,
+        minTcbMicrocode: Int,
         grantHex: String,         // Coordinator grant for this hop ("" if none); node verifies it
         grantNonceHex: String,    // per-connection nonce bound into the grant + attestation report
         allowUnattested: Boolean,

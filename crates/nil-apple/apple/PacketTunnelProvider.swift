@@ -1,7 +1,7 @@
 // Reference NEPacketTunnelProvider for NIL VPN (iOS app extension + macOS system extension — same
 // provider). Drives the C-ABI engine in this crate (nil_start / nil_ingest_packets /
-// nil_negotiated_mtu / nil_stop from nil_apple.h, imported via the extension's bridging header). The
-// container app redeems the unlinkable token and passes ONLY the node endpoint + pinned measurement
+// nil_assigned_ipv4 / nil_negotiated_mtu / nil_stop from nil_apple.h, imported via the extension's bridging header). The
+// container app redeems the blind-signed bearer token and passes ONLY the node endpoint + pinned measurement
 // + the per-connection grant (token + freshness nonce) in providerConfiguration — no identity reaches
 // the extension.
 //
@@ -21,8 +21,36 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let port = UInt16((cfg["nodePort"] as? Int) ?? 443)
         let sni = (cfg["serverName"] as? String) ?? host
         let measurement = (cfg["measurementHex"] as? String) ?? ""
+        let tlsSpkiSha256 = (cfg["tlsSpkiSha256Hex"] as? String) ?? ""
+        let transparencyLogKey = (cfg["transparencyLogKeyHex"] as? String) ?? ""
         let teeName = (cfg["teeName"] as? String) ?? "sev-snp"
         let allow = (cfg["allowUnattested"] as? Bool) ?? false
+        let floorConfig = cfg["minTcbSevsnp"] as? [String: Any]
+        var nativeFloor = NilSevSnpTcbFloor(
+            fmc: -1, bootloader: 0, tee: 0, snp: 0, microcode: 0)
+        if let floor = floorConfig {
+            func component(_ name: String) -> UInt8? {
+                guard let value = floor[name] as? Int, (0...255).contains(value) else { return nil }
+                return UInt8(value)
+            }
+            guard let bootloader = component("bootloader"),
+                  let tee = component("tee"),
+                  let snp = component("snp"),
+                  let microcode = component("microcode") else {
+                completionHandler(NEVPNError(.configurationInvalid))
+                return
+            }
+            var fmc: Int16 = -1
+            if floor.keys.contains("fmc") {
+                guard let value = component("fmc") else {
+                    completionHandler(NEVPNError(.configurationInvalid))
+                    return
+                }
+                fmc = Int16(value)
+            }
+            nativeFloor = NilSevSnpTcbFloor(
+                fmc: fmc, bootloader: bootloader, tee: tee, snp: snp, microcode: microcode)
+        }
         // Per-connection Privacy Pass grant (redeemed in the container app), passed as hex. Empty when
         // unauthenticated; the engine falls back to a fresh random freshness nonce.
         let grantHex = (cfg["grantHex"] as? String) ?? ""
@@ -41,16 +69,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
 
         let ctx = Unmanaged.passUnretained(self).toOpaque()
-        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in teeName.withCString { tp in grantHex.withCString { gp in grantNonceHex.withCString { np in
-            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, tee_name: tp, allow_unattested: allow, grant_hex: gp, grant_nonce_hex: np)
+        host.withCString { hp in sni.withCString { sp in measurement.withCString { mp in tlsSpkiSha256.withCString { tsp in transparencyLogKey.withCString { lkp in teeName.withCString { tp in grantHex.withCString { gp in grantNonceHex.withCString { np in
+            var c = NilConfig(node_host: hp, node_port: port, server_name: sp, measurement_hex: mp, tls_spki_sha256_hex: tsp, transparency_log_key_hex: lkp, tee_name: tp, allow_unattested: allow, has_min_tcb_sevsnp: floorConfig != nil, min_tcb_sevsnp: nativeFloor, grant_hex: gp, grant_nonce_hex: np)
             tunnel = nil_start(&c, ctx, writeCb, statusCb)
-        }}}}}}
+        }}}}}}}}
         if tunnel == nil { completionHandler(NEVPNError(.configurationInvalid)); startCompletion = nil }
     }
 
     private func applySettingsAndRead() {
         let s = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: "10.74.0.1")
-        s.ipv4Settings = NEIPv4Settings(addresses: ["10.74.0.2"], subnetMasks: ["255.255.255.0"])
+        let assigned = nil_assigned_ipv4(tunnel)
+        let clientAddress = assigned == 0
+            ? "10.74.0.2"
+            : "\((assigned >> 24) & 0xff).\((assigned >> 16) & 0xff).\((assigned >> 8) & 0xff).\(assigned & 0xff)"
+        s.ipv4Settings = NEIPv4Settings(addresses: [clientAddress], subnetMasks: ["255.255.255.0"])
         s.ipv4Settings?.includedRoutes = [NEIPv4Route.default()]
         // IPv6 leak fix (Epic 9): the engine is IPv4-only, so capture all IPv6 into the tunnel with a
         // ULA address + a v6 default route. v6 packets entering the engine are dropped, preventing the

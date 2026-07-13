@@ -40,45 +40,98 @@ async fn subscribe_activate_mint_and_relogin() {
 
     // 2. A fresh account is NOT subscribed.
     let pre = portal.status(&material).await.expect("status (pre)");
-    assert_ne!(pre.entitlement, EntitlementDto::Active, "a fresh account is not active");
+    assert_ne!(
+        pre.entitlement,
+        EntitlementDto::Active,
+        "a fresh account is not active"
+    );
     assert!(pre.until.is_none());
 
-    // 3. Mint must be refused before subscribing (no active subscription).
-    assert!(tokens.mint(&material).await.is_err(), "mint refused without a subscription");
+    // 3. Batch prefetch must be refused before subscribing (no active subscription).
+    assert!(
+        tokens.mint_batch(&material, 8).await.is_err(),
+        "prefetch refused without a subscription"
+    );
 
     // 4. Subscribe → reference; activate (mock-paid confirms instantly) → Active with an expiry.
-    let reference = portal.subscribe(&material).await.expect("subscribe").payment_reference;
-    let activated = portal.activate(&material, reference.clone()).await.expect("activate");
+    let reference = portal
+        .subscribe(&material)
+        .await
+        .expect("subscribe")
+        .payment_reference;
+    let activated = portal
+        .activate(&material, reference.clone())
+        .await
+        .expect("activate");
     assert_eq!(activated.entitlement, EntitlementDto::Active);
     let until = activated.until.expect("active has an expiry");
 
     // 5. The SAME reference cannot extend twice (one extension per payment).
-    assert!(portal.activate(&material, reference).await.is_err(), "no double-extend");
+    assert!(
+        portal.activate(&material, reference).await.is_err(),
+        "no double-extend"
+    );
 
-    // 6. Mint on demand against the active subscription → a real, well-formed unblinded token.
-    let token = tokens.mint(&material).await.expect("mint while active");
-    assert_eq!(token.msg.len(), 64, "msg is 32-byte hex");
-    assert!(!token.token.is_empty() && token.token.bytes().all(|c| c.is_ascii_hexdigit()));
-
-    // 7. Mint AGAIN — the subscription is unlimited-while-active, so a second token mints too, and
-    //    the two are distinct (each connection spends its own).
-    let token2 = tokens.mint(&material).await.expect("mint a second token");
-    assert_ne!(token.msg, token2.msg, "each mint is a fresh, distinct token");
+    // 6. One authenticated batch prefetch yields distinct, well-formed unblinded tokens that later
+    //    connects can consume without contacting the account-authenticated issuer.
+    let batch = tokens
+        .mint_batch(&material, 8)
+        .await
+        .expect("prefetch while active");
+    assert_eq!(batch.len(), 8);
+    assert!(batch.iter().all(|token| token.msg.len() == 64));
+    assert!(batch.iter().all(|token| {
+        !token.token.is_empty() && token.token.bytes().all(|c| c.is_ascii_hexdigit())
+    }));
+    let unique = batch
+        .iter()
+        .map(|token| token.msg.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        unique.len(),
+        batch.len(),
+        "every prefetched token is distinct"
+    );
 
     // 8. RE-LOGIN simulation: a brand-new client (fresh PortalClient/TokenClient) that only re-derived
     //    the same material from the phrase — no shared state — still sees Active and can still mint.
     //    This is the core acceptance: log back in on any device → reconnect with no new payment.
     let relogin_material = material_from_phrase(&account.recovery_phrase);
-    assert_eq!(relogin_material, material, "the phrase deterministically re-derives the auth material");
-    let fresh_portal = PortalClient::with_base_url(std::env::var("PORTAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()));
-    let fresh_tokens = TokenClient::with_base_url(std::env::var("PORTAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()));
-    let relogin_status = fresh_portal.status(&relogin_material).await.expect("status after re-login");
-    assert_eq!(relogin_status.entitlement, EntitlementDto::Active, "re-login sees the active subscription");
-    assert_eq!(relogin_status.until, Some(until), "same expiry after re-login");
-    let relogin_token = fresh_tokens.mint(&relogin_material).await.expect("mint after re-login");
-    assert_eq!(relogin_token.msg.len(), 64, "a re-logged-in device mints a usable token");
+    assert_eq!(
+        relogin_material, material,
+        "the phrase deterministically re-derives the auth material"
+    );
+    let fresh_portal = PortalClient::with_base_url(
+        std::env::var("PORTAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+    );
+    let fresh_tokens = TokenClient::with_base_url(
+        std::env::var("PORTAL_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into()),
+    );
+    let relogin_status = fresh_portal
+        .status(&relogin_material)
+        .await
+        .expect("status after re-login");
+    assert_eq!(
+        relogin_status.entitlement,
+        EntitlementDto::Active,
+        "re-login sees the active subscription"
+    );
+    assert_eq!(
+        relogin_status.until,
+        Some(until),
+        "same expiry after re-login"
+    );
+    let relogin_tokens = fresh_tokens
+        .mint_batch(&relogin_material, 2)
+        .await
+        .expect("prefetch after re-login");
+    assert_eq!(
+        relogin_tokens.len(),
+        2,
+        "a re-logged-in device refills a usable batch"
+    );
 
-    println!("OK: create → subscribe → activate → mint x2 → re-login → status Active → mint again");
+    println!("OK: create → subscribe → activate → batch prefetch → re-login → status Active → batch prefetch");
 }
 
 /// Deploy smoke test: verifies the subscription endpoints are DEPLOYED and correctly gated, WITHOUT
@@ -106,7 +159,11 @@ async fn subscription_endpoints_live_smoke() {
     );
 
     // /v1/billing/subscribe is wired + authenticates: returns a 256-bit reference, no payment needed.
-    let reference = portal.subscribe(&material).await.expect("subscribe").payment_reference;
+    let reference = portal
+        .subscribe(&material)
+        .await
+        .expect("subscribe")
+        .payment_reference;
     assert_eq!(reference.len(), 64, "a 256-bit reference is 64 hex chars");
 
     // /v1/billing/activate BEFORE the payment confirms → 402 PaymentNotConfirmed. (A mock-paid Portal
@@ -120,9 +177,12 @@ async fn subscription_endpoints_live_smoke() {
         Err(e) => panic!("unexpected activate error: {e:?}"),
     }
 
-    // /v1/tokens/mint without an active subscription → 402 NotSubscribed.
+    // /v2/tokens/mint without an active subscription → 402 NotSubscribed.
     assert!(
-        matches!(tokens.mint(&material).await, Err(nil_client_lib::tokens::TokenError::NotSubscribed)),
+        matches!(
+            tokens.mint_batch(&material, 8).await,
+            Err(nil_client_lib::tokens::TokenError::NotSubscribed)
+        ),
         "mint must be refused without an active subscription"
     );
 

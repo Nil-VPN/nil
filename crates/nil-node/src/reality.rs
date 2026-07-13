@@ -111,11 +111,11 @@ async fn serve<S>(
 
     // Record 1: [auth_id ‖ client WG pubkey]. Bounded — a peer that completes the TLS handshake but
     // never sends its auth record must not hold the single-client slot forever.
-    let hello = match tokio::time::timeout(REALITY_HANDSHAKE_TIMEOUT, read_record_from(&mut rd)).await
-    {
-        Ok(Ok(b)) if b.len() == REALITY_AUTH_ID_LEN + 32 => b,
-        _ => return, // timed out / closed / malformed auth record → drop
-    };
+    let hello =
+        match tokio::time::timeout(REALITY_HANDSHAKE_TIMEOUT, read_record_from(&mut rd)).await {
+            Ok(Ok(b)) if b.len() == REALITY_AUTH_ID_LEN + 32 => b,
+            _ => return, // timed out / closed / malformed auth record → drop
+        };
     // Constant-time auth check: a wrong ID is dropped without revealing a tunnel (the prober sees a
     // plain TLS connection close). A timing side-channel on a key-derived ID is low-value, but a
     // constant-time compare costs nothing and keeps the gate honest.
@@ -176,7 +176,8 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// trust boundary — the inner WireGuard is). See the module honest-status note: a real REALITY
 /// deployment would present a *proxied real foreign-site* cert here, not a self-signed one.
 fn tls_acceptor() -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-    let ck = rcgen::generate_simple_self_signed(vec!["nil-node".to_string(), "localhost".to_string()])?;
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["nil-node".to_string(), "localhost".to_string()])?;
     let cert_der = ck.cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der())
         .map_err(|e| anyhow::anyhow!("reality server key: {e}"))?;

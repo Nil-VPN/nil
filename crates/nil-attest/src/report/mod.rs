@@ -15,7 +15,8 @@ pub mod tdx;
 #[derive(Debug, Clone)]
 pub struct Evidence {
     pub tee: Tee,
-    /// The code measurement: SEV-SNP launch `MEASUREMENT` (48 B) or TDX `MRTD` (48 B).
+    /// The normalized identity: SEV-SNP launch `MEASUREMENT` (48 B), or NIL's domain-separated
+    /// SHA-384 digest over TDX MRTD plus the exact workload-policy fields (48 B).
     pub measurement: Vec<u8>,
     /// The 64-byte field the TEE binds to attester-supplied data — here, the TLS key + nonce.
     pub report_data: [u8; 64],

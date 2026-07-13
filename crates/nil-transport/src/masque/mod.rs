@@ -414,8 +414,9 @@ async fn resolve(target: &NodeEndpoint) -> Result<SocketAddr> {
     // up and are logged on the client (e.g. into Android logcat via the nil-android FFI boundary),
     // and the node address is routing metadata we deliberately keep out of logs (PD-2/PD-3). The
     // resolver's `{e}` is an OS-level category ("Name or service not known"), not the host name.
-    let host_port = format!("{}:{}", target.host, target.port);
-    let mut addrs = tokio::net::lookup_host(host_port)
+    // Tuple resolution handles DNS names and bare IPv4/IPv6 literals without constructing an
+    // ambiguous `host:port` string (an IPv6 registry endpoint must not fail after token use).
+    let mut addrs = tokio::net::lookup_host((target.host.as_str(), target.port))
         .await
         .map_err(|e| Error::Transport(format!("resolve node endpoint: {e}")))?;
     addrs
@@ -427,14 +428,13 @@ async fn resolve(target: &NodeEndpoint) -> Result<SocketAddr> {
 /// `None` ⇒ unattested (loopback/dev). The node must attest to the measurement the Coordinator
 /// pinned in the endpoint.
 fn policy_for(target: &NodeEndpoint) -> Option<AppraisalPolicy> {
-    target
-        .expected
-        .as_ref()
-        .map(|e| {
-            AppraisalPolicy::new(e.tee, e.measurement.clone())
-                .with_min_tcb_sevsnp(e.min_tcb_sevsnp)
-                .with_transparency_log_key(e.transparency_log_key)
-        })
+    target.expected.as_ref().map(|e| {
+        AppraisalPolicy::new(e.tee, e.measurement.clone())
+            .with_tls_spki_sha256(e.tls_spki_sha256)
+            .with_min_tcb_sevsnp(e.min_tcb_sevsnp)
+            .with_tdx_policy(e.tdx_policy.clone())
+            .with_transparency_log_key(e.transparency_log_key)
+    })
 }
 
 /// How a driver moves QUIC packets to and from its peer. The outermost hop uses a real UDP
@@ -711,8 +711,9 @@ async fn driver_run(
                                                 tracing::info!(
                                                     flow_id,
                                                     max_dgram_payload = mdp,
-                                                    usable_mtu = mdp
-                                                        .saturating_sub(connectip::MAX_FRAMING_OVERHEAD),
+                                                    usable_mtu = mdp.saturating_sub(
+                                                        connectip::MAX_FRAMING_OVERHEAD
+                                                    ),
                                                     "dev-trace: negotiated tunnel MTU"
                                                 );
                                             }
@@ -918,9 +919,8 @@ pub(crate) fn build_client_config(max_udp_payload: usize) -> Result<quiche::Conf
     tls.set_curves_list("X25519MLKEM768:X25519:P-256:P-384")
         .map_err(|e| Error::Transport(format!("boring set_curves_list: {e}")))?;
 
-    let mut config =
-        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
-            .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
+    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, tls)
+        .map_err(|e| Error::Transport(format!("quiche config: {e}")))?;
     config
         .set_application_protos(&[b"h3"])
         .map_err(|e| Error::Transport(format!("set_application_protos: {e}")))?;
@@ -971,6 +971,12 @@ fn attest_peer(
     let Some(policy) = policy else {
         return unattested_gate(allow_unattested);
     };
+    #[cfg(not(debug_assertions))]
+    if policy.tls_spki_sha256.is_none() {
+        return Err(Error::Transport(
+            "attestation failed: production endpoint has no TLS SPKI identity pin".into(),
+        ));
+    }
     let cert = conn.peer_cert().ok_or_else(|| {
         Error::Transport("attestation failed: node presented no certificate".into())
     })?;
@@ -991,17 +997,28 @@ fn attest_peer(
 /// fail-OPEN bug where a missing `NW_EXPECTED_MEASUREMENT` silently carried traffic unattested
 /// (PD-2 / Pillar 2: "no attestation pass → kill-switch holds → no traffic"). Pure + unit-tested.
 fn unattested_gate(allow_unattested: bool) -> Result<()> {
-    if allow_unattested {
-        tracing::warn!(
-            "MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only"
-        );
-        return Ok(());
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = allow_unattested;
+        Err(Error::Transport(
+            "refusing to bring up an unattested MASQUE tunnel: unattested mode is not compiled into production builds"
+                .into(),
+        ))
     }
-    Err(Error::Transport(
-        "refusing to bring up an unattested MASQUE tunnel: no pinned measurement. Set \
-         NW_EXPECTED_MEASUREMENT (production), or NW_ALLOW_UNATTESTED=1 for local dev/loopback only."
-            .into(),
-    ))
+    #[cfg(debug_assertions)]
+    {
+        if allow_unattested {
+            tracing::warn!(
+                "MASQUE connection is UNATTESTED (no pinned measurement) — dev/loopback only"
+            );
+            return Ok(());
+        }
+        Err(Error::Transport(
+            "refusing to bring up an unattested MASQUE tunnel: no pinned measurement. Set \
+             NW_EXPECTED_MEASUREMENT (production), or NW_ALLOW_UNATTESTED=1 for local dev/loopback only."
+                .into(),
+        ))
+    }
 }
 
 /// Find an H3 header value by (lowercase) name.
@@ -1066,11 +1083,60 @@ mod fingerprint;
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn resolves_bare_ipv6_registry_endpoint_without_ambiguous_host_port_formatting() {
+        let endpoint = NodeEndpoint {
+            host: "::1".to_string(),
+            port: 443,
+            kind: nil_core::TransportKind::Masque,
+            wg_pub: None,
+            expected: None,
+            grant: None,
+        };
+        let resolved = resolve(&endpoint).await.expect("IPv6 literal resolves");
+        assert_eq!(resolved, "[::1]:443".parse().unwrap());
+    }
+
     #[test]
     fn kind_and_profile_are_masque() {
         let t = MasqueTransport::new();
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
+    }
+
+    #[test]
+    fn endpoint_tdx_policy_reaches_the_appraisal_gate() {
+        let tdx_policy = nil_core::TdxPolicy {
+            td_attributes: [0, 0, 0, 0x10, 0, 0, 0, 0],
+            xfam: [2; 8],
+            mr_config_id: nil_core::TdxMeasurement([3; 48]),
+            mr_owner: nil_core::TdxMeasurement([4; 48]),
+            mr_owner_config: nil_core::TdxMeasurement([5; 48]),
+            rt_mr0: nil_core::TdxMeasurement([6; 48]),
+            rt_mr1: nil_core::TdxMeasurement([7; 48]),
+            rt_mr2: nil_core::TdxMeasurement([8; 48]),
+            rt_mr3: nil_core::TdxMeasurement([9; 48]),
+            mr_service_td: Some(nil_core::TdxMeasurement([10; 48])),
+        };
+        let endpoint = NodeEndpoint {
+            host: "node.example".into(),
+            port: 443,
+            kind: TransportKind::Masque,
+            wg_pub: None,
+            expected: Some(nil_core::AttestExpectation {
+                tee: nil_core::Tee::Tdx,
+                measurement: nil_core::Measurement(vec![11; 48]),
+                tls_spki_sha256: Some([12; 32]),
+                min_tcb_sevsnp: None,
+                tdx_policy: Some(tdx_policy.clone()),
+                transparency_log_key: Some([13; 32]),
+            }),
+            grant: None,
+        };
+        let policy = policy_for(&endpoint).expect("attested endpoint has a policy");
+        assert_eq!(policy.tdx_policy, Some(tdx_policy));
+        assert_eq!(policy.tls_spki_sha256, Some([12; 32]));
+        assert_eq!(policy.transparency_log_key, Some([13; 32]));
     }
 
     #[test]
@@ -1094,7 +1160,10 @@ mod tests {
         // test on the chosen values (quiche's Config has no getters). It does NOT — and cannot
         // here — prove DPI-indistinguishability; that needs a passive-fingerprinting lab.
         let p = HTTPS_QUIC_PROFILE;
-        assert!(p.grease, "a real QUIC client sends GREASE; not greasing is a tell");
+        assert!(
+            p.grease,
+            "a real QUIC client sends GREASE; not greasing is a tell"
+        );
         assert!(
             p.disable_active_migration,
             "browser QUIC clients disable active migration"
@@ -1135,10 +1204,15 @@ mod tests {
             unattested_gate(false).is_err(),
             "missing measurement must refuse the tunnel"
         );
-        // Explicit dev opt-in → permitted (loopback/dev).
+        #[cfg(debug_assertions)]
         assert!(
             unattested_gate(true).is_ok(),
             "explicit opt-in permits unattested dev use"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(
+            unattested_gate(true).is_err(),
+            "production builds must reject unattested mode even when requested programmatically"
         );
     }
 }

@@ -12,15 +12,16 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, SevSnpTcbFloor, Tee, TransportKind};
-use nil_proto::path::{Hop, PathResponse, Tee as WireTee};
+use nil_core::{
+    AttestExpectation, Grant, Measurement, NodeEndpoint, SevSnpTcbFloor, TdxMeasurement, TdxPolicy,
+    Tee, TransportKind,
+};
+use nil_proto::path::{Hop, PathResponse, TdxPolicy as WireTdxPolicy, Tee as WireTee};
 use nil_proto::token::RedeemRequest;
 use nil_transport::connectip;
 
-/// Minimum hops in a redeemed path. A trust-split path is multi-hop (≥2) — a single hop means the
-/// one node sees BOTH the client IP and the destination (no split). The closed alpha ships
-/// SINGLE-HOP deliberately (trust-split is the next milestone), so 1 is allowed but a single-hop
-/// path is WARNED about as not-yet-trust-split (see [`path_from_response`]). 0 hops is always rejected.
+/// Minimum structurally valid hop count. Debug builds may exercise a one-hop development path, but
+/// release builds impose the stronger trust-split policy below and reject anything below two hops.
 const MIN_HOPS: usize = 1;
 /// Sanity cap on a Coordinator-returned path (the Coordinator is a distinct, not-fully-trusted
 /// domain). A real path is a handful of hops; anything larger is rejected.
@@ -60,32 +61,48 @@ fn read_token() -> Result<RedeemRequest> {
 /// `client_pins` is the client-side, Coordinator-INDEPENDENT set of measurements the client will
 /// accept for ANY hop (see [`crate::launch::pinned_measurements_from_env`]). Threaded through so
 /// the cross-check in [`redeem_path`] uses the operator's own pin, not whatever the Coordinator
-/// claims (audit B1, see [`cross_check_pins`]).
+/// claims (audit B1, see [`cross_check_trust`]).
 pub async fn redeem_path_from_env(
     coord_url: &str,
     client_pins: &[Vec<u8>],
+    client_transparency_log_key: Option<[u8; 32]>,
 ) -> Result<Vec<NodeEndpoint>> {
     let req = read_token()?;
-    redeem_path(coord_url, &req.msg, &req.token, client_pins).await
+    redeem_path(
+        coord_url,
+        &req.msg,
+        &req.token,
+        client_pins,
+        client_transparency_log_key,
+    )
+    .await
 }
 
 /// Redeem an explicitly-supplied token (`msg` + `token`, both hex) at the Coordinator (`coord_url`)
-/// and return the attested path. Fails closed if the URL is plaintext-to-non-loopback, the
+/// and return the attested path. Fails closed if a release build's URL is not HTTPS, the
 /// Coordinator rejects/stalls, the response is empty/oversized/malformed, OR a returned hop's
-/// measurement is not in `client_pins` (the substitution cross-check, see [`cross_check_pins`]).
+/// measurement is not in `client_pins` (the substitution cross-check, see [`cross_check_trust`]).
 pub async fn redeem_path(
     coord_url: &str,
     msg: &str,
     token: &str,
     client_pins: &[Vec<u8>],
+    client_transparency_log_key: Option<[u8; 32]>,
 ) -> Result<Vec<NodeEndpoint>> {
     // The token is a bearer credential — never POST it in cleartext to a non-loopback host. A
-    // plaintext link also lets a MITM rewrite the per-hop measurements. Require TLS unless the
-    // host is loopback, or the operator explicitly opted into an insecure control plane (a
-    // trusted local/test network; dev only).
-    if !nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
-        nil_core::net::require_tls_or_loopback(coord_url)
-            .map_err(|e| anyhow::anyhow!("NW_COORDINATOR_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local network)"))?;
+    // plaintext link also lets a MITM rewrite the per-hop measurements. Release builds require
+    // HTTPS unconditionally; debug builds may use genuine loopback HTTP or explicitly opt into a
+    // trusted local test network.
+    if !nil_core::net::dev_env_flag("NW_INSECURE_CONTROL_PLANE") {
+        nil_core::net::require_https_or_debug_loopback(coord_url)
+            .map_err(|e| {
+                #[cfg(debug_assertions)]
+                return anyhow::anyhow!(
+                    "NW_COORDINATOR_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local development network)"
+                );
+                #[cfg(not(debug_assertions))]
+                anyhow::anyhow!("NW_COORDINATOR_URL: {e}; production builds require HTTPS")
+            })?;
     }
 
     let req = RedeemRequest {
@@ -119,15 +136,24 @@ pub async fn redeem_path(
         }
         body.extend_from_slice(&chunk);
     }
-    path_from_response(&body, client_pins)
+    path_from_response_with_trust(&body, client_pins, client_transparency_log_key)
 }
 
 /// Pure: parse a `/v1/redeem` [`PathResponse`] body into attested [`NodeEndpoint`]s, then
 /// cross-check each hop's Coordinator-provided measurement against the client's independent pin
-/// (see [`cross_check_pins`]). Unit-tested without a network. Fails closed on an empty,
-/// single-hop (non-trust-split — warned, still accepted for the alpha), oversized, or
+/// (see [`cross_check_trust`]). Unit-tested without a network. Fails closed on an empty,
+/// single-hop in production (non-trust-split), oversized, or
 /// pin-mismatched path.
+#[cfg(test)]
 fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEndpoint>> {
+    path_from_response_with_trust(body, client_pins, None)
+}
+
+fn path_from_response_with_trust(
+    body: &[u8],
+    client_pins: &[Vec<u8>],
+    client_transparency_log_key: Option<[u8; 32]>,
+) -> Result<Vec<NodeEndpoint>> {
     let resp: PathResponse = serde_json::from_slice(body).context("parse PathResponse")?;
     if resp.hops.len() < MIN_HOPS {
         anyhow::bail!("coordinator returned an empty path");
@@ -138,14 +164,19 @@ fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEn
             resp.hops.len()
         );
     }
-    if resp.hops.len() == 1 && !nil_core::net::env_flag("NW_FORCE_SINGLE_HOP") {
-        // Honest about the limit (SOUL §6): one hop is not trust-split. Gated by NW_FORCE_SINGLE_HOP
-        // so that flag is the SINGLE acknowledgement that silences single-hop disclosure across both
-        // this redeem path and `launch::assemble` (no asymmetric warn fatigue).
-        tracing::warn!(
-            "single-hop path: the exit node sees BOTH your IP and your destination — NOT trust-split \
-             (acceptable only for the single-hop alpha; trust-split is the next milestone)"
+    if resp.hops.len() == 1 {
+        #[cfg(not(debug_assertions))]
+        anyhow::bail!(
+            "coordinator returned a single-hop path; production builds require at least two hops for trust splitting"
         );
+
+        #[cfg(debug_assertions)]
+        if !nil_core::net::dev_env_flag("NW_FORCE_SINGLE_HOP") {
+            tracing::warn!(
+                "single-hop path: the exit node sees BOTH your IP and your destination — NOT trust-split \
+                 (development only; production requires at least two hops)"
+            );
+        }
     }
     let endpoints: Vec<NodeEndpoint> = resp
         .hops
@@ -153,7 +184,7 @@ fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEn
         .enumerate()
         .map(|(i, h)| hop_to_endpoint(i, h))
         .collect::<Result<_>>()?;
-    cross_check_pins(&endpoints, client_pins)?;
+    cross_check_trust(&endpoints, client_pins, client_transparency_log_key)?;
     Ok(endpoints)
 }
 
@@ -185,7 +216,11 @@ fn path_from_response(body: &[u8], client_pins: &[Vec<u8>]) -> Result<Vec<NodeEn
 /// With NO pin configured the function keeps today's behavior: it logs a clear WARN that the path
 /// is Coordinator-trusted (no independent pin) and accepts it (back-compat). Logs are PII-free:
 /// no measurement bytes and no hop hosts ever reach a log line.
-fn cross_check_pins(endpoints: &[NodeEndpoint], client_pins: &[Vec<u8>]) -> Result<()> {
+fn cross_check_trust(
+    endpoints: &[NodeEndpoint],
+    client_pins: &[Vec<u8>],
+    client_transparency_log_key: Option<[u8; 32]>,
+) -> Result<()> {
     if client_pins.is_empty() {
         // No independent anchor — fall back to trusting the Coordinator's per-hop pins, but say so
         // loudly so an operator never believes an independent cross-check is in force when it isn't.
@@ -194,16 +229,17 @@ fn cross_check_pins(endpoints: &[NodeEndpoint], client_pins: &[Vec<u8>]) -> Resu
              the redeemed path is COORDINATOR-TRUSTED — a compromised Coordinator could substitute a \
              hop measurement and it would be accepted. Pin from an independent source to cross-check"
         );
-        return Ok(());
     }
     for (idx, ep) in endpoints.iter().enumerate() {
         // Every redeemed hop carries a measurement (`hop_to_endpoint` always sets `expected`).
-        let measurement = ep
-            .expected
-            .as_ref()
-            .map(|e| &e.measurement.0)
-            .ok_or_else(|| anyhow::anyhow!("redeemed path hop {idx}: missing measurement to pin against"))?;
-        if !client_pins.iter().any(|pin| pin == measurement) {
+        let expectation = ep.expected.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("redeemed path hop {idx}: missing attestation expectation")
+        })?;
+        if !client_pins.is_empty()
+            && !client_pins
+                .iter()
+                .any(|pin| pin == &expectation.measurement.0)
+        {
             // Substitution detected (or simply an unpinned node) — refuse the WHOLE path, fail
             // closed. No measurement bytes, no host in the log (PD-2 / no-PII): only the hop index.
             anyhow::bail!(
@@ -212,11 +248,23 @@ fn cross_check_pins(endpoints: &[NodeEndpoint], client_pins: &[Vec<u8>]) -> Resu
                  refusing the path (possible measurement substitution by the Coordinator)"
             );
         }
+        if let Some(pinned_key) = client_transparency_log_key {
+            if expectation.transparency_log_key != Some(pinned_key) {
+                anyhow::bail!(
+                    "redeemed path hop {idx}: Coordinator-provided transparency-log key does not \
+                     match the client's independent key — refusing the path"
+                );
+            }
+        }
     }
-    tracing::info!(
-        hops = endpoints.len(),
-        "redeemed path cross-checked against the client's independent measurement pin"
-    );
+    if !client_pins.is_empty() || client_transparency_log_key.is_some() {
+        tracing::info!(
+            hops = endpoints.len(),
+            measurement_pinned = !client_pins.is_empty(),
+            transparency_key_pinned = client_transparency_log_key.is_some(),
+            "redeemed path cross-checked against independent client trust roots"
+        );
+    }
     Ok(())
 }
 
@@ -230,6 +278,22 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
     let tee = match h.tee {
         WireTee::SevSnp => Tee::SevSnp,
         WireTee::Tdx => Tee::Tdx,
+    };
+    let tls_spki_sha256 = match h.tls_spki_sha256 {
+        Some(hex) => {
+            let bytes = connectip::from_hex(hex.trim().as_bytes()).ok_or_else(|| {
+                anyhow::anyhow!("redeemed path hop {idx}: tls_spki_sha256 is not hex")
+            })?;
+            Some(<[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+                anyhow::anyhow!("redeemed path hop {idx}: tls_spki_sha256 must be 32 bytes")
+            })?)
+        }
+        None => {
+            #[cfg(not(debug_assertions))]
+            anyhow::bail!("redeemed path hop {idx}: missing production TLS SPKI identity pin");
+            #[cfg(debug_assertions)]
+            None
+        }
     };
     // A hop's `wg_pub`, when present, drives per-hop PQ-WireGuard-over-MASQUE. `PathTransport`
     // PQ-wraps EVERY hop that carries a key (not just the exit): the carrier for hop N+1 is hop N's
@@ -267,6 +331,9 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
     // Per-hop offline attestation floors published by the Coordinator. Both are enforced by the
     // MASQUE gate (`nil_attest::appraise`): a `current_tcb` below the floor, or a measurement absent
     // from the pinned transparency log, fails the hop closed. Absent ⇒ measurement pin alone gates.
+    if tee == Tee::Tdx && h.min_tcb_sevsnp.is_some() {
+        anyhow::bail!("redeemed path hop {idx}: min_tcb_sevsnp is invalid for TDX");
+    }
     let min_tcb_sevsnp = h.min_tcb_sevsnp.map(|f| SevSnpTcbFloor {
         fmc: f.fmc,
         bootloader: f.bootloader,
@@ -274,6 +341,18 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
         snp: f.snp,
         microcode: f.microcode,
     });
+    let tdx_policy = match (tee, h.tdx_policy) {
+        (Tee::Tdx, Some(policy)) => Some(tdx_policy_from_wire(policy).map_err(|error| {
+            anyhow::anyhow!("redeemed path hop {idx}: invalid TDX policy: {error}")
+        })?),
+        (Tee::Tdx, None) => {
+            anyhow::bail!("redeemed path hop {idx}: missing mandatory TDX policy")
+        }
+        (Tee::SevSnp, Some(_)) => {
+            anyhow::bail!("redeemed path hop {idx}: TDX policy is invalid for SEV-SNP")
+        }
+        (Tee::SevSnp, None) => None,
+    };
     let transparency_log_key = match h.transparency_log_key {
         Some(hex) => {
             let bytes = connectip::from_hex(hex.trim().as_bytes()).ok_or_else(|| {
@@ -290,8 +369,76 @@ fn hop_to_endpoint(idx: usize, h: Hop) -> Result<NodeEndpoint> {
         port: h.port,
         kind: TransportKind::Masque,
         wg_pub,
-        expected: Some(AttestExpectation { tee, measurement: Measurement(measurement), min_tcb_sevsnp, transparency_log_key }),
+        expected: Some(AttestExpectation {
+            tee,
+            measurement: Measurement(measurement),
+            tls_spki_sha256,
+            min_tcb_sevsnp,
+            tdx_policy,
+            transparency_log_key,
+        }),
         grant,
+    })
+}
+
+fn decode_policy_hex<const N: usize>(field: &str, value: &str) -> Result<[u8; N]> {
+    if value.len() != N * 2
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        anyhow::bail!("{field} must be exactly {N} bytes of canonical lowercase hex");
+    }
+    nil_core::grant::from_hex(value)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("{field} is not valid canonical hex"))
+}
+
+/// Convert the dependency-free wire DTO into length-safe core policy types. For TDX, the hop's
+/// independently pinned `measurement` is the NIL identity digest over MRTD plus these values; this
+/// conversion supplies the exact values the appraisal gate recomputes and checks against it. It is
+/// also used by the direct-node environment path so both sources enforce one fail-closed grammar.
+pub(crate) fn tdx_policy_from_wire(dto: WireTdxPolicy) -> Result<TdxPolicy> {
+    let td_attributes = decode_policy_hex::<8>("tdx_policy.td_attributes", &dto.td_attributes)?;
+    if td_attributes[0] & 0x01 != 0 {
+        anyhow::bail!("tdx_policy.td_attributes must not enable TDX debug mode");
+    }
+    let rt_mr0 = decode_policy_hex::<48>("tdx_policy.rt_mr0", &dto.rt_mr0)?;
+    let rt_mr1 = decode_policy_hex::<48>("tdx_policy.rt_mr1", &dto.rt_mr1)?;
+    let rt_mr2 = decode_policy_hex::<48>("tdx_policy.rt_mr2", &dto.rt_mr2)?;
+    let rt_mr3 = decode_policy_hex::<48>("tdx_policy.rt_mr3", &dto.rt_mr3)?;
+    for (name, value) in [
+        ("rt_mr0", &rt_mr0),
+        ("rt_mr1", &rt_mr1),
+        ("rt_mr2", &rt_mr2),
+        ("rt_mr3", &rt_mr3),
+    ] {
+        if value.iter().all(|byte| *byte == 0) {
+            anyhow::bail!("tdx_policy.{name} must be nonzero");
+        }
+    }
+
+    Ok(TdxPolicy {
+        td_attributes,
+        xfam: decode_policy_hex("tdx_policy.xfam", &dto.xfam)?,
+        mr_config_id: TdxMeasurement(decode_policy_hex(
+            "tdx_policy.mr_config_id",
+            &dto.mr_config_id,
+        )?),
+        mr_owner: TdxMeasurement(decode_policy_hex("tdx_policy.mr_owner", &dto.mr_owner)?),
+        mr_owner_config: TdxMeasurement(decode_policy_hex(
+            "tdx_policy.mr_owner_config",
+            &dto.mr_owner_config,
+        )?),
+        rt_mr0: TdxMeasurement(rt_mr0),
+        rt_mr1: TdxMeasurement(rt_mr1),
+        rt_mr2: TdxMeasurement(rt_mr2),
+        rt_mr3: TdxMeasurement(rt_mr3),
+        mr_service_td: dto
+            .mr_service_td
+            .as_deref()
+            .map(|value| decode_policy_hex("tdx_policy.mr_service_td", value).map(TdxMeasurement))
+            .transpose()?,
     })
 }
 
@@ -307,14 +454,39 @@ mod tests {
         vec![0xab; 48]
     }
 
+    fn tls_spki_hex() -> String {
+        "11".repeat(32)
+    }
+
+    fn wire_tdx_policy() -> WireTdxPolicy {
+        WireTdxPolicy {
+            td_attributes: "0000001000000000".into(),
+            xfam: "02".repeat(8),
+            mr_config_id: "03".repeat(48),
+            mr_owner: "04".repeat(48),
+            mr_owner_config: "05".repeat(48),
+            rt_mr0: "06".repeat(48),
+            rt_mr1: "07".repeat(48),
+            rt_mr2: "08".repeat(48),
+            rt_mr3: "09".repeat(48),
+            mr_service_td: Some("0a".repeat(48)),
+        }
+    }
+
+    fn tdx_policy_json() -> String {
+        serde_json::to_string(&wire_tdx_policy()).expect("serialize TDX fixture")
+    }
+
     #[test]
     fn parses_a_three_hop_attested_path() {
         let m = "ab".repeat(48); // 48-byte SEV-SNP-ish measurement, hex
+        let tls = tls_spki_hex();
+        let tdx_policy = tdx_policy_json();
         let body = format!(
             r#"{{"hops":[
-                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}"}},
-                {{"host":"middle.example","port":443,"tee":"tdx","measurement":"{m}"}},
-                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}"}}
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}},
+                {{"host":"middle.example","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{tdx_policy}}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
             ]}}"#
         );
         let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
@@ -325,7 +497,68 @@ mod tests {
             hops.iter().all(|h| h.expected.is_some()),
             "each hop must carry a pinned measurement"
         );
-        assert_eq!(hops[1].expected.as_ref().unwrap().tee, Tee::Tdx);
+        let tdx = hops[1].expected.as_ref().unwrap();
+        assert_eq!(tdx.tee, Tee::Tdx);
+        let policy = tdx.tdx_policy.as_ref().expect("TDX policy propagated");
+        assert_eq!(policy.td_attributes, [0, 0, 0, 0x10, 0, 0, 0, 0]);
+        assert_eq!(policy.rt_mr3, TdxMeasurement([0x09; 48]));
+        assert_eq!(policy.mr_service_td, Some(TdxMeasurement([0x0a; 48])));
+    }
+
+    #[test]
+    fn tdx_hop_requires_a_complete_canonical_policy() {
+        let m = "ab".repeat(48);
+        let tls = tls_spki_hex();
+        let missing = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}"}}]}}"#
+        );
+        let error = path_from_response(missing.as_bytes(), NO_PINS).unwrap_err();
+        assert!(error.to_string().contains("missing mandatory TDX policy"));
+
+        let mut malformed = wire_tdx_policy();
+        malformed.mr_owner = "AA".repeat(48);
+        let malformed = serde_json::to_string(&malformed).unwrap();
+        let body = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{malformed}}}]}}"#
+        );
+        let error = path_from_response(body.as_bytes(), NO_PINS).unwrap_err();
+        assert!(error.to_string().contains("tdx_policy.mr_owner"));
+
+        let mut zero_rtmr = wire_tdx_policy();
+        zero_rtmr.rt_mr3 = "00".repeat(48);
+        let zero_rtmr = serde_json::to_string(&zero_rtmr).unwrap();
+        let body = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{zero_rtmr}}}]}}"#
+        );
+        let error = path_from_response(body.as_bytes(), NO_PINS).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("tdx_policy.rt_mr3 must be nonzero"));
+
+        let mut debug = wire_tdx_policy();
+        debug.td_attributes = "0100001000000000".into();
+        let debug = serde_json::to_string(&debug).unwrap();
+        let body = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{debug}}}]}}"#
+        );
+        let error = path_from_response(body.as_bytes(), NO_PINS).unwrap_err();
+        assert!(error.to_string().contains("must not enable TDX debug mode"));
+    }
+
+    #[test]
+    fn redeemed_hop_rejects_cross_tee_policy_fields() {
+        let m = "ab".repeat(48);
+        let tls = tls_spki_hex();
+        let tdx_policy = tdx_policy_json();
+        let sev_with_tdx = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{tdx_policy}}}]}}"#
+        );
+        assert!(path_from_response(sev_with_tdx.as_bytes(), NO_PINS).is_err());
+
+        let tdx_with_sev = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"tdx","measurement":"{m}","tls_spki_sha256":"{tls}","tdx_policy":{tdx_policy},"min_tcb_sevsnp":{{"bootloader":1,"tee":2,"snp":3,"microcode":4}}}}]}}"#
+        );
+        assert!(path_from_response(tdx_with_sev.as_bytes(), NO_PINS).is_err());
     }
 
     #[test]
@@ -333,8 +566,12 @@ mod tests {
         let m = "ab".repeat(48);
         let grant = "cd".repeat(90);
         let nonce = "11".repeat(32);
+        let tls = tls_spki_hex();
         let body = format!(
-            r#"{{"hops":[{{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{nonce}"}}]}}"#
+            r#"{{"hops":[
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","grant":"{grant}","grant_nonce":"{nonce}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
+            ]}}"#
         );
         let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
         let g = hops[0].grant.as_ref().expect("grant");
@@ -349,16 +586,26 @@ mod tests {
         // dropped to None on the redeemed path, making both defenses inert in production).
         let m = "ab".repeat(48);
         let key = "cd".repeat(32); // 32-byte Ed25519 log key, hex
+        let tls = tls_spki_hex();
         let body = format!(
-            r#"{{"hops":[{{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}",
-               "min_tcb_sevsnp":{{"bootloader":3,"tee":0,"snp":8,"microcode":115}},
-               "transparency_log_key":"{key}"}}]}}"#
+            r#"{{"hops":[
+               {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}",
+                "min_tcb_sevsnp":{{"bootloader":3,"tee":0,"snp":8,"microcode":115}},
+                "transparency_log_key":"{key}"}},
+               {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
+            ]}}"#
         );
         let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
         let exp = hops[0].expected.as_ref().expect("pinned expectation");
         assert_eq!(
             exp.min_tcb_sevsnp,
-            Some(SevSnpTcbFloor { fmc: None, bootloader: 3, tee: 0, snp: 8, microcode: 115 }),
+            Some(SevSnpTcbFloor {
+                fmc: None,
+                bootloader: 3,
+                tee: 0,
+                snp: 8,
+                microcode: 115
+            }),
             "the per-hop TCB floor must reach the appraisal policy"
         );
         assert_eq!(
@@ -366,31 +613,82 @@ mod tests {
             Some([0xcd; 32]),
             "the per-hop transparency-log key must reach the appraisal policy"
         );
+        assert_eq!(exp.tls_spki_sha256, Some([0x11; 32]));
     }
 
     #[test]
-    fn absent_floor_and_key_stay_none_backcompat() {
-        // A hop without the new fields keeps today's behavior: measurement pin alone (no floor/log).
+    fn independent_transparency_key_rejects_missing_or_substituted_coordinator_key() {
         let m = "ab".repeat(48);
-        let body =
-            format!(r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#);
+        let tls = tls_spki_hex();
+        let missing = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}]}}"#
+        );
+        assert!(path_from_response_with_trust(
+            missing.as_bytes(),
+            &[ab_measurement()],
+            Some([0xcd; 32]),
+        )
+        .is_err());
+
+        let wrong = "ef".repeat(32);
+        let substituted = format!(
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","transparency_log_key":"{wrong}"}}]}}"#
+        );
+        assert!(path_from_response_with_trust(
+            substituted.as_bytes(),
+            &[ab_measurement()],
+            Some([0xcd; 32]),
+        )
+        .is_err());
+
+        let key = "cd".repeat(32);
+        let matching = format!(
+            r#"{{"hops":[
+                {{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","transparency_log_key":"{key}"}},
+                {{"host":"b","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","transparency_log_key":"{key}"}}
+            ]}}"#
+        );
+        assert!(path_from_response_with_trust(
+            matching.as_bytes(),
+            &[ab_measurement()],
+            Some([0xcd; 32]),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn absent_floor_and_transparency_key_stay_none() {
+        // TLS identity is present, while optional TCB/transparency policy remains absent.
+        let m = "ab".repeat(48);
+        let tls = tls_spki_hex();
+        let body = format!(
+            r#"{{"hops":[
+                {{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}},
+                {{"host":"b","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
+            ]}}"#
+        );
         let hops = path_from_response(body.as_bytes(), NO_PINS).expect("parse");
         let exp = hops[0].expected.as_ref().expect("pinned expectation");
         assert_eq!(exp.min_tcb_sevsnp, None);
         assert_eq!(exp.transparency_log_key, None);
+        assert_eq!(exp.tls_spki_sha256, Some([0x11; 32]));
     }
 
     #[test]
     fn malformed_transparency_log_key_fails_the_path_closed() {
         let m = "ab".repeat(48);
+        let tls = tls_spki_hex();
         // Not hex → whole path rejected (fail closed, no silently-dropped key).
         let bad_hex = format!(
-            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","transparency_log_key":"zz"}}]}}"#
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","transparency_log_key":"zz"}}]}}"#
         );
-        assert!(path_from_response(bad_hex.as_bytes(), NO_PINS).is_err(), "non-hex key must fail");
+        assert!(
+            path_from_response(bad_hex.as_bytes(), NO_PINS).is_err(),
+            "non-hex key must fail"
+        );
         // Right hex, wrong length (not 32 bytes) → rejected too.
         let wrong_len = format!(
-            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","transparency_log_key":"abcd"}}]}}"#
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","transparency_log_key":"abcd"}}]}}"#
         );
         assert!(
             path_from_response(wrong_len.as_bytes(), NO_PINS).is_err(),
@@ -399,15 +697,41 @@ mod tests {
     }
 
     #[test]
+    fn malformed_tls_spki_identity_pin_fails_the_path_closed() {
+        let m = "ab".repeat(48);
+        for digest in ["zz".to_string(), "11".repeat(31)] {
+            let body = format!(
+                r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{digest}"}}]}}"#
+            );
+            assert!(path_from_response(body.as_bytes(), NO_PINS).is_err());
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_rejects_a_multi_hop_path_without_tls_identity_pins() {
+        let m = "ab".repeat(48);
+        let body = format!(
+            r#"{{"hops":[
+                {{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}"}},
+                {{"host":"b","port":443,"tee":"sev-snp","measurement":"{m}"}}
+            ]}}"#
+        );
+        let error = path_from_response(body.as_bytes(), NO_PINS).unwrap_err();
+        assert!(error.to_string().contains("missing production TLS SPKI"));
+    }
+
+    #[test]
     fn grant_requires_a_paired_32_byte_nonce() {
         // A grant MUST be bound to a per-connection nonce, and that nonce must be exactly 32 bytes.
         // Any half-specified or wrong-length grant fails the whole path closed (no unbound grant).
         let m = "ab".repeat(48);
         let grant = "cd".repeat(90);
+        let tls = tls_spki_hex();
 
         // grant with NO grant_nonce → rejected (must be provided together).
         let only_grant = format!(
-            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}"}}]}}"#
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","grant":"{grant}"}}]}}"#
         );
         assert!(
             path_from_response(only_grant.as_bytes(), NO_PINS).is_err(),
@@ -417,7 +741,7 @@ mod tests {
         // grant_nonce with NO grant → rejected.
         let nonce = "11".repeat(32);
         let only_nonce = format!(
-            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant_nonce":"{nonce}"}}]}}"#
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","grant_nonce":"{nonce}"}}]}}"#
         );
         assert!(
             path_from_response(only_nonce.as_bytes(), NO_PINS).is_err(),
@@ -427,7 +751,7 @@ mod tests {
         // grant + a WRONG-LENGTH (16-byte) nonce → rejected.
         let short = "11".repeat(16);
         let bad_len = format!(
-            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","grant":"{grant}","grant_nonce":"{short}"}}]}}"#
+            r#"{{"hops":[{{"host":"a","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}","grant":"{grant}","grant_nonce":"{short}"}}]}}"#
         );
         assert!(
             path_from_response(bad_len.as_bytes(), NO_PINS).is_err(),
@@ -443,21 +767,34 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn single_hop_path_is_accepted_for_the_alpha() {
-        // The closed alpha ships single-hop (trust-split is the next milestone); a 1-hop path is
-        // accepted (with a not-trust-split warning) and still pins its measurement. 0 hops is rejected.
+    fn single_hop_path_is_accepted_only_in_debug_builds() {
+        // A debug harness may exercise a one-hop path (with a not-trust-split warning), while the
+        // corresponding release-cfg test below proves that production rejects it.
         let m = "ab".repeat(48);
         let body = format!(
             r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
         );
-        let hops =
-            path_from_response(body.as_bytes(), NO_PINS).expect("single-hop accepted for the alpha");
+        let hops = path_from_response(body.as_bytes(), NO_PINS)
+            .expect("single-hop accepted by the debug harness");
         assert_eq!(hops.len(), 1);
         assert!(
             hops[0].expected.is_some(),
             "the single hop still pins a measurement (attested)"
         );
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn single_hop_path_is_rejected_in_release_even_with_an_override_in_the_environment() {
+        let m = "ab".repeat(48);
+        let body = format!(
+            r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+        );
+        // `dev_env_flag` is compile-time disabled here, so no process environment value can turn
+        // this into an accepted production path.
+        assert!(path_from_response(body.as_bytes(), NO_PINS).is_err());
     }
 
     #[test]
@@ -475,10 +812,11 @@ mod tests {
     fn matching_pin_is_accepted() {
         // (a) A redeemed path whose hop measurement matches the client's independent pin is accepted.
         let m = "ab".repeat(48);
+        let tls = tls_spki_hex();
         let body = format!(
             r#"{{"hops":[
-                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}"}},
-                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}"}}
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
             ]}}"#
         );
         let pins = vec![ab_measurement()];
@@ -492,10 +830,11 @@ mod tests {
         // the client's pinned set → the WHOLE path is refused (fail closed, kill-switch holds).
         let pinned = "ab".repeat(48);
         let rogue = "cd".repeat(48); // a measurement the operator never pinned (rogue node)
+        let tls = tls_spki_hex();
         let body = format!(
             r#"{{"hops":[
-                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{pinned}"}},
-                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{rogue}"}}
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{pinned}","tls_spki_sha256":"{tls}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{rogue}","tls_spki_sha256":"{tls}"}}
             ]}}"#
         );
         let pins = vec![ab_measurement()]; // only the genuine measurement is pinned
@@ -510,12 +849,16 @@ mod tests {
         // (c) With no client pin configured, the path stays Coordinator-trusted (a WARN is logged
         // by `cross_check_pins`) and is accepted — preserving today's behavior.
         let m = "ef".repeat(48);
+        let tls = tls_spki_hex();
         let body = format!(
-            r#"{{"hops":[{{"host":"only.example","port":443,"tee":"sev-snp","measurement":"{m}"}}]}}"#
+            r#"{{"hops":[
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}},
+                {{"host":"exit.example","port":443,"tee":"sev-snp","measurement":"{m}","tls_spki_sha256":"{tls}"}}
+            ]}}"#
         );
-        let hops =
-            path_from_response(body.as_bytes(), NO_PINS).expect("no-pin path accepted (back-compat)");
-        assert_eq!(hops.len(), 1);
+        let hops = path_from_response(body.as_bytes(), NO_PINS)
+            .expect("no-pin path accepted (back-compat)");
+        assert_eq!(hops.len(), 2);
     }
 
     #[test]
@@ -525,10 +868,12 @@ mod tests {
         // is somewhere in the set.
         let entry_m = "ab".repeat(48);
         let exit_m = "cd".repeat(48);
+        let tls = tls_spki_hex();
+        let tdx_policy = tdx_policy_json();
         let body = format!(
             r#"{{"hops":[
-                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{entry_m}"}},
-                {{"host":"exit.example","port":443,"tee":"tdx","measurement":"{exit_m}"}}
+                {{"host":"entry.example","port":443,"tee":"sev-snp","measurement":"{entry_m}","tls_spki_sha256":"{tls}"}},
+                {{"host":"exit.example","port":443,"tee":"tdx","measurement":"{exit_m}","tls_spki_sha256":"{tls}","tdx_policy":{tdx_policy}}}
             ]}}"#
         );
         let pins = vec![vec![0xab; 48], vec![0xcd; 48]];

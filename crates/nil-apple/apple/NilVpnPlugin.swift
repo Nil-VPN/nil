@@ -1,13 +1,14 @@
 // NilVpnPlugin.swift — the iOS Tauri v2 plugin for NIL VPN. Runs in the CONTAINER-APP process
 // (not the packet-tunnel appex), and is the iOS counterpart of the Android `NilVpnPlugin.kt`.
 //
-// It exposes the same five `nil-vpn` plugin commands the WebView calls
-// (prepareVpn / startVpn / statusVpn / stopVpn / openVpnSettings), and drives the REAL attested
+// It implements five `nil-vpn` commands called through a private Rust-held PluginHandle
+// (prepareVpn / startVpn / statusVpn / stopVpn / openVpnSettings); the WebView has no plugin ACL.
+// The bridge drives the REAL attested
 // MASQUE tunnel via `NETunnelProviderManager` + the `PacketTunnel` appex
 // (`NEPacketTunnelProvider`, see `PacketTunnelProvider.swift`) — never the in-process loopback mock.
 //
 // Privacy (PD-3): identity NEVER reaches here. `extension_connect` (Rust, app process) already
-// redeemed the unlinkable token at the Coordinator; this plugin only receives the attested node
+// redeemed the blind-signed bearer token at the Coordinator; this plugin only receives the attested node
 // endpoint + pinned measurement + opaque grant and forwards them to the appex via
 // `providerConfiguration`. No account, email, payment, token, or destination crosses into the
 // datapath. Nothing identifying is logged (PD-2).
@@ -28,16 +29,28 @@ import Tauri
 import UIKit
 import WebKit
 
-/// The attested start args handed over by `extension_connect` (Rust). Field names are camelCase to
+/// The attested start args handed over privately by `extension_connect` (Rust). Field names are camelCase to
 /// match `extension::StartArgs` (`#[serde(rename_all = "camelCase")]`) and are forwarded VERBATIM
 /// into the appex's `providerConfiguration`, where `PacketTunnelProvider.swift` reads the same keys.
 /// There is no `allowUnattested` field on the real path — its absence means attestation is enforced.
+struct NilStartTcbFloor: Decodable {
+  let fmc: UInt8?
+  let bootloader: UInt8
+  let tee: UInt8
+  let snp: UInt8
+  let microcode: UInt8
+}
+
 class NilStartArgs: Decodable {
+  let reservationId: String
   let nodeHost: String
   let nodePort: Int
   let serverName: String
   let measurementHex: String
+  let tlsSpkiSha256Hex: String
+  let transparencyLogKeyHex: String
   let teeName: String
+  let minTcbSevsnp: NilStartTcbFloor?
   let grantHex: String
   let grantNonceHex: String
 }
@@ -93,6 +106,10 @@ class NilVpnPlugin: Plugin {
       invoke.reject("invalid startVpn args: \(error.localizedDescription)")
       return
     }
+    guard args.reservationId.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil else {
+      invoke.reject("invalid reservation id")
+      return
+    }
     loadOrCreateManager { manager, error in
       if let error = error {
         invoke.reject("load VPN manager: \(error.localizedDescription)")
@@ -108,15 +125,29 @@ class NilVpnPlugin: Plugin {
       proto.serverAddress = args.nodeHost
       // The keys the appex reads out of `providerConfiguration` (camelCase, matching
       // `PacketTunnelProvider.swift`). `nodePort` fits a u16 but rides as an Int (a JSON number).
-      proto.providerConfiguration = [
+      var providerConfiguration: [String: Any] = [
+        "reservationId": args.reservationId,
         "nodeHost": args.nodeHost,
         "nodePort": args.nodePort,
         "serverName": args.serverName,
         "measurementHex": args.measurementHex,
+        "tlsSpkiSha256Hex": args.tlsSpkiSha256Hex,
+        "transparencyLogKeyHex": args.transparencyLogKeyHex,
         "teeName": args.teeName,
         "grantHex": args.grantHex,
         "grantNonceHex": args.grantNonceHex,
       ]
+      if let floor = args.minTcbSevsnp {
+        var encoded: [String: Any] = [
+          "bootloader": Int(floor.bootloader),
+          "tee": Int(floor.tee),
+          "snp": Int(floor.snp),
+          "microcode": Int(floor.microcode),
+        ]
+        if let fmc = floor.fmc { encoded["fmc"] = Int(fmc) }
+        providerConfiguration["minTcbSevsnp"] = encoded
+      }
+      proto.providerConfiguration = providerConfiguration
       // In-connection fail-closed: route ALL traffic into the tunnel (protocol-level reinforcement of
       // the appex's default routes). The persistent "block when the process is down" guarantee is the
       // OS Always-on setting, which the app cannot set — see `openVpnSettings` (PD-8).
@@ -175,7 +206,14 @@ class NilVpnPlugin: Plugin {
       @unknown default:
         state = "down"
       }
-      invoke.resolve(["state": state])
+      var response: [String: Any] = ["state": state]
+      if let proto = manager?.protocolConfiguration as? NETunnelProviderProtocol,
+         let reservationId = proto.providerConfiguration?["reservationId"] as? String,
+         reservationId.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil
+      {
+        response["reservationId"] = reservationId
+      }
+      invoke.resolve(response)
     }
   }
 
@@ -195,15 +233,21 @@ class NilVpnPlugin: Plugin {
   }
 
   // MARK: - helpers
-  /// Load the existing NIL manager (the first `NETunnelProviderManager`) or hand back a fresh one to
-  /// configure. NIL manages exactly one VPN configuration.
+  /// Load only NIL's own manager or hand back a fresh one. Selecting `managers.first` could
+  /// overwrite an unrelated packet-tunnel provider installed by another app/profile.
   private func loadOrCreateManager(_ completion: @escaping (NETunnelProviderManager?, Error?) -> Void) {
     NETunnelProviderManager.loadAllFromPreferences { managers, error in
       if let error = error {
         completion(nil, error)
         return
       }
-      completion(managers?.first ?? NETunnelProviderManager(), nil)
+      let existing = managers?.first { manager in
+        guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else {
+          return false
+        }
+        return proto.providerBundleIdentifier == NilVpnPlugin.providerBundleId
+      }
+      completion(existing ?? NETunnelProviderManager(), nil)
     }
   }
 }

@@ -21,10 +21,18 @@ fn main() {
     println!("cargo:rerun-if-changed={}", kt_path.display());
     println!("cargo:rerun-if-changed={}", rs_path.display());
 
-    let kt = std::fs::read_to_string(&kt_path)
-        .unwrap_or_else(|e| panic!("nil-android symbol guard: cannot read {}: {e}", kt_path.display()));
-    let rs = std::fs::read_to_string(&rs_path)
-        .unwrap_or_else(|e| panic!("nil-android symbol guard: cannot read {}: {e}", rs_path.display()));
+    let kt = std::fs::read_to_string(&kt_path).unwrap_or_else(|e| {
+        panic!(
+            "nil-android symbol guard: cannot read {}: {e}",
+            kt_path.display()
+        )
+    });
+    let rs = std::fs::read_to_string(&rs_path).unwrap_or_else(|e| {
+        panic!(
+            "nil-android symbol guard: cannot read {}: {e}",
+            rs_path.display()
+        )
+    });
 
     // The JNI symbol prefix is derived from the Kotlin package + object name. If either changes, the
     // mangled prefix changes too, so assert them explicitly rather than hard-trusting the constant.

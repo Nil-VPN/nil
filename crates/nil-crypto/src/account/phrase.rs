@@ -1,81 +1,79 @@
-//! The 7-word recovery phrase and its underlying entropy.
+//! The v2 account recovery phrase and its underlying entropy.
 //!
-//! 7 words × 11 bits = 77 bits of entropy, packed big-endian (most-significant word
-//! first) into a `u128`. The phrase is canonical: the account secret is derived from
-//! this entropy, so reconstructing the phrase reconstructs the account (ADR-0001).
+//! A phrase is a standard 12-word BIP39 English mnemonic: 128 bits of entropy plus
+//! its BIP39 checksum. The phrase is the sole account root, so parsing delegates
+//! checksum validation to the audited `bip39` crate before deriving account material.
 
+use bip39::{Language, Mnemonic};
+use rand_core::{CryptoRng, RngCore};
 use zeroize::Zeroize;
 
-use super::words as wordlist;
 use super::PHRASE_WORDS;
 use crate::error::CryptoError;
 
-/// The phrase's underlying entropy: a 77-bit value (7 × 11-bit indices), stored
-/// low-aligned in a `u128`. Zeroized on drop.
+const ENTROPY_BYTES: usize = 16;
+
+/// The phrase's underlying 128-bit entropy. Zeroized on drop.
 #[derive(Clone)]
 pub(crate) struct PhraseEntropy {
-    value: u128,
+    bytes: [u8; ENTROPY_BYTES],
 }
 
 impl PhraseEntropy {
-    const BITS: u32 = (PHRASE_WORDS * 11) as u32; // 77
-
-    /// Draw fresh entropy from an RNG. Masking to the low 77 bits is unbiased because
-    /// every bit of a CSPRNG output is independent and uniform.
-    pub(crate) fn random(rng: &mut impl rand_core::RngCore) -> Self {
-        let mut raw = [0u8; 16];
-        rng.fill_bytes(&mut raw);
-        let mut value = u128::from_be_bytes(raw);
-        raw.zeroize();
-        value &= (1u128 << Self::BITS) - 1;
-        Self { value }
+    /// Draw fresh 128-bit entropy from the injected CSPRNG.
+    pub(crate) fn random<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
+        let mut bytes = [0u8; ENTROPY_BYTES];
+        rng.fill_bytes(&mut bytes);
+        Self { bytes }
     }
 
-    /// The 7 word indices, most-significant first.
-    pub(crate) fn indices(&self) -> [u16; PHRASE_WORDS] {
-        let mut out = [0u16; PHRASE_WORDS];
-        for (i, slot) in out.iter_mut().enumerate() {
-            let shift = 11 * (PHRASE_WORDS - 1 - i) as u32;
-            *slot = ((self.value >> shift) & 0x7FF) as u16;
-        }
-        out
+    #[cfg(test)]
+    fn from_bytes(bytes: [u8; ENTROPY_BYTES]) -> Self {
+        Self { bytes }
     }
 
-    fn from_indices(indices: &[u16; PHRASE_WORDS]) -> Self {
-        let mut value: u128 = 0;
-        for &idx in indices {
-            value = (value << 11) | (idx as u128 & 0x7FF);
-        }
-        Self { value }
-    }
-
-    /// Canonical 16-byte big-endian encoding — the HKDF input keying material.
-    pub(crate) fn ikm(&self) -> [u8; 16] {
-        self.value.to_be_bytes()
+    /// Canonical 16-byte entropy — the HKDF input keying material.
+    pub(crate) fn ikm(&self) -> [u8; ENTROPY_BYTES] {
+        self.bytes
     }
 }
 
 impl Drop for PhraseEntropy {
     fn drop(&mut self) {
-        self.value.zeroize();
+        self.bytes.zeroize();
     }
 }
 
-/// A 7-word recovery phrase. Shown to the user exactly once; it is the sole root of
-/// the account.
+/// A checksum-protected 12-word BIP39 English mnemonic. It is the sole account root.
 #[derive(Clone)]
 pub struct Phrase {
     words: [String; PHRASE_WORDS],
 }
 
 impl Phrase {
-    /// Render entropy as words.
-    pub(crate) fn from_entropy(e: &PhraseEntropy) -> Self {
-        let words = e.indices().map(|idx| wordlist::word_at(idx).to_string());
+    /// Render 128-bit entropy as a canonical BIP39 English mnemonic.
+    pub(crate) fn from_entropy(entropy: &PhraseEntropy) -> Self {
+        let mnemonic = Mnemonic::from_entropy_in(Language::English, &entropy.bytes)
+            .expect("128-bit entropy is always a valid BIP39 size");
+        Self::from_mnemonic(&mnemonic)
+    }
+
+    fn from_mnemonic(mnemonic: &Mnemonic) -> Self {
+        debug_assert_eq!(mnemonic.word_count(), PHRASE_WORDS);
+        let mut source = mnemonic.words();
+        let words = std::array::from_fn(|_| {
+            source
+                .next()
+                .expect("a 12-word mnemonic contains exactly 12 words")
+                .to_owned()
+        });
         Self { words }
     }
 
-    /// Parse and validate user-supplied words (case-insensitive, trimmed).
+    /// Parse and validate a BIP39 English mnemonic (case-insensitive, trimmed).
+    ///
+    /// Besides validating the word count and English wordlist, this delegates checksum
+    /// validation to [`Mnemonic::parse_in_normalized`].
     pub fn parse(input: &[String]) -> Result<Self, CryptoError> {
         if input.len() != PHRASE_WORDS {
             return Err(CryptoError::WrongLength {
@@ -83,24 +81,40 @@ impl Phrase {
                 got: input.len(),
             });
         }
-        let mut words: [String; PHRASE_WORDS] = std::array::from_fn(|_| String::new());
-        for (slot, w) in words.iter_mut().zip(input.iter()) {
-            let norm = w.trim().to_lowercase();
-            if wordlist::index_of(&norm).is_none() {
-                return Err(CryptoError::UnknownWord(w.clone()));
+
+        let english = Language::English.word_list();
+        let mut normalized = Vec::with_capacity(PHRASE_WORDS);
+        for word in input {
+            let word = word.trim().to_lowercase();
+            if english.binary_search(&word.as_str()).is_err() {
+                return Err(CryptoError::UnknownWord(word));
             }
-            *slot = norm;
+            normalized.push(word);
         }
-        Ok(Self { words })
+
+        let sentence = normalized.join(" ");
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &sentence)
+            .map_err(|_| CryptoError::InvalidMnemonicChecksum)?;
+        Ok(Self::from_mnemonic(&mnemonic))
     }
 
-    /// Recover the entropy from the (already validated) words.
+    /// Recover the entropy from the already validated mnemonic.
     pub(crate) fn to_entropy(&self) -> Result<PhraseEntropy, CryptoError> {
-        let mut indices = [0u16; PHRASE_WORDS];
-        for (slot, w) in indices.iter_mut().zip(self.words.iter()) {
-            *slot = wordlist::index_of(w).ok_or_else(|| CryptoError::UnknownWord(w.clone()))?;
+        let sentence = self.words.join(" ");
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &sentence)
+            .map_err(|_| CryptoError::InvalidMnemonicChecksum)?;
+        let (mut entropy, len) = mnemonic.to_entropy_array();
+        if len != ENTROPY_BYTES {
+            entropy.zeroize();
+            return Err(CryptoError::WrongLength {
+                expected: ENTROPY_BYTES,
+                got: len,
+            });
         }
-        Ok(PhraseEntropy::from_indices(&indices))
+        let mut bytes = [0u8; ENTROPY_BYTES];
+        bytes.copy_from_slice(&entropy[..ENTROPY_BYTES]);
+        entropy.zeroize();
+        Ok(PhraseEntropy { bytes })
     }
 
     pub fn words(&self) -> &[String; PHRASE_WORDS] {
@@ -112,48 +126,80 @@ impl Phrase {
     }
 }
 
+impl Drop for Phrase {
+    fn drop(&mut self) {
+        self.words.zeroize();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn entropy_index_roundtrip() {
-        let idx = [1u16, 2, 4, 8, 16, 1023, 2047];
-        let e = PhraseEntropy::from_indices(&idx);
-        assert_eq!(e.indices(), idx);
+    fn bip39_zero_entropy_vector_matches() {
+        let entropy = PhraseEntropy::from_bytes([0u8; ENTROPY_BYTES]);
+        let phrase = Phrase::from_entropy(&entropy);
+        let expected: Vec<String> = ["abandon"; 11]
+            .into_iter()
+            .chain(["about"])
+            .map(str::to_string)
+            .collect();
+        assert_eq!(phrase.to_vec(), expected);
     }
 
     #[test]
-    fn phrase_roundtrips_through_words() {
-        let e = PhraseEntropy::from_indices(&[7, 700, 2047, 0, 1, 1234, 99]);
-        let phrase = Phrase::from_entropy(&e);
-        assert_eq!(phrase.words().len(), 7);
-        let back = phrase.to_entropy().expect("valid words");
-        assert_eq!(back.indices(), e.indices());
+    fn phrase_roundtrips_through_bip39() {
+        let entropy = PhraseEntropy::from_bytes([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+        let phrase = Phrase::from_entropy(&entropy);
+        assert_eq!(phrase.words().len(), PHRASE_WORDS);
+        assert_eq!(phrase.to_entropy().unwrap().ikm(), entropy.ikm());
     }
 
     #[test]
     fn parse_normalizes_case_and_whitespace() {
-        let e = PhraseEntropy::from_indices(&[7, 700, 2047, 0, 1, 1234, 99]);
-        let phrase = Phrase::from_entropy(&e);
-        let shouty: Vec<String> = phrase.words().iter().map(|w| format!("  {} ", w.to_uppercase())).collect();
+        let entropy = PhraseEntropy::from_bytes([0x42; ENTROPY_BYTES]);
+        let phrase = Phrase::from_entropy(&entropy);
+        let shouty: Vec<String> = phrase
+            .words()
+            .iter()
+            .map(|word| format!("  {} ", word.to_uppercase()))
+            .collect();
         let reparsed = Phrase::parse(&shouty).expect("normalized parse");
-        assert_eq!(reparsed.to_entropy().unwrap().indices(), e.indices());
+        assert_eq!(reparsed.to_entropy().unwrap().ikm(), entropy.ikm());
     }
 
     #[test]
     fn parse_rejects_wrong_count() {
-        let six: Vec<String> = (0..6).map(|_| "abandon".to_string()).collect();
+        let eleven = vec!["abandon".to_owned(); 11];
         assert!(matches!(
-            Phrase::parse(&six),
-            Err(CryptoError::WrongLength { expected: 7, got: 6 })
+            Phrase::parse(&eleven),
+            Err(CryptoError::WrongLength {
+                expected: PHRASE_WORDS,
+                got: 11
+            })
         ));
     }
 
     #[test]
     fn parse_rejects_unknown_word() {
-        let mut words: Vec<String> = (0..7).map(|_| "abandon".to_string()).collect();
-        words[3] = "notabip39word".to_string();
-        assert!(matches!(Phrase::parse(&words), Err(CryptoError::UnknownWord(_))));
+        let mut words = vec!["abandon".to_owned(); PHRASE_WORDS];
+        words[3] = "notabip39word".to_owned();
+        assert!(matches!(
+            Phrase::parse(&words),
+            Err(CryptoError::UnknownWord(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_bad_checksum() {
+        let words = vec!["abandon".to_owned(); PHRASE_WORDS];
+        assert!(matches!(
+            Phrase::parse(&words),
+            Err(CryptoError::InvalidMnemonicChecksum)
+        ));
     }
 }

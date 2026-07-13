@@ -11,12 +11,10 @@ pub enum ApiError {
     NotImplemented,
     #[error("bad request: {0}")]
     BadRequest(&'static str),
-    #[error("invalid recovery phrase: {0}")]
-    BadPhrase(String),
-    /// Recovery failed: either no account matches the phrase OR the recovery code is wrong. These
-    /// are deliberately INDISTINGUISHABLE (same status + message) so the endpoint is not an
-    /// account-existence oracle (PD-3).
-    #[error("invalid recovery phrase or code")]
+    /// Authentication failed. Unknown accounts, invalid registration proofs, and bad request
+    /// signatures deliberately share one response so authenticated endpoints are not account-
+    /// existence oracles (PD-3).
+    #[error("invalid authentication proof")]
     Unauthorized,
     #[error("too many requests")]
     TooManyRequests,
@@ -40,7 +38,6 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::NotImplemented => StatusCode::NOT_IMPLEMENTED,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::BadPhrase(_) => StatusCode::BAD_REQUEST,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
             ApiError::PaymentRequired => StatusCode::PAYMENT_REQUIRED,

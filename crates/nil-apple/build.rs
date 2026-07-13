@@ -10,7 +10,11 @@ fn main() {
         cpp_compat: true, // wrap in extern "C" for the Swift/Obj-C bridge
         ..Default::default()
     };
-    if let Ok(bindings) = cbindgen::Builder::new().with_crate(&crate_dir).with_config(cfg).generate() {
+    if let Ok(bindings) = cbindgen::Builder::new()
+        .with_crate(&crate_dir)
+        .with_config(cfg)
+        .generate()
+    {
         let _ = std::fs::create_dir_all(format!("{crate_dir}/include"));
         bindings.write_to_file(format!("{crate_dir}/include/nil_apple.h"));
     }

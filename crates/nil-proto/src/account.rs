@@ -7,44 +7,31 @@ use serde::{Deserialize, Serialize};
 
 /// Request body for `POST /v1/account`.
 ///
-/// Internally tagged on `type`: `{"type":"anonymous"}` or
-/// `{"type":"email","email":"a@b.c"}`.
+/// Internally tagged on `type`. Anonymous accounts are derived entirely by the client: the Portal
+/// receives only the account's opaque identifier, public authentication key, and a proof that the
+/// registering client possesses the corresponding private key. Recovery material never crosses
+/// the network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum CreateAccountRequest {
-    /// No-email account: the Portal generates the credential. Nothing personal is sent.
-    Anonymous,
+    /// No-email account. All values are exact lowercase hex: 32-byte account number, 32-byte
+    /// Ed25519 public key, and 64-byte registration signature respectively.
+    Anonymous {
+        account_number: String,
+        auth_pubkey: String,
+        registration_signature: String,
+    },
     /// Email account (Phase 0 stub): only an encrypted email would be retained.
     Email { email: String },
 }
 
 /// Response for a successful anonymous `POST /v1/account`.
 ///
-/// The `recovery_phrase` is exactly 7 words and is shown to the user **once**.
+/// The account number is returned as canonical lowercase 64-character hex. No secret or recovery
+/// material is ever returned by the Portal because the client generated and retained it locally.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAccountResponse {
     pub account_number: String,
-    pub recovery_phrase: Vec<String>,
-    pub recovery_code: String,
-}
-
-/// Request body for `POST /v1/account/recover`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoverRequest {
-    pub recovery_phrase: Vec<String>,
-    pub recovery_code: String,
-}
-
-/// Response for a successful recovery — status only, never any identity.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RecoverResponse {
-    pub account_number: String,
-    pub entitlement: EntitlementDto,
-    /// Subscription expiry (unix secs) iff `entitlement == Active`; lets the client show
-    /// "Active until …". Additive + optional so older clients (which read `entitlement` as a bare
-    /// string) keep working. Tied to the anonymous account, never to a person (ADR-0007).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub until: Option<u64>,
 }
 
 /// Subscription/entitlement state. Carries no identity — just what the account is
@@ -100,16 +87,36 @@ pub struct ActivateRequest {
     pub payment_reference: String,
 }
 
-/// Request body for `POST /v1/tokens/mint` — an authenticated, subscription-gated blind-token mint
-/// (ADR-0007). The same blind-sign path as one-shot issuance, but gated on an *active subscription*
-/// (rate-capped per account) instead of a one-time payment. The issuer never sees the unblinded
-/// token, so mint↔redeem stays unlinkable (account↔connection unlinkability holds). The response is
-/// a [`crate::token::IssueResponse`] (the blind signature; the client unblinds locally).
+/// Original single-item request body for `POST /v1/tokens/mint`.
+///
+/// This wire shape is retained for v1 compatibility. The server derives its retry key from the
+/// canonical authenticated account and decoded blinded request, so a fresh auth challenge can
+/// safely retry the same operation without adding a required v1 field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MintRequest {
     pub auth: AccountAuth,
-    /// Lowercase hex of the blinded token message (the client blinds locally, unblinds the reply).
     pub blind_msg: String,
+}
+
+/// Request body for `POST /v2/tokens/mint` — one account proof authenticates a bounded batch of
+/// blinded messages. The Portal validates the complete batch before signing and charges abuse
+/// limits by item count; it never sees any unblinded token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MintBatchRequest {
+    pub auth: AccountAuth,
+    /// Fresh 256-bit lowercase-hex idempotency key. A retry uses the same value and ordered blind
+    /// messages with a new single-use authentication challenge.
+    pub request_id: String,
+    pub blind_msgs: crate::token::BlindMessageBatch,
+}
+
+/// Same-order response for `POST /v2/tokens/mint`. Each signature corresponds to the blinded
+/// message at the same array index; the client unblinds each one locally.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MintBatchResponse {
+    pub blind_sigs: crate::token::BlindSignatureBatch,
 }
 
 #[cfg(test)]
@@ -117,9 +124,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn anonymous_request_deserializes_from_type_tag() {
-        let req: CreateAccountRequest = serde_json::from_str(r#"{"type":"anonymous"}"#).unwrap();
-        assert_eq!(req, CreateAccountRequest::Anonymous);
+    fn anonymous_request_deserializes_with_public_registration_material() {
+        let account_number = "ab".repeat(32);
+        let auth_pubkey = "cd".repeat(32);
+        let registration_signature = "ef".repeat(64);
+        let json = serde_json::json!({
+            "type": "anonymous",
+            "account_number": account_number,
+            "auth_pubkey": auth_pubkey,
+            "registration_signature": registration_signature,
+        });
+        let req: CreateAccountRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            req,
+            CreateAccountRequest::Anonymous {
+                account_number,
+                auth_pubkey,
+                registration_signature,
+            }
+        );
     }
 
     #[test]
@@ -135,15 +158,81 @@ mod tests {
     }
 
     #[test]
+    fn anonymous_request_rejects_recovery_material() {
+        let json = serde_json::json!({
+            "type": "anonymous",
+            "account_number": "ab".repeat(32),
+            "auth_pubkey": "cd".repeat(32),
+            "registration_signature": "ef".repeat(64),
+            "recovery_phrase": ["must", "stay", "on", "the", "client"],
+        });
+        assert!(
+            serde_json::from_value::<CreateAccountRequest>(json).is_err(),
+            "recovery material must not be accepted by the registration protocol"
+        );
+    }
+
+    #[test]
     fn create_response_shape_matches_spec() {
         let resp = CreateAccountResponse {
-            account_number: "K7Q2M-9XR4T".to_string(),
-            recovery_phrase: (1..=7).map(|i| format!("word{i}")).collect(),
-            recovery_code: "XXXX-XXXX".to_string(),
+            account_number: "ab".repeat(32),
         };
         let json = serde_json::to_value(&resp).unwrap();
-        assert_eq!(json["recovery_phrase"].as_array().unwrap().len(), 7);
-        assert!(json["account_number"].is_string());
-        assert!(json["recovery_code"].is_string());
+        assert_eq!(json["account_number"], "ab".repeat(32));
+        assert_eq!(
+            json.as_object().unwrap().len(),
+            1,
+            "Portal returns no recovery material"
+        );
+    }
+
+    #[test]
+    fn v1_single_and_v2_batch_mint_shapes_are_versioned() {
+        let auth = AccountAuth {
+            account_number: "ab".repeat(32),
+            challenge: "cd".repeat(32),
+            signature: "ef".repeat(64),
+        };
+        let request = MintRequest {
+            auth: auth.clone(),
+            blind_msg: "11".repeat(256),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["blind_msg"], "11".repeat(256));
+        assert!(json.get("request_id").is_none());
+        assert!(json.get("blind_msgs").is_none());
+        assert_eq!(
+            serde_json::from_value::<MintRequest>(json).unwrap(),
+            request
+        );
+
+        let batch_request = MintBatchRequest {
+            auth,
+            request_id: "aa".repeat(32),
+            blind_msgs: crate::token::BlindMessageBatch::try_from(vec![
+                "11".repeat(256),
+                "22".repeat(256),
+            ])
+            .unwrap(),
+        };
+        let json = serde_json::to_value(&batch_request).unwrap();
+        assert_eq!(json["request_id"], "aa".repeat(32));
+        assert_eq!(json["blind_msgs"].as_array().unwrap().len(), 2);
+        assert!(json.get("blind_msg").is_none());
+        assert_eq!(
+            serde_json::from_value::<MintBatchRequest>(json).unwrap(),
+            batch_request
+        );
+
+        let response = MintBatchResponse {
+            blind_sigs: crate::token::BlindSignatureBatch::try_from(vec![
+                "33".repeat(256),
+                "44".repeat(256),
+            ])
+            .unwrap(),
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["blind_sigs"].as_array().unwrap().len(), 2);
+        assert!(json.get("blind_sig").is_none());
     }
 }

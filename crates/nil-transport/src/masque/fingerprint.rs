@@ -74,7 +74,8 @@ fn expand_label(prk: &Hkdf<Sha256>, label: &str, out_len: usize) -> Vec<u8> {
     info.extend_from_slice(full.as_bytes());
     info.push(0u8); // zero-length context
     let mut out = vec![0u8; out_len];
-    prk.expand(&info, &mut out).expect("hkdf expand within output limit");
+    prk.expand(&info, &mut out)
+        .expect("hkdf expand within output limit");
     out
 }
 
@@ -100,8 +101,8 @@ fn capture_initials() -> Vec<Vec<u8>> {
     let scid = quiche::ConnectionId::from_ref(&scid);
     let local = "127.0.0.1:0".parse().unwrap();
     let peer = "127.0.0.1:443".parse().unwrap();
-    let mut conn =
-        quiche::connect(Some("fingerprint.invalid"), &scid, local, peer, &mut config).expect("connect");
+    let mut conn = quiche::connect(Some("fingerprint.invalid"), &scid, local, peer, &mut config)
+        .expect("connect");
     let mut datagrams = Vec::new();
     loop {
         let mut buf = vec![0u8; 2048];
@@ -120,7 +121,10 @@ fn capture_initials() -> Vec<Vec<u8>> {
 
 /// Decrypt a QUIC v1 client Initial packet → the plaintext QUIC frames.
 fn decrypt_initial(pkt: &[u8]) -> Vec<u8> {
-    assert!(pkt[0] & 0x80 != 0, "expected a long-header (Initial) packet");
+    assert!(
+        pkt[0] & 0x80 != 0,
+        "expected a long-header (Initial) packet"
+    );
     let dcid_len = pkt[5] as usize;
     let dcid = &pkt[6..6 + dcid_len];
     let mut off = 6 + dcid_len;
@@ -208,18 +212,20 @@ fn reassemble(mut chunks: Vec<(u64, Vec<u8>)>) -> Vec<u8> {
 struct ClientHelloShape {
     tls13: bool,
     has_sni: bool,
-    ciphers: Vec<u16>,      // GREASE removed
-    extensions: Vec<u16>,   // in order, GREASE removed
+    ciphers: Vec<u16>,    // GREASE removed
+    extensions: Vec<u16>, // in order, GREASE removed
     alpn: Vec<String>,
-    groups: Vec<u16>,       // supported_groups (ext 10)
-    sig_algs: Vec<u16>,     // ext 13, original order
+    groups: Vec<u16>,           // supported_groups (ext 10)
+    sig_algs: Vec<u16>,         // ext 13, original order
     key_share_groups: Vec<u16>, // ext 51 offered shares
     grease_present: bool,
 }
 
 impl ClientHelloShape {
     fn has_pq_key_share(&self) -> bool {
-        self.key_share_groups.iter().any(|&g| g == X25519MLKEM768 || g == X25519KYBER768_DRAFT)
+        self.key_share_groups
+            .iter()
+            .any(|&g| g == X25519MLKEM768 || g == X25519KYBER768_DRAFT)
     }
 
     /// A stable, unambiguous digest over the normalized shape (anti-drift pin). Not JA4 — this is
@@ -252,12 +258,31 @@ impl ClientHelloShape {
     fn ja4(&self) -> String {
         let mut sc = self.ciphers.clone();
         sc.sort_unstable();
-        let cipher_hash = trunc12(&sc.iter().map(|c| format!("{c:04x}")).collect::<Vec<_>>().join(","));
+        let cipher_hash = trunc12(
+            &sc.iter()
+                .map(|c| format!("{c:04x}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         // JA4_c: extensions sorted, excluding SNI(0x0000) and ALPN(0x0010), then "_" + sig algs in order.
-        let mut se: Vec<u16> = self.extensions.iter().copied().filter(|&e| e != 0x0000 && e != 0x0010).collect();
+        let mut se: Vec<u16> = self
+            .extensions
+            .iter()
+            .copied()
+            .filter(|&e| e != 0x0000 && e != 0x0010)
+            .collect();
         se.sort_unstable();
-        let ext_part = se.iter().map(|e| format!("{e:04x}")).collect::<Vec<_>>().join(",");
-        let sig_part = self.sig_algs.iter().map(|s| format!("{s:04x}")).collect::<Vec<_>>().join(",");
+        let ext_part = se
+            .iter()
+            .map(|e| format!("{e:04x}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sig_part = self
+            .sig_algs
+            .iter()
+            .map(|s| format!("{s:04x}"))
+            .collect::<Vec<_>>()
+            .join(",");
         let ext_hash = trunc12(&format!("{ext_part}_{sig_part}"));
         let alpn2 = match self.alpn.first() {
             Some(a) if a.len() >= 2 => format!("{}{}", &a[..1], &a[a.len() - 1..]),
@@ -278,11 +303,17 @@ impl ClientHelloShape {
 }
 
 fn hexlist(v: &[u16]) -> String {
-    v.iter().map(|x| format!("{x:04x}")).collect::<Vec<_>>().join(",")
+    v.iter()
+        .map(|x| format!("{x:04x}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn trunc12(s: &str) -> String {
-    Sha256::digest(s.as_bytes())[..6].iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(s.as_bytes())[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn parse_client_hello(hs: &[u8]) -> ClientHelloShape {
@@ -328,7 +359,8 @@ fn parse_client_hello(hs: &[u8]) -> ClientHelloShape {
                 while q < edata.len() {
                     let l = edata[q] as usize;
                     q += 1;
-                    sh.alpn.push(String::from_utf8_lossy(&edata[q..q + l]).into_owned());
+                    sh.alpn
+                        .push(String::from_utf8_lossy(&edata[q..q + l]).into_owned());
                     q += l;
                 }
             }
@@ -414,8 +446,15 @@ fn nil_outer_client_hello_fingerprint() {
     // Pipeline sanity (also validates the RFC 9001 decrypt end-to-end): a real ClientHello with the
     // MASQUE ALPN and TLS 1.3 cipher suites. Garbage from a wrong key derivation would not parse.
     assert!(sh.tls13, "TLS 1.3 must be offered");
-    assert!(sh.alpn.iter().any(|a| a == "h3"), "ALPN must advertise h3, got {:?}", sh.alpn);
-    assert!(sh.ciphers.contains(&0x1301), "TLS_AES_128_GCM_SHA256 must be offered");
+    assert!(
+        sh.alpn.iter().any(|a| a == "h3"),
+        "ALPN must advertise h3, got {:?}",
+        sh.alpn
+    );
+    assert!(
+        sh.ciphers.contains(&0x1301),
+        "TLS_AES_128_GCM_SHA256 must be offered"
+    );
     // NOTE: TLS-level GREASE (RFC 8701) is measured, not asserted — quiche's `grease` flag greases
     // the QUIC layer; whether BoringSSL adds a TLS GREASE cipher/extension is a separate fingerprint
     // characteristic this harness reports (its absence is a Chrome-parity gap).
@@ -429,7 +468,10 @@ fn nil_outer_client_hello_fingerprint() {
     println!("\n=== NIL outer QUIC/TLS ClientHello fingerprint ===");
     println!("digest (pinned): {digest}");
     println!("JA4 (best-effort; verify vs FoxIO tooling): {ja4}");
-    println!("TLS1.3={} SNI={} GREASE={}", sh.tls13, sh.has_sni, sh.grease_present);
+    println!(
+        "TLS1.3={} SNI={} GREASE={}",
+        sh.tls13, sh.has_sni, sh.grease_present
+    );
     println!("cipher suites: {}", hexlist(&sh.ciphers));
     println!("extensions:    {}", hexlist(&sh.extensions));
     println!("supported groups: {}", hexlist(&sh.groups));
@@ -458,8 +500,14 @@ fn nil_outer_client_hello_fingerprint() {
     // directly (robust to future re-pins), then pin the full digest for anti-drift. Any drift
     // (quiche/BoringSSL bump, config change) fails here — re-pin only after confirming the change
     // keeps NIL at or closer to browser parity.
-    assert!(pq, "regression: NIL's outer ClientHello must offer the X25519MLKEM768 PQ key share");
-    assert!(sh.grease_present, "regression: NIL's outer ClientHello must carry TLS GREASE");
+    assert!(
+        pq,
+        "regression: NIL's outer ClientHello must offer the X25519MLKEM768 PQ key share"
+    );
+    assert!(
+        sh.grease_present,
+        "regression: NIL's outer ClientHello must carry TLS GREASE"
+    );
     // Pinned 2026-07 (quiche 0.22 boring-crate + boring 4.22 pq-experimental): TLS1.3; ciphers
     // 1301/1302/1303; groups 11ec,001d,0017,0018; key_share 11ec,001d; GREASE on; 8 extensions.
     // Remaining finer gap (not the headline ones): Chrome carries a larger extension SET/ORDER —
@@ -474,8 +522,11 @@ fn nil_outer_client_hello_fingerprint() {
     // known, documented residual: NIL matches Chrome on every substantive JA4 component; only three
     // finer extensions remain, and closing them needs quiche per-SSL hooks (see below).
     let nset: std::collections::BTreeSet<u16> = sh.extensions.iter().copied().collect();
-    let missing: Vec<String> =
-        CHROME_EXT_SET.iter().filter(|e| !nset.contains(e)).map(|e| format!("{e:04x}")).collect();
+    let missing: Vec<String> = CHROME_EXT_SET
+        .iter()
+        .filter(|e| !nset.contains(e))
+        .map(|e| format!("{e:04x}"))
+        .collect();
     let extra: Vec<String> = sh
         .extensions
         .iter()
@@ -527,9 +578,18 @@ fn compare_against_captured_chrome() {
     let cg: BTreeSet<u16> = chrome.groups.iter().copied().collect();
     let ng: BTreeSet<u16> = nil.groups.iter().copied().collect();
     println!("--- parity delta (what NIL must add to match Chrome) ---");
-    println!("extensions Chrome has, NIL LACKS: [{}]", hx(cset.difference(&nset)));
-    println!("extensions NIL has, Chrome lacks: [{}]", hx(nset.difference(&cset)));
-    println!("groups Chrome has, NIL lacks:     [{}]", hx(cg.difference(&ng)));
+    println!(
+        "extensions Chrome has, NIL LACKS: [{}]",
+        hx(cset.difference(&nset))
+    );
+    println!(
+        "extensions NIL has, Chrome lacks: [{}]",
+        hx(nset.difference(&cset))
+    );
+    println!(
+        "groups Chrome has, NIL lacks:     [{}]",
+        hx(cg.difference(&ng))
+    );
     println!("cipher suites match: {}", chrome.ciphers == nil.ciphers);
     println!("ALPN match: {}", chrome.alpn == nil.alpn);
 }

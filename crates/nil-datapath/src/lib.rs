@@ -3,12 +3,24 @@
 //! for the node so the tunnel's own QUIC packets don't loop), arms a fail-closed
 //! kill-switch, and runs the bidirectional packet pump.
 //!
-//! The OS-specific routing/kill-switch/DNS lives behind [`NetControl`]: Linux (verified in
-//! Docker), macOS (verified in a tart VM), and Windows (routing/DNS + a fail-closed Windows
-//! Firewall kill-switch, verified in a Windows-on-ARM VM — see `windows.rs`) are complete. All
-//! three fail closed: IPv6 is dropped wholesale (the tunnel is IPv4-only) and a dropped pump
-//! holds the kill-switch. The [`Transport`] trait stays the only seam to the tunnel — this crate
-//! never knows which transport is active.
+//! OS-specific routing/kill-switch/DNS lives behind [`NetControl`] for Linux, macOS, and Windows.
+//! The source paths are fail-closed and transaction-aware, but privileged fault/crash/reboot tests
+//! on stock systems remain a release blocker. IPv6 is dropped wholesale
+//! (the tunnel is IPv4-only), and a dropped pump holds the kill-switch. The [`Transport`] trait
+//! stays the only seam to the tunnel — this crate never knows which transport is active.
+
+#[cfg(all(not(debug_assertions), feature = "dev-fallbacks"))]
+compile_error!(
+    "nil-datapath: `dev-fallbacks` is development-only and cannot be compiled without debug assertions"
+);
+#[cfg(all(not(debug_assertions), feature = "synthetic-attest"))]
+compile_error!(
+    "nil-datapath: `synthetic-attest` is development-only and cannot be compiled without debug assertions"
+);
+#[cfg(all(not(debug_assertions), feature = "dev-trace"))]
+compile_error!(
+    "nil-datapath: `dev-trace` is development-only and cannot be compiled without debug assertions"
+);
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -31,6 +43,38 @@ mod linux;
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
+
+/// Collects rollback failures without stopping later cleanup attempts. Platform teardown uses this
+/// to preserve the fail-closed ordering: routes and DNS are all attempted, but the firewall guard
+/// is released only when every earlier mutation was restored successfully.
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct CleanupErrors(Vec<String>);
+
+#[cfg(not(target_os = "android"))]
+impl CleanupErrors {
+    fn attempt(&mut self, step: &'static str, result: anyhow::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                self.0.push(format!("{step}: {error:#}"));
+                false
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn finish(self) -> anyhow::Result<()> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("network rollback incomplete: {}", self.0.join("; "))
+        }
+    }
+}
 
 /// How to bring up the tunnel.
 pub struct TunnelConfig {
@@ -63,7 +107,9 @@ pub struct ArmParams {
 /// safe to call after a partial `arm`.
 pub trait NetControl: Send {
     fn arm(&mut self, params: &ArmParams) -> anyhow::Result<()>;
-    fn teardown(&mut self);
+    /// Restore every mutation made by [`NetControl::arm`]. Implementations must keep enough state
+    /// to retry a failed rollback and must not release a kill-switch until routes and DNS are sane.
+    fn teardown(&mut self) -> anyhow::Result<()>;
 }
 
 /// Fallback for targets without a native datapath impl. Compiles everywhere so the workspace
@@ -85,7 +131,9 @@ impl NetControl for StubNet {
     fn arm(&mut self, _params: &ArmParams) -> anyhow::Result<()> {
         anyhow::bail!("system datapath is implemented for Linux, macOS, and Windows only")
     }
-    fn teardown(&mut self) {}
+    fn teardown(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -198,9 +246,15 @@ impl Tunnel {
             also_except,
         }) {
             // Bringing up the network failed — tear down what we armed and close the session.
-            net.teardown();
+            let rollback = net.teardown();
             let _ = transport.close(session).await;
-            return Err(e);
+            return match rollback {
+                Ok(()) => Err(e),
+                Err(rollback) => Err(e.context(format!(
+                    "network setup rollback also failed; host networking may remain fail-closed \
+                     or partially configured: {rollback:#}"
+                ))),
+            };
         }
 
         let cancel = CancellationToken::new();
@@ -238,16 +292,19 @@ impl Tunnel {
     }
 
     /// Tear down cleanly: stop the pump, restore networking, close the session.
-    pub async fn down(mut self) -> anyhow::Result<()> {
+    /// A failed rollback retains its mutation journal in `self`; callers may invoke `down` again
+    /// after repairing the local privilege/firewall condition.
+    pub async fn down(&mut self) -> anyhow::Result<()> {
         self.cancel.cancel();
         for h in self.pumps.drain(..) {
             let _ = h.await;
         }
         // Restore routes/DNS/firewall BEFORE closing the session so there is no leak window.
-        self.net.teardown();
+        let rollback = self.net.teardown();
         if let Some(s) = self.session.take() {
             let _ = self.transport.close(s).await;
         }
+        rollback?;
         tracing::info!("tunnel down; networking restored");
         Ok(())
     }
@@ -326,7 +383,9 @@ pub fn preflight_privilege() -> Result<(), PreflightError> {
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return Ok(());
         }
-        let mut elevation = TokenElevation { token_is_elevated: 0 };
+        let mut elevation = TokenElevation {
+            token_is_elevated: 0,
+        };
         let mut ret_len: u32 = 0;
         let ok = GetTokenInformation(
             token,
@@ -368,6 +427,7 @@ fn open_tun(cfg: &TunnelConfig) -> std::io::Result<tun_rs::AsyncDevice> {
 /// `Some(new_ip)` only when the node assigned an address that differs from the configured one
 /// (`None` ⇒ keep the configured address: no assignment, or it already matches). Pure — extracted
 /// from [`Tunnel::up`] so the ADDRESS_ASSIGN apply path is unit-testable without a TUN device.
+#[cfg(not(target_os = "android"))]
 fn apply_assigned_ip(configured: Ipv4Addr, assigned: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
     match assigned {
         Some(ip) if ip != configured => Some(ip),
@@ -379,6 +439,7 @@ fn apply_assigned_ip(configured: Ipv4Addr, assigned: Option<Ipv4Addr>) -> Option
 /// when the negotiated MTU is known AND smaller than the configured ceiling (we never grow the TUN
 /// past what the OS expects); `None` ⇒ keep the configured MTU. Pure — extracted from
 /// [`Tunnel::up`] for unit testing.
+#[cfg(not(target_os = "android"))]
 fn clamp_mtu(configured: u16, negotiated: Option<usize>) -> Option<u16> {
     let m = negotiated?.min(u16::MAX as usize) as u16;
     (m < configured).then_some(m)
@@ -396,8 +457,12 @@ fn spawn_pumps(
     // dies uncleanly its `cancel.cancel()` also wakes the sibling — the whole tunnel winds down
     // together. `down()` cancels the same token, which the pumps treat as a clean teardown.
     let to_wire = {
-        let (tun, transport, cancel, dead) =
-            (tun.clone(), transport.clone(), cancel.clone(), pump_dead.clone());
+        let (tun, transport, cancel, dead) = (
+            tun.clone(),
+            transport.clone(),
+            cancel.clone(),
+            pump_dead.clone(),
+        );
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             loop {
@@ -425,8 +490,12 @@ fn spawn_pumps(
     };
     // tunnel → TUN: receive IP packets from the transport and write them to the OS.
     let from_wire = {
-        let (tun, transport, cancel, dead) =
-            (tun.clone(), transport.clone(), cancel.clone(), pump_dead.clone());
+        let (tun, transport, cancel, dead) = (
+            tun.clone(),
+            transport.clone(),
+            cancel.clone(),
+            pump_dead.clone(),
+        );
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -457,21 +526,52 @@ async fn resolve_ip(node: &NodeEndpoint) -> anyhow::Result<IpAddr> {
 /// exceptions).
 #[cfg(not(target_os = "android"))]
 async fn resolve_host(host: &str) -> anyhow::Result<IpAddr> {
-    let hp = format!("{host}:0");
-    let mut addrs = tokio::net::lookup_host(hp.clone())
+    // Tuple resolution is unambiguous for bare IPv6 literals and keeps the node hostname out of
+    // propagated/logged errors.
+    let mut addrs = tokio::net::lookup_host((host, 0))
         .await
-        .map_err(|e| anyhow::anyhow!("resolve {hp}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("resolve node endpoint: {e}"))?;
     addrs
         .next()
         .map(|s| s.ip())
-        .ok_or_else(|| anyhow::anyhow!("no address for {host}"))
+        .ok_or_else(|| anyhow::anyhow!("no address resolved for node endpoint"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(debug_assertions)]
     use nil_core::Grant;
+    #[cfg(debug_assertions)]
     use nil_transport::loopback::LoopbackTransport;
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn cleanup_errors_attempt_every_step_and_preserve_context() {
+        let mut errors = CleanupErrors::default();
+        assert!(errors.attempt("restore DNS", Ok(())));
+        assert!(!errors.attempt(
+            "restore route",
+            Err(anyhow::anyhow!("injected route failure")),
+        ));
+        assert!(!errors.attempt(
+            "restore firewall",
+            Err(anyhow::anyhow!("injected firewall failure")),
+        ));
+
+        let rendered = format!("{:#}", errors.finish().unwrap_err());
+        assert!(rendered.contains("restore route: injected route failure"));
+        assert!(rendered.contains("restore firewall: injected firewall failure"));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[tokio::test]
+    async fn host_route_resolution_accepts_a_bare_ipv6_literal() {
+        assert_eq!(
+            resolve_host("::1").await.unwrap(),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+    }
 
     /// The pre-token privilege gate must be deterministic and side-effect-free (it runs before a
     /// single-use token is spent, so it can't churn state), and its verdict must track root exactly:
@@ -496,6 +596,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn assigned_ip_replaces_only_a_distinct_node_assignment() {
         let configured: Ipv4Addr = "10.74.0.2".parse().unwrap();
@@ -505,9 +606,13 @@ mod tests {
         assert_eq!(apply_assigned_ip(configured, Some(configured)), None);
         // Node assigned a DIFFERENT address ⇒ apply it (concurrent-client collision avoidance).
         let assigned: Ipv4Addr = "10.74.0.9".parse().unwrap();
-        assert_eq!(apply_assigned_ip(configured, Some(assigned)), Some(assigned));
+        assert_eq!(
+            apply_assigned_ip(configured, Some(assigned)),
+            Some(assigned)
+        );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn mtu_clamps_down_never_up() {
         // Unknown negotiated MTU ⇒ keep the configured ceiling.
@@ -526,6 +631,7 @@ mod tests {
     /// exercises the encapsulate→decapsulate round-trip over the in-memory loopback transport
     /// (the same `Transport` seam the real pump drives — the OS TUN endpoints are not mockable
     /// offline, so we drive the transport directly, matching `spawn_pumps`' send/recv sequence).
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pump_roundtrips_a_packet_over_loopback() {
         let transport = LoopbackTransport::new();
@@ -567,6 +673,7 @@ mod tests {
 
     /// Two concurrent sessions never cross packets — the pump for one tunnel must not receive
     /// another's traffic (the loopback transport keys queues by session id).
+    #[cfg(debug_assertions)]
     #[tokio::test]
     async fn pump_sessions_do_not_cross_talk() {
         let transport = LoopbackTransport::new();
@@ -587,7 +694,13 @@ mod tests {
             .send(&b, IpPacket::new(vec![0xBB]))
             .await
             .expect("send b");
-        assert_eq!(transport.recv(&a).await.expect("recv a").as_bytes(), &[0xAA]);
-        assert_eq!(transport.recv(&b).await.expect("recv b").as_bytes(), &[0xBB]);
+        assert_eq!(
+            transport.recv(&a).await.expect("recv a").as_bytes(),
+            &[0xAA]
+        );
+        assert_eq!(
+            transport.recv(&b).await.expect("recv b").as_bytes(),
+            &[0xBB]
+        );
     }
 }

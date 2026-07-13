@@ -33,7 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 use tokio::net::UdpSocket;
 
 use crate::cascade::{Cascade, DnsLivenessProbe};
@@ -98,7 +100,9 @@ pub struct UdpReachabilityProbe {
 
 impl Default for UdpReachabilityProbe {
     fn default() -> Self {
-        Self { budget: DEFAULT_PROBE_BUDGET }
+        Self {
+            budget: DEFAULT_PROBE_BUDGET,
+        }
     }
 }
 
@@ -136,7 +140,11 @@ async fn run_udp_probe(host: &str, port: u16, budget: Duration) -> ProbeOutcome 
     if sock.connect((host, port)).await.is_err() {
         return ProbeOutcome::Unsendable;
     }
-    if sock.send(&quic_version_negotiation_trigger()).await.is_err() {
+    if sock
+        .send(&quic_version_negotiation_trigger())
+        .await
+        .is_err()
+    {
         return ProbeOutcome::Unsendable;
     }
     let mut buf = [0u8; 2048];
@@ -197,7 +205,12 @@ impl Selector {
         fast: Vec<Arc<dyn Transport>>,
         resistant: Vec<Arc<dyn Transport>>,
     ) -> Self {
-        Self { probe, fast, resistant, last_class: Mutex::new(None) }
+        Self {
+            probe,
+            fast,
+            resistant,
+            last_class: Mutex::new(None),
+        }
     }
 
     /// Probe the path and build the ordered [`Cascade`] (with the DNS liveness probe attached). On
@@ -243,7 +256,11 @@ pub struct SelectorTransport {
 
 impl SelectorTransport {
     pub fn new(selector: Selector) -> Self {
-        Self { selector, winners: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            selector,
+            winners: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn winner(&self, session: &Session) -> Result<Winner> {
@@ -296,7 +313,8 @@ impl Transport for SelectorTransport {
                 .winners
                 .lock()
                 .map_err(|_| Error::Transport("selector map poisoned".into()))?;
-            map.remove(&session.id).ok_or(Error::SessionNotFound(session.id))?
+            map.remove(&session.id)
+                .ok_or(Error::SessionNotFound(session.id))?
         };
         t.close(inner).await
     }
@@ -336,11 +354,21 @@ mod tests {
         async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
             Err(Error::Transport("blocked".into()))
         }
-        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Err(Error::Closed) }
-        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Err(Error::Closed) }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> {
+            Err(Error::Closed)
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            Err(Error::Closed)
+        }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
     /// A rung that connects and answers `recv` (so it passes the DNS liveness probe).
@@ -348,16 +376,31 @@ mod tests {
     #[async_trait]
     impl Transport for Live {
         async fn connect(&self, _t: NodeEndpoint, _c: Grant) -> Result<Session> {
-            Ok(Session { id: SessionId(7), kind: self.0 })
+            Ok(Session {
+                id: SessionId(7),
+                kind: self.0,
+            })
         }
-        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> { Ok(()) }
-        async fn recv(&self, _s: &Session) -> Result<IpPacket> { Ok(IpPacket::new(vec![0u8])) }
-        async fn close(&self, _s: Session) -> Result<()> { Ok(()) }
-        fn kind(&self) -> TransportKind { self.0 }
-        fn fingerprint_profile(&self) -> Profile { Profile::Internal }
+        async fn send(&self, _s: &Session, _p: IpPacket) -> Result<()> {
+            Ok(())
+        }
+        async fn recv(&self, _s: &Session) -> Result<IpPacket> {
+            Ok(IpPacket::new(vec![0u8]))
+        }
+        async fn close(&self, _s: Session) -> Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> TransportKind {
+            self.0
+        }
+        fn fingerprint_profile(&self) -> Profile {
+            Profile::Internal
+        }
     }
 
-    fn live(kind: TransportKind) -> Arc<dyn Transport> { Arc::new(Live(kind)) }
+    fn live(kind: TransportKind) -> Arc<dyn Transport> {
+        Arc::new(Live(kind))
+    }
 
     #[test]
     fn unknown_coerces_to_hostile() {
@@ -377,7 +420,10 @@ mod tests {
     #[tokio::test]
     async fn clean_leads_fast_then_appends_resistant_tail() {
         let s = selector_with(PathClass::Clean);
-        let kinds = s.build_cascade(&NodeEndpoint::loopback()).await.rung_kinds();
+        let kinds = s
+            .build_cascade(&NodeEndpoint::loopback())
+            .await
+            .rung_kinds();
         assert_eq!(
             kinds,
             vec![
@@ -394,7 +440,10 @@ mod tests {
     #[tokio::test]
     async fn hostile_uses_only_the_resistant_rungs() {
         let s = selector_with(PathClass::Hostile);
-        let kinds = s.build_cascade(&NodeEndpoint::loopback()).await.rung_kinds();
+        let kinds = s
+            .build_cascade(&NodeEndpoint::loopback())
+            .await
+            .rung_kinds();
         assert_eq!(kinds, vec![TransportKind::Reality, TransportKind::Wstunnel]);
         assert_eq!(s.selected_class(), Some(PathClass::Hostile));
     }
@@ -402,7 +451,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_probe_is_treated_like_hostile() {
         let s = selector_with(PathClass::Unknown);
-        let kinds = s.build_cascade(&NodeEndpoint::loopback()).await.rung_kinds();
+        let kinds = s
+            .build_cascade(&NodeEndpoint::loopback())
+            .await
+            .rung_kinds();
         assert_eq!(
             kinds,
             vec![TransportKind::Reality, TransportKind::Wstunnel],
@@ -426,12 +478,22 @@ mod tests {
             .connect(NodeEndpoint::loopback(), Grant::mock())
             .await
             .expect("steps down into the resistant tail");
-        assert_eq!(session.kind, TransportKind::Wstunnel, "won via the resistant rung");
-        assert_eq!(st.selected_class(), Some(PathClass::Clean), "diagnostics expose the probe verdict");
+        assert_eq!(
+            session.kind,
+            TransportKind::Wstunnel,
+            "won via the resistant rung"
+        );
+        assert_eq!(
+            st.selected_class(),
+            Some(PathClass::Clean),
+            "diagnostics expose the probe verdict"
+        );
         assert_eq!(st.winning_kind(&session), Some(TransportKind::Wstunnel));
 
         // Close tears the winner down; the seam then reports SessionNotFound (no dangling rung).
-        st.close(session).await.expect("close tears down the winner");
+        st.close(session)
+            .await
+            .expect("close tears down the winner");
         assert!(matches!(
             st.send(&session, IpPacket::new(vec![0])).await,
             Err(Error::SessionNotFound(_))
@@ -456,14 +518,26 @@ mod tests {
     #[test]
     fn version_negotiation_trigger_is_well_formed() {
         let p = quic_version_negotiation_trigger();
-        assert_eq!(p.len(), PROBE_DATAGRAM_LEN, "padded to the QUIC Initial minimum");
+        assert_eq!(
+            p.len(),
+            PROBE_DATAGRAM_LEN,
+            "padded to the QUIC Initial minimum"
+        );
         assert_eq!(p[0] & 0x80, 0x80, "long header form bit set");
         assert_eq!(p[0] & 0x40, 0x40, "fixed bit set");
-        assert_ne!(&p[1..5], &[0, 0, 0, 0], "version is not 0x00000000 (which would be VN itself)");
+        assert_ne!(
+            &p[1..5],
+            &[0, 0, 0, 0],
+            "version is not 0x00000000 (which would be VN itself)"
+        );
         assert_eq!(p[5], 8, "DCID length");
         assert_eq!(p[14], 8, "SCID length");
         // DCID and SCID must DIFFER (a conformant client never reuses one for both) so the probe
         // isn't a NIL-specific fingerprint.
-        assert_ne!(&p[6..14], &p[15..23], "DCID and SCID must differ (RFC 9000; anti-fingerprint)");
+        assert_ne!(
+            &p[6..14],
+            &p[15..23],
+            "DCID and SCID must differ (RFC 9000; anti-fingerprint)"
+        );
     }
 }

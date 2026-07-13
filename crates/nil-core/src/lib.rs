@@ -66,8 +66,8 @@ pub enum Tee {
 }
 
 /// An expected code measurement, opaque bytes compared for equality during appraisal. For
-/// SEV-SNP this is the 48-byte launch `MEASUREMENT`; for TDX a domain-separated digest over
-/// the TD measurements (`MRTD`/`RTMR`s) so both TEEs compare uniformly.
+/// SEV-SNP this is the 48-byte launch `MEASUREMENT`; for TDX it is NIL's domain-separated
+/// SHA-384 digest over MRTD, exact workload policy fields, RTMRs, and report-body identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Measurement(pub Vec<u8>);
 
@@ -92,7 +92,14 @@ impl SevSnpTcbFloor {
     /// True iff every reported TCB component is at or above this floor, compared COMPONENT-WISE
     /// (not the lexicographic `TcbVersion` order): a node ahead on one component but behind on
     /// another must fail, since any lagging component can be the one carrying a security fix.
-    pub fn is_met_by(&self, fmc: Option<u8>, bootloader: u8, tee: u8, snp: u8, microcode: u8) -> bool {
+    pub fn is_met_by(
+        &self,
+        fmc: Option<u8>,
+        bootloader: u8,
+        tee: u8,
+        snp: u8,
+        microcode: u8,
+    ) -> bool {
         bootloader >= self.bootloader
             && tee >= self.tee
             && snp >= self.snp
@@ -104,16 +111,102 @@ impl SevSnpTcbFloor {
     }
 }
 
+/// Exact Intel TDX workload policy pinned by a relying party.
+///
+/// A cryptographically valid DCAP quote is only a statement about the values in its TD report;
+/// it does not say that those values describe the workload NIL intended to run.  Production TDX
+/// appraisal therefore compares every security-relevant, workload-controlled field below rather
+/// than treating `MRTD` alone as the guest identity.  The QVL separately authenticates the TDX
+/// module/platform TCB and rejects debug/reserved attribute combinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TdxMeasurement(pub [u8; 48]);
+
+impl AsRef<[u8]> for TdxMeasurement {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl From<[u8; 48]> for TdxMeasurement {
+    fn from(value: [u8; 48]) -> Self {
+        Self(value)
+    }
+}
+
+// Serde's built-in array implementations stop at 32 elements. Keep the core representation
+// length-safe and encode it as the same byte sequence/JSON array used by the surrounding DTOs.
+impl Serialize for TdxMeasurement {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TdxMeasurement {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        let len = bytes.len();
+        let value = bytes.try_into().map_err(|_| {
+            <D::Error as serde::de::Error>::custom(format!(
+                "TDX measurement must be exactly 48 bytes, got {len}"
+            ))
+        })?;
+        Ok(Self(value))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TdxPolicy {
+    /// Exact TDATTRIBUTES bytes.  This pins the security attributes in addition to the QVL's
+    /// unconditional rejection of a debuggable TD.
+    pub td_attributes: [u8; 8],
+    /// Exact extended-feature mask made available to the TD.
+    pub xfam: [u8; 8],
+    /// Software-defined non-owner configuration identity.
+    pub mr_config_id: TdxMeasurement,
+    /// Software-defined TD owner identity.
+    pub mr_owner: TdxMeasurement,
+    /// Software-defined owner/workload configuration identity.
+    pub mr_owner_config: TdxMeasurement,
+    /// Runtime measurement registers.  NIL's production image policy assigns RTMR0 to firmware,
+    /// RTMR1 to the boot loader/kernel, RTMR2 to the OS/runtime, and RTMR3 to the NIL workload.
+    pub rt_mr0: TdxMeasurement,
+    pub rt_mr1: TdxMeasurement,
+    pub rt_mr2: TdxMeasurement,
+    pub rt_mr3: TdxMeasurement,
+    /// Quote-body policy: `None` requires a TDREPORT 1.0 body. `Some(value)` requires a TDREPORT
+    /// 1.5 body whose `MRSERVICETD` equals `value`.  This prevents silently accepting a new report
+    /// shape with an unpinned identity field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mr_service_td: Option<TdxMeasurement>,
+}
+
 /// What the client expects a node to attest to — the Coordinator publishes this and the
 /// client refuses to tunnel unless the node's report matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestExpectation {
     pub tee: Tee,
     pub measurement: Measurement,
+    /// Optional SHA-256 pin of the node certificate's exact DER SubjectPublicKeyInfo. Coordinator
+    /// paths in production always carry this; `None` exists only for legacy/debug direct-node
+    /// fixtures. When set, the client compares it in constant time before accepting attestation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_spki_sha256: Option<[u8; 32]>,
     /// Optional pinned minimum SEV-SNP platform TCB. `None` (the default, and the only value for a
     /// TDX endpoint) enforces no floor; a `Some` is checked offline during appraisal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_tcb_sevsnp: Option<SevSnpTcbFloor>,
+    /// Exact workload/configuration identity required for Intel TDX. Production TDX endpoints
+    /// always carry `Some`; SEV-SNP endpoints must carry `None`. The independently pinned
+    /// `measurement` is a digest over these values and MRTD, so a Coordinator cannot broaden this
+    /// policy while retaining the same client-trusted identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tdx_policy: Option<TdxPolicy>,
     /// Optional pinned transparency-log Ed25519 public key (32 bytes). When set, the client requires
     /// the node's measurement to be proven present in that log via a stapled RFC 6962 inclusion
     /// proof before any packet flows; `None` (the default) gates on the measurement pin alone.
@@ -158,13 +251,21 @@ impl NodeEndpoint {
 /// A short-lived, identity-free credential issued by the Coordinator against a redeemed Privacy
 /// Pass token. `token` is intentionally opaque to clients/transports; the Coordinator mints it
 /// and the node verifies it via [`grant`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Grant {
     pub token: Vec<u8>,
-    /// Fresh per-connection nonce. The client generates it, sends it to the node in the
-    /// RA-TLS challenge, and `nil-attest` requires it to be bound into the report's
+    /// Fresh per-connection nonce created alongside the grant by the Coordinator. The client sends it
+    /// to the node in the RA-TLS challenge, and `nil-attest` requires it to be bound into the report's
     /// `report_data` — proving the report was minted for *this* connection (freshness).
     pub nonce: [u8; 32],
+}
+
+// A grant is a live bearer credential. Its ordinary debug representation must remain safe even if
+// a future caller uses `tracing!(?grant)` or includes it in an error context.
+impl std::fmt::Debug for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Grant([REDACTED])")
+    }
 }
 
 impl Grant {
@@ -175,6 +276,20 @@ impl Grant {
             token: Vec::new(),
             nonce: [0u8; 32],
         }
+    }
+}
+
+#[cfg(test)]
+mod grant_debug_tests {
+    use super::Grant;
+
+    #[test]
+    fn grant_debug_never_exposes_bearer_bytes() {
+        let grant = Grant {
+            token: vec![0xde, 0xad, 0xbe, 0xef],
+            nonce: [0x11; 32],
+        };
+        assert_eq!(format!("{grant:?}"), "Grant([REDACTED])");
     }
 }
 

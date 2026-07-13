@@ -7,8 +7,8 @@
 //! 2. `POST /v1/billing/activate` — once the payment confirms, the client authenticates again and
 //!    presents the reference; the Portal verifies the binding (only the account that subscribed for
 //!    a reference can activate with it), checks the payment is confirmed, and sets the entitlement
-//!    to `Active { until = max(now, current_until) + 30d }` (extend/stack). One activation per
-//!    reference (a durable guard, like one-token-per-payment).
+//!    to `Active { until = max(now, current_until) + 30d }` (extend/stack). Claim and extension are
+//!    one durable Store commit; a retry returns the first expiry without extending again.
 //!
 //! ## Privacy (PD-4)
 //! The binding is stored as a **hash** `H("nil.subscription.v1.binding" ‖ reference ‖ account)`,
@@ -17,11 +17,10 @@
 //! (business plane) is *allowed* to know "this anonymous account is a subscriber"; the control/data
 //! plane never sees any of this, and connections still ride anonymous blind tokens.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use sha2::{Digest, Sha256};
@@ -36,6 +35,7 @@ use crate::account::error::ApiError;
 use crate::account::handlers::map_auth_err;
 use crate::account::model::Entitlement;
 use crate::billing::mint_reference;
+use crate::client_ip::ClientIp;
 use crate::monero::PaymentWatcher;
 use crate::ratelimit::RateLimiter;
 use crate::state::AppState;
@@ -55,7 +55,8 @@ const SUB_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Subscription-plane state. Embeds the account [`AppState`] (so it shares the SAME account store
 /// and challenge set used by `/v1/account/challenge` — auth must be cross-endpoint), plus the
-/// payment watcher and the two durable sets that make activation safe.
+/// payment watcher and the pending-binding set. The account Store is the authority for atomic,
+/// idempotent activation results.
 #[derive(Clone)]
 pub struct SubscriptionState {
     pub app: AppState,
@@ -64,8 +65,10 @@ pub struct SubscriptionState {
     /// abandoned subscriptions age out; durable so a confirmed payment can be activated after a
     /// restart. Enforces "only the account that subscribed for a reference can activate it".
     pub bindings: Arc<TimedDurableSet>,
-    /// `H(ref‖account)` for references already activated — one extension per payment, durable and
-    /// never pruned (mirrors the one-token-per-payment `issued` set). Blocks double-extend.
+    /// Read-only upgrade fence for activations written by versions that used
+    /// `NW_SUB_ACTIVATED_PATH`. New activations are never inserted here: the account Store commits
+    /// the claim and entitlement together. Retaining this lookup prevents a recently activated
+    /// pre-upgrade binding from being extended again during migration.
     pub activated: Arc<DurableSet>,
     pub limiter: Arc<RateLimiter>,
 }
@@ -89,12 +92,14 @@ impl SubscriptionState {
 
 /// The durable-set key binding a payment reference to an account: a domain-separated hash, so the
 /// stored value reveals neither the reference nor the account to a database reader.
-fn binding_key(reference: &str, account_number: &[u8; 32]) -> String {
+fn binding_key(reference: &str, account_number: &[u8; 32]) -> ([u8; 32], String) {
     let mut h = Sha256::new();
     h.update(b"nil.subscription.v1.binding");
     h.update(reference.as_bytes());
     h.update(account_number);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    let digest: [u8; 32] = h.finalize().into();
+    let encoded = digest.iter().map(|b| format!("{b:02x}")).collect();
+    (digest, encoded)
 }
 
 pub fn subscription_router(state: SubscriptionState) -> Router {
@@ -107,11 +112,11 @@ pub fn subscription_router(state: SubscriptionState) -> Router {
 
 /// `POST /v1/billing/subscribe` — authenticate, mint a payment reference, bind it to the account.
 async fn subscribe(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     State(state): State<SubscriptionState>,
     Json(auth): Json<AccountAuth>,
 ) -> Result<Json<CheckoutResponse>, ApiError> {
-    if !state.limiter.check(&peer.ip().to_string()) {
+    if !state.limiter.check(&client_ip.to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     // The challenge is a gate ("is this a live, owned account?") → fail-closed clock.
@@ -124,11 +129,13 @@ async fn subscribe(
         tracing::error!("subscribe reference CSPRNG failed: {e}"); // never log the reference
         ApiError::Internal
     })?;
-    let key = binding_key(&reference, &account);
+    let (_, key) = binding_key(&reference, &account);
     // Record the binding durably BEFORE returning the reference, so a payment that confirms (even
     // after a restart) can still be activated. The TTL stamp uses the issuance clock.
     match state.bindings.insert(&key, now_unix_secs()) {
-        Ok(true) => Ok(Json(CheckoutResponse { payment_reference: reference })),
+        Ok(true) => Ok(Json(CheckoutResponse {
+            payment_reference: reference,
+        })),
         // A 256-bit reference collision is impossible; refuse rather than hand back a bound one.
         Ok(false) => {
             tracing::error!("subscribe binding collision (impossible) — refusing");
@@ -143,22 +150,22 @@ async fn subscribe(
 
 /// `POST /v1/billing/activate` — claim a confirmed payment to activate/extend the subscription.
 async fn activate(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     State(state): State<SubscriptionState>,
     Json(req): Json<ActivateRequest>,
 ) -> Result<Json<AccountStatusResponse>, ApiError> {
-    if !state.limiter.check(&peer.ip().to_string()) {
+    if !state.limiter.check(&client_ip.to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     let record = authenticate(&state.app, &req.auth, now_unix_secs_for_expiry())
         .await
         .map_err(map_auth_err)?;
     let account = record.account_number;
-    let key = binding_key(&req.payment_reference, &account);
+    let (activation_key, encoded_key) = binding_key(&req.payment_reference, &account);
 
     // Front-running / theft guard: the reference must be one THIS account subscribed for. An
     // unknown/expired binding is the same Unauthorized as a bad auth — no oracle.
-    if !state.bindings.contains(&key) {
+    if !state.bindings.contains(&encoded_key) {
         return Err(ApiError::Unauthorized);
     }
     // The payment must be confirmed on-chain. Not yet ⇒ 402, the client retries later.
@@ -170,47 +177,56 @@ async fn activate(
     // consuming the activation guard so the client can retry once the clock is sane (fail closed).
     let mint_now = now_unix_secs();
     if mint_now == 0 {
-        tracing::error!("activate: system clock before the Unix epoch — refusing to mint a subscription");
+        tracing::error!(
+            "activate: system clock before the Unix epoch — refusing to mint a subscription"
+        );
         return Err(ApiError::Internal);
     }
 
-    // One activation per (reference, account): record the guard BEFORE extending, durably. Fail
-    // closed — like the one-token-per-payment `issued` set, a persist failure refuses rather than
-    // risk a double-extend on the next restart. A replay after success finds it already present.
-    match state.activated.insert(&key) {
-        Ok(true) => {}
-        Ok(false) => return Err(ApiError::Conflict),
-        Err(e) => {
-            tracing::error!("activated-set persist failed: {e}");
-            return Err(ApiError::Internal);
-        }
+    // Upgrade safety: older versions committed this guard before extending. Treat such an entry as
+    // an idempotent replay and never feed it into the new Store as a fresh activation. The old set
+    // is read-only from this version onward and can be retired after its binding TTL has elapsed.
+    if state.activated.contains(&encoded_key) {
+        let resolved = record.entitlement.resolved(mint_now);
+        return Ok(Json(AccountStatusResponse {
+            entitlement: resolved.into(),
+            until: resolved.active_until(mint_now),
+        }));
     }
 
-    // Atomically extend by 30d, stacking on the account's PERSISTED expiry (read under the store
-    // lock/row, not the pre-guard snapshot in `record`) so two concurrent activations of distinct
-    // confirmed payments each add their period instead of one overwriting the other.
-    let until = match state.app.store.extend_subscription(&account, mint_now, THIRTY_DAYS_SECS).await {
-        Ok(Some(u)) => u,
+    // Claim + extension is ONE Store operation. FileStore persists both maps in one atomic
+    // snapshot; Postgres uses one transaction; InMemoryStore uses one write lock. An ambiguous
+    // response is safe to retry: Replay returns the expiry cached by the original commit.
+    let activation = match state
+        .app
+        .store
+        .activate_subscription(&account, &activation_key, mint_now, THIRTY_DAYS_SECS)
+        .await
+    {
+        Ok(Some(result)) => result,
         Ok(None) => {
             // The account vanished between auth and update (a delete race) — treat as internal.
             tracing::error!("activate: account not found during entitlement extend");
             return Err(ApiError::Internal);
         }
         Err(e) => {
-            tracing::error!("activate: extend_subscription failed: {e}");
+            tracing::error!("activate: atomic subscription activation failed: {e}");
             return Err(ApiError::Internal);
         }
     };
+    let until = activation.until();
 
     let resolved = Entitlement::Active { until }.resolved(mint_now);
-    Ok(Json(AccountStatusResponse { entitlement: resolved.into(), until: resolved.active_until(mint_now) }))
+    Ok(Json(AccountStatusResponse {
+        entitlement: resolved.into(),
+        until: resolved.active_until(mint_now),
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use axum::extract::connect_info::ConnectInfo;
     use nil_crypto::account::{create_account_os, AuthKeypair, DerivedAccount};
 
     use crate::account::model::AccountRecord;
@@ -218,8 +234,8 @@ mod tests {
     use crate::store::memory::InMemoryStore;
     use crate::store::Store;
 
-    fn peer() -> ConnectInfo<SocketAddr> {
-        ConnectInfo("1.2.3.4:9999".parse().unwrap())
+    fn peer() -> ClientIp {
+        ClientIp("1.2.3.4".parse().unwrap())
     }
 
     fn hex(b: &[u8]) -> String {
@@ -247,7 +263,6 @@ mod tests {
             .store
             .insert(AccountRecord {
                 account_number: *d.account_number.as_bytes(),
-                recovery_code_hash: d.recovery_code_hash,
                 entitlement: Entitlement::None,
                 auth_pubkey: d.auth_public_key,
             })
@@ -270,7 +285,9 @@ mod tests {
 
     async fn do_subscribe(state: &SubscriptionState, acct_hex: &str, kp: &AuthKeypair) -> String {
         let auth = proof(state, acct_hex, kp);
-        let resp = subscribe(peer(), State(state.clone()), Json(auth)).await.expect("subscribe ok");
+        let resp = subscribe(peer(), State(state.clone()), Json(auth))
+            .await
+            .expect("subscribe ok");
         resp.0.payment_reference
     }
 
@@ -280,8 +297,13 @@ mod tests {
         kp: &AuthKeypair,
         reference: &str,
     ) -> Result<AccountStatusResponse, ApiError> {
-        let req = ActivateRequest { auth: proof(state, acct_hex, kp), payment_reference: reference.to_string() };
-        activate(peer(), State(state.clone()), Json(req)).await.map(|j| j.0)
+        let req = ActivateRequest {
+            auth: proof(state, acct_hex, kp),
+            payment_reference: reference.to_string(),
+        };
+        activate(peer(), State(state.clone()), Json(req))
+            .await
+            .map(|j| j.0)
     }
 
     #[tokio::test]
@@ -292,14 +314,28 @@ mod tests {
 
         let reference = do_subscribe(&state, &acct, &kp).await;
         let now = now_unix_secs();
-        let status = do_activate(&state, &acct, &kp, &reference).await.expect("activate ok");
+        let status = do_activate(&state, &acct, &kp, &reference)
+            .await
+            .expect("activate ok");
 
-        assert_eq!(status.entitlement, nil_proto::account::EntitlementDto::Active);
+        assert_eq!(
+            status.entitlement,
+            nil_proto::account::EntitlementDto::Active
+        );
         let until = status.until.expect("active has an expiry");
-        assert!(until >= now + THIRTY_DAYS_SECS - 5 && until <= now + THIRTY_DAYS_SECS + 5, "≈ now + 30d");
+        assert!(
+            until >= now + THIRTY_DAYS_SECS - 5 && until <= now + THIRTY_DAYS_SECS + 5,
+            "≈ now + 30d"
+        );
 
         // And the store actually reflects the new entitlement.
-        let rec = state.app.store.get(d.account_number.as_bytes()).await.unwrap().unwrap();
+        let rec = state
+            .app
+            .store
+            .get(d.account_number.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(rec.entitlement, Entitlement::Active { .. }));
     }
 
@@ -309,37 +345,107 @@ mod tests {
         let state = state_with(watcher);
         let (d, kp, acct) = add_account(&state).await;
 
-        // Pre-set an active subscription 10 days out (10d from now via the atomic extend).
+        // Pre-set an active subscription 10 days out with a distinct atomic activation.
         let now = now_unix_secs();
         let existing_until = state
             .app
             .store
-            .extend_subscription(d.account_number.as_bytes(), now, 10 * 24 * 60 * 60)
+            .activate_subscription(
+                d.account_number.as_bytes(),
+                &[0x01; 32],
+                now,
+                10 * 24 * 60 * 60,
+            )
             .await
             .unwrap()
-            .unwrap();
+            .unwrap()
+            .until();
         assert!(existing_until >= now + 10 * 24 * 60 * 60 - 5);
 
         let reference = do_subscribe(&state, &acct, &kp).await;
-        let status = do_activate(&state, &acct, &kp, &reference).await.expect("activate ok");
+        let status = do_activate(&state, &acct, &kp, &reference)
+            .await
+            .expect("activate ok");
         let until = status.until.expect("active");
         // Stacks ON TOP of the existing expiry, not from now.
-        assert!(until >= existing_until + THIRTY_DAYS_SECS - 5 && until <= existing_until + THIRTY_DAYS_SECS + 5);
+        assert!(
+            until >= existing_until + THIRTY_DAYS_SECS - 5
+                && until <= existing_until + THIRTY_DAYS_SECS + 5
+        );
     }
 
     #[tokio::test]
-    async fn the_same_payment_cannot_activate_twice() {
+    async fn the_same_payment_replays_success_without_extending_twice() {
         let watcher = Arc::new(MockWatcher::confirm_everything());
         let state = state_with(watcher);
-        let (_d, kp, acct) = add_account(&state).await;
+        let (d, kp, acct) = add_account(&state).await;
 
         let reference = do_subscribe(&state, &acct, &kp).await;
-        assert!(do_activate(&state, &acct, &kp, &reference).await.is_ok());
-        // A second activation of the same reference is a conflict (no double-extend).
-        match do_activate(&state, &acct, &kp, &reference).await {
-            Err(ApiError::Conflict) => {}
-            other => panic!("expected Conflict, got {other:?}"),
-        }
+        let first = do_activate(&state, &acct, &kp, &reference)
+            .await
+            .expect("first activation");
+        let replay = do_activate(&state, &acct, &kp, &reference)
+            .await
+            .expect("idempotent replay");
+        assert_eq!(
+            replay.until, first.until,
+            "replay returns the cached expiry"
+        );
+
+        let stored = state
+            .app
+            .store
+            .get(d.account_number.as_bytes())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.entitlement.active_until(now_unix_secs()),
+            first.until
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_activation_guard_is_a_read_only_upgrade_fence() {
+        let watcher = Arc::new(MockWatcher::confirm_everything());
+        let state = state_with(watcher);
+        let (d, kp, acct) = add_account(&state).await;
+        let now = now_unix_secs();
+        let existing_until = state
+            .app
+            .store
+            .activate_subscription(
+                d.account_number.as_bytes(),
+                &[0x02; 32],
+                now,
+                THIRTY_DAYS_SECS,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .until();
+        let reference = do_subscribe(&state, &acct, &kp).await;
+        let (_, legacy_key) = binding_key(&reference, d.account_number.as_bytes());
+        assert!(state.activated.insert(&legacy_key).unwrap());
+
+        let replay = do_activate(&state, &acct, &kp, &reference)
+            .await
+            .expect("legacy replay is successful");
+        assert_eq!(replay.until, Some(existing_until));
+        assert_eq!(
+            state
+                .app
+                .store
+                .get(d.account_number.as_bytes())
+                .await
+                .unwrap()
+                .unwrap()
+                .entitlement,
+            Entitlement::Active {
+                until: existing_until
+            },
+            "the pre-upgrade guard must not trigger another extension"
+        );
     }
 
     #[tokio::test]
@@ -377,19 +483,30 @@ mod tests {
     #[tokio::test]
     async fn two_confirmed_payments_stack_cumulatively() {
         // Two DISTINCT confirmed payments on the same account must each add a full period — the
-        // second stacks on the first's expiry, never overwrites it (the atomic `extend_subscription`
-        // reads the persisted expiry under the store lock, not a pre-guard snapshot).
+        // second stacks on the first's expiry, never overwrites it (atomic activation reads the
+        // persisted expiry under the store lock, not a pre-guard snapshot).
         let watcher = Arc::new(MockWatcher::confirm_everything());
         let state = state_with(watcher);
         let (_d, kp, acct) = add_account(&state).await;
         let now = now_unix_secs();
 
         let r1 = do_subscribe(&state, &acct, &kp).await;
-        let after1 = do_activate(&state, &acct, &kp, &r1).await.expect("activate 1").until.expect("active");
-        assert!(after1 >= now + THIRTY_DAYS_SECS - 5, "first payment grants ~30d");
+        let after1 = do_activate(&state, &acct, &kp, &r1)
+            .await
+            .expect("activate 1")
+            .until
+            .expect("active");
+        assert!(
+            after1 >= now + THIRTY_DAYS_SECS - 5,
+            "first payment grants ~30d"
+        );
 
         let r2 = do_subscribe(&state, &acct, &kp).await;
-        let after2 = do_activate(&state, &acct, &kp, &r2).await.expect("activate 2").until.expect("active");
+        let after2 = do_activate(&state, &acct, &kp, &r2)
+            .await
+            .expect("activate 2")
+            .until
+            .expect("active");
         assert!(
             after2 >= after1 + THIRTY_DAYS_SECS - 5 && after2 <= after1 + THIRTY_DAYS_SECS + 5,
             "the second distinct payment stacks ANOTHER ~30d (≈60d total), it does not overwrite"
@@ -407,7 +524,10 @@ mod tests {
 
         let reference = do_subscribe(&state, &acct, &kp).await;
         // Prune with a cutoff far past the insertion time → drops the single pending binding.
-        let pruned = state.bindings.prune_older_than(now_unix_secs() + 100_000).expect("prune");
+        let pruned = state
+            .bindings
+            .prune_older_than(now_unix_secs() + 100_000)
+            .expect("prune");
         assert_eq!(pruned, 1, "the one pending binding is pruned");
         match do_activate(&state, &acct, &kp, &reference).await {
             Err(ApiError::Unauthorized) => {}

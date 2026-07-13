@@ -40,23 +40,41 @@ pub struct NodeAttest {
 }
 
 impl NodeAttest {
-    /// Read `NW_NODE_MEASUREMENT` (48-byte hex) + `NW_NODE_TEE` (`sev-snp`|`tdx`). `None` when
-    /// unset → the node serves unattested (dev), and a pinning client will refuse it.
-    pub fn from_env() -> Option<Self> {
-        let raw = std::env::var("NW_NODE_MEASUREMENT").ok()?;
-        let bytes = nil_transport::connectip::from_hex(raw.trim().as_bytes())?;
-        if bytes.len() != 48 {
-            tracing::warn!("NW_NODE_MEASUREMENT must be 48 bytes of hex; ignoring");
-            return None;
+    /// Read `NW_NODE_MEASUREMENT` (48-byte hex) + explicit `NW_NODE_TEE`
+    /// (`sev-snp`|`tdx`). Both absent means an unattested development node; a partial, malformed,
+    /// or unknown identity is an error rather than a silent downgrade/default.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let measurement = std::env::var("NW_NODE_MEASUREMENT");
+        let tee = std::env::var("NW_NODE_TEE");
+        match (measurement, tee) {
+            (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
+            (Ok(raw), Ok(tee)) => parse_attestation(&raw, &tee).map(Some),
+            (Err(std::env::VarError::NotPresent), Ok(_)) => {
+                anyhow::bail!("NW_NODE_TEE requires NW_NODE_MEASUREMENT")
+            }
+            (Ok(_), Err(std::env::VarError::NotPresent)) => {
+                anyhow::bail!("NW_NODE_MEASUREMENT requires explicit NW_NODE_TEE")
+            }
+            (Err(e), _) => Err(anyhow::anyhow!("NW_NODE_MEASUREMENT: {e}")),
+            (_, Err(e)) => Err(anyhow::anyhow!("NW_NODE_TEE: {e}")),
         }
-        let mut measurement = [0u8; 48];
-        measurement.copy_from_slice(&bytes);
-        let tee = match std::env::var("NW_NODE_TEE").unwrap_or_else(|_| "sev-snp".into()).as_str() {
-            "tdx" => Tee::Tdx,
-            _ => Tee::SevSnp,
-        };
-        Some(Self { tee, measurement })
     }
+}
+
+fn parse_attestation(raw: &str, tee: &str) -> anyhow::Result<NodeAttest> {
+    let bytes = nil_transport::connectip::from_hex(raw.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_NODE_MEASUREMENT must be hex"))?;
+    if bytes.len() != 48 {
+        anyhow::bail!("NW_NODE_MEASUREMENT must be exactly 48 bytes of hex");
+    }
+    let mut measurement = [0u8; 48];
+    measurement.copy_from_slice(&bytes);
+    let tee = match tee {
+        "sev-snp" => Tee::SevSnp,
+        "tdx" => Tee::Tdx,
+        _ => anyhow::bail!("NW_NODE_TEE must be one of: sev-snp, tdx"),
+    };
+    Ok(NodeAttest { tee, measurement })
 }
 
 /// The hex `nil-attest-report` header value for this connection's `nonce`, or `None` if no
@@ -91,5 +109,25 @@ pub fn report_hex(spki: &[u8], attest: Option<&NodeAttest>, nonce: &[u8; 32]) ->
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attestation_parser_requires_exact_measurement_and_known_tee() {
+        let measurement = "ab".repeat(48);
+        let sev = parse_attestation(&measurement, "sev-snp").unwrap();
+        assert_eq!(sev.tee, Tee::SevSnp);
+        assert_eq!(sev.measurement, [0xab; 48]);
+        let tdx = parse_attestation(&measurement, "tdx").unwrap();
+        assert_eq!(tdx.tee, Tee::Tdx);
+
+        assert!(parse_attestation(&"ab".repeat(47), "sev-snp").is_err());
+        assert!(parse_attestation("not-hex", "sev-snp").is_err());
+        assert!(parse_attestation(&measurement, "sev").is_err());
+        assert!(parse_attestation(&measurement, "").is_err());
     }
 }

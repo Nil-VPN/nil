@@ -61,7 +61,10 @@ mod tests {
         assert!(rl.check("1.2.3.4"));
         assert!(rl.check("1.2.3.4"));
         assert!(rl.check("1.2.3.4"));
-        assert!(!rl.check("1.2.3.4"), "4th hit in the window is over the cap");
+        assert!(
+            !rl.check("1.2.3.4"),
+            "4th hit in the window is over the cap"
+        );
         // A different key has its own budget.
         assert!(rl.check("5.6.7.8"));
     }

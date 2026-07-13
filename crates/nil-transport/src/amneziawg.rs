@@ -144,7 +144,7 @@ impl ObfsParams {
         let mut out = Vec::with_capacity(wg.len() + self.tail_max);
         out.extend_from_slice(&self.headers[idx]); // magic header replaces the type word
         out.extend_from_slice(&wg[4..]); // the rest of the WG packet
-        // Append a junk tail to the fixed-size handshake/cookie packets to erase their size tell.
+                                         // Append a junk tail to the fixed-size handshake/cookie packets to erase their size tell.
         if WG_LEN[idx] != 0 {
             out.extend_from_slice(&rand_bytes(rand_len(self.tail_min, self.tail_max)));
         }
@@ -179,7 +179,9 @@ impl ObfsParams {
     /// Pre-handshake junk datagrams to send before the real WireGuard initiation. They match no
     /// magic header, so the peer's `deobfuscate` drops them.
     pub fn junk_packets(&self) -> Vec<Vec<u8>> {
-        (0..self.junk_count).map(|_| rand_bytes(rand_len(self.junk_min, self.junk_max))).collect()
+        (0..self.junk_count)
+            .map(|_| rand_bytes(rand_len(self.junk_min, self.junk_max)))
+            .collect()
     }
 
     /// Obfuscate the preface (the client's 32-byte WG static pubkey) the responder needs before
@@ -213,7 +215,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boringtun::x25519::PublicKey;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
@@ -258,11 +262,20 @@ impl AmneziaWgTransport {
         // Derive the obfuscation magics from the node's WG key so each deployment differs on the
         // wire (no fleet-wide static DPI signature). The node responder derives identically.
         let obfs = ObfsParams::derive(&node_wg_pub);
-        Self::with_config(AmneziaWgConfig { node_wg_pub, host, port, obfs })
+        Self::with_config(AmneziaWgConfig {
+            node_wg_pub,
+            host,
+            port,
+            obfs,
+        })
     }
 
     pub fn with_config(cfg: AmneziaWgConfig) -> Self {
-        Self { cfg: Arc::new(cfg), sessions: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            cfg: Arc::new(cfg),
+            sessions: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn state(&self, session: &Session) -> Result<Arc<AwgSession>> {
@@ -281,7 +294,9 @@ async fn resolve(host: &str, port: u16) -> Result<SocketAddr> {
     let mut addrs = tokio::net::lookup_host((host, port))
         .await
         .map_err(|e| Error::Transport(format!("amneziawg node resolve failed: {e}")))?;
-    addrs.next().ok_or_else(|| Error::Transport("amneziawg node did not resolve".into()))
+    addrs
+        .next()
+        .ok_or_else(|| Error::Transport("amneziawg node did not resolve".into()))
 }
 
 #[async_trait]
@@ -290,21 +305,32 @@ impl Transport for AmneziaWgTransport {
         let host = self.cfg.host.as_deref().unwrap_or(&target.host);
         let port = self.cfg.port.unwrap_or(target.port);
         let peer = resolve(host, port).await?;
-        let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let bind = if peer.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
         let socket = UdpSocket::bind(bind)
             .await
             .map_err(|e| Error::Transport(format!("udp bind: {e}")))?;
-        socket.connect(peer).await.map_err(|e| Error::Transport(format!("udp connect: {e}")))?;
+        socket
+            .connect(peer)
+            .await
+            .map_err(|e| Error::Transport(format!("udp connect: {e}")))?;
         let obfs = self.cfg.obfs.clone();
 
         // Pre-handshake junk (the peer ignores it), then the obfuscated WireGuard handshake.
         for junk in obfs.junk_packets() {
             let _ = socket.send(&junk).await;
         }
-        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let client_kp =
+            WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
         let client_pub = *client_kp.public.as_bytes();
-        let mut core = PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
-        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        let mut core =
+            PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
+        let init = core
+            .handshake_init()
+            .map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         // Preface (our WG pubkey, so the responder can build its Tunn) then the handshake init.
         socket
             .send(&obfs.obfuscate_preface(&client_pub))
@@ -339,14 +365,25 @@ impl Transport for AmneziaWgTransport {
                     .await
                     .map_err(|e| Error::Transport(format!("send keepalive: {e}")))?;
             }
-            other => return Err(Error::Transport(format!("amneziawg handshake failed: {other:?}"))),
+            other => {
+                return Err(Error::Transport(format!(
+                    "amneziawg handshake failed: {other:?}"
+                )))
+            }
         }
         tracing::info!("AmneziaWG tunnel established (obfuscated WireGuard over UDP)");
 
         let (to_tx, to_rx) = mpsc::channel(AWG_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(AWG_QUEUE);
         let shutdown = CancellationToken::new();
-        let driver = tokio::spawn(awg_driver(socket, core, obfs, to_rx, from_tx, shutdown.clone()));
+        let driver = tokio::spawn(awg_driver(
+            socket,
+            core,
+            obfs,
+            to_rx,
+            from_tx,
+            shutdown.clone(),
+        ));
 
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let sess = Arc::new(AwgSession {
@@ -359,7 +396,10 @@ impl Transport for AmneziaWgTransport {
             .lock()
             .map_err(|_| Error::Transport("amneziawg session map poisoned".into()))?
             .insert(id, sess);
-        Ok(Session { id, kind: TransportKind::AmneziaWg })
+        Ok(Session {
+            id,
+            kind: TransportKind::AmneziaWg,
+        })
     }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
@@ -461,14 +501,24 @@ mod tests {
             let wg = wg_packet(t, len - 4);
             let wire = p.obfuscate(&wg);
             // The WG type word (1/2/3/4 at byte 0) must NOT appear at the wire's start.
-            assert_ne!(wire[0], t, "type-{t} word must be replaced by a magic header");
-            assert_eq!(&wire[0..4], &p.headers[(t - 1) as usize], "magic header present");
+            assert_ne!(
+                wire[0], t,
+                "type-{t} word must be replaced by a magic header"
+            );
+            assert_eq!(
+                &wire[0..4],
+                &p.headers[(t - 1) as usize],
+                "magic header present"
+            );
             // Fixed-size handshakes must not be their tell-tale length on the wire.
             if len != 80 {
                 assert!(wire.len() > len, "handshake packet padded past its WG size");
             }
             let back = p.deobfuscate(&wire).expect("our packet deobfuscates");
-            assert_eq!(back, wg, "type-{t} WG packet survives the round-trip exactly");
+            assert_eq!(
+                back, wg,
+                "type-{t} WG packet survives the round-trip exactly"
+            );
         }
     }
 
@@ -517,7 +567,10 @@ mod tests {
         assert_eq!(junk.len(), p.junk_count);
         for j in junk {
             // Astronomically unlikely to match a 4-byte magic; treat any match as a test miss.
-            assert!(p.deobfuscate(&j).is_none(), "junk must not look like a real packet");
+            assert!(
+                p.deobfuscate(&j).is_none(),
+                "junk must not look like a real packet"
+            );
         }
     }
 

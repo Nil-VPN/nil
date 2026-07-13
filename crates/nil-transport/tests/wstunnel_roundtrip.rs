@@ -74,9 +74,12 @@ where
         mceliece_pk: parts[1].clone(),
     };
     let (cts, psk) = responder_encapsulate(&offer).expect("node encapsulates");
-    ws.send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
-        .await
-        .expect("send PQ ciphertexts");
+    ws.send(Message::Binary(encode_parts(&[
+        &cts.mlkem_ct,
+        &cts.mceliece_ct,
+    ])))
+    .await
+    .expect("send PQ ciphertexts");
 
     let mut core = PqWgCore::new(node_secret, PublicKey::from(client_pub), &psk, 2);
     let (mut sink, mut stream) = ws.split();
@@ -132,7 +135,9 @@ async fn wstunnel_packet_round_trips_through_ws_tls_wireguard() {
                     .unwrap())
             }
         };
-        let ws = tokio_tungstenite::accept_hdr_async(tls, gate).await.unwrap();
+        let ws = tokio_tungstenite::accept_hdr_async(tls, gate)
+            .await
+            .unwrap();
         serve(ws, node_secret).await;
     });
 
@@ -193,7 +198,11 @@ fn request_path_is_deterministic_and_key_bound() {
     let b = [9u8; 32];
     let pa = derive_request_path(&a);
     let pb = derive_request_path(&b);
-    assert_eq!(pa, derive_request_path(&a), "same key derives the same path");
+    assert_eq!(
+        pa,
+        derive_request_path(&a),
+        "same key derives the same path"
+    );
     assert_ne!(pa, pb, "different node keys derive different paths");
     assert!(pa.starts_with('/'), "path is rooted");
     assert_eq!(pa.len(), 1 + 64, "/ + 32 bytes of lowercase hex");
@@ -298,7 +307,9 @@ async fn mismatched_pq_psk_fails_the_wstunnel_handshake() {
                     .unwrap())
             }
         };
-        let mut ws = tokio_tungstenite::accept_hdr_async(tls, gate).await.unwrap();
+        let mut ws = tokio_tungstenite::accept_hdr_async(tls, gate)
+            .await
+            .unwrap();
 
         // Frame 1: client WG pubkey.
         let preface = loop {
@@ -326,9 +337,12 @@ async fn mismatched_pq_psk_fails_the_wstunnel_handshake() {
             mceliece_pk: parts[1].clone(),
         };
         let (cts, _psk_a) = responder_encapsulate(&offer).unwrap();
-        ws.send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
-            .await
-            .unwrap();
+        ws.send(Message::Binary(encode_parts(&[
+            &cts.mlkem_ct,
+            &cts.mceliece_ct,
+        ])))
+        .await
+        .unwrap();
 
         // ... but key the responder Tunn with a FRESH, unrelated PSK_B. The IKpsk2 handshake must
         // fail because the preshared keys differ.

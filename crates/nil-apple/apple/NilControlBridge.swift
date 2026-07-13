@@ -46,7 +46,10 @@ private struct NilProviderConfig: Decodable {
     var nodePort: Int
     var serverName: String?
     var measurementHex: String
+    var tlsSpkiSha256Hex: String
+    var transparencyLogKeyHex: String
     var teeName: String?
+    var minTcbSevsnp: NilProviderTcbFloor?
     var allowUnattested: Bool?
     var grantHex: String?
     var grantNonceHex: String?
@@ -64,13 +67,33 @@ private struct NilProviderConfig: Decodable {
             "nodePort": nodePort,
             "serverName": serverName ?? nodeHost,
             "measurementHex": measurementHex,
+            "tlsSpkiSha256Hex": tlsSpkiSha256Hex,
+            "transparencyLogKeyHex": transparencyLogKeyHex,
             "teeName": teeName ?? "sev-snp",
             "allowUnattested": allowUnattested ?? false,
         ]
         if let g = grantHex, !g.isEmpty { dict["grantHex"] = g }
         if let n = grantNonceHex, !n.isEmpty { dict["grantNonceHex"] = n }
+        if let floor = minTcbSevsnp {
+            var encoded: [String: Any] = [
+                "bootloader": Int(floor.bootloader),
+                "tee": Int(floor.tee),
+                "snp": Int(floor.snp),
+                "microcode": Int(floor.microcode),
+            ]
+            if let fmc = floor.fmc { encoded["fmc"] = Int(fmc) }
+            dict["minTcbSevsnp"] = encoded
+        }
         return dict
     }
+}
+
+private struct NilProviderTcbFloor: Decodable {
+    var fmc: UInt8?
+    var bootloader: UInt8
+    var tee: UInt8
+    var snp: UInt8
+    var microcode: UInt8
 }
 
 // MARK: - Tunnel status (mirrors the C ABI return of nil_macos_tunnel_status)
@@ -320,7 +343,11 @@ extension NilControlBridge: OSSystemExtensionRequestDelegate {
 //
 //   // Start the tunnel. `config_json` is a NUL-terminated UTF-8 JSON object with the provider keys:
 //   //   { "nodeHost": str, "nodePort": int, "serverName": str?, "measurementHex": str,
-//   //     "teeName": str?, "allowUnattested": bool?, "grantHex": str?, "grantNonceHex": str?,
+//   //     "tlsSpkiSha256Hex": str,
+//   //     "transparencyLogKeyHex": str,
+//   //     "teeName": str?, "minTcbSevsnp": { "fmc": int?, "bootloader": int,
+//   //       "tee": int, "snp": int, "microcode": int }?,
+//   //     "allowUnattested": bool?, "grantHex": str?, "grantNonceHex": str?,
 //   //     "onDemand": bool?, "includeAllNetworks": bool? }
 //   // Returns 0 on accepted (config parsed + start issued asynchronously), -1 on a parse/encoding
 //   // error. The pointer is borrowed for the duration of the call only; Rust still owns/frees it.

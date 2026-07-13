@@ -8,15 +8,23 @@ const REPORT_HEX: &str = include_str!("data/report_milan.hex");
 const VCEK_DER: &[u8] = include_bytes!("data/vcek_milan.der");
 
 fn report_bytes() -> Vec<u8> {
-    let cleaned: String = REPORT_HEX.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let cleaned: String = REPORT_HEX
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect();
     hex::decode(cleaned).expect("valid hex report vector")
 }
 
 #[test]
 fn genuine_milan_report_verifies_to_amd_root() {
     let report = report_bytes();
-    let ev = sevsnp::verify(&report, VCEK_DER, None).expect("real Milan report verifies to the AMD root");
-    assert_eq!(ev.measurement.len(), 48, "SEV-SNP launch measurement is 48 bytes");
+    let ev = sevsnp::verify(&report, VCEK_DER, None)
+        .expect("real Milan report verifies to the AMD root");
+    assert_eq!(
+        ev.measurement.len(),
+        48,
+        "SEV-SNP launch measurement is 48 bytes"
+    );
     assert_eq!(ev.report_data.len(), 64);
 }
 
@@ -37,7 +45,10 @@ fn wrong_vcek_is_rejected() {
     let report = report_bytes();
     // A VCEK that didn't sign this report (truncated/garbage) must not verify.
     let bogus = vec![0x30u8; VCEK_DER.len()];
-    assert!(sevsnp::verify(&report, &bogus, None).is_err(), "a non-matching VCEK must be rejected");
+    assert!(
+        sevsnp::verify(&report, &bogus, None).is_err(),
+        "a non-matching VCEK must be rejected"
+    );
 }
 
 #[test]

@@ -36,7 +36,9 @@ fn tee_from_byte(b: u8) -> Result<Tee, AttestError> {
     match b {
         0 => Ok(Tee::SevSnp),
         1 => Ok(Tee::Tdx),
-        other => Err(AttestError::Malformed(format!("synthetic tee byte {other}"))),
+        other => Err(AttestError::Malformed(format!(
+            "synthetic tee byte {other}"
+        ))),
     }
 }
 
@@ -69,13 +71,23 @@ pub fn verify(payload: &[u8]) -> Result<Evidence, AttestError> {
     let tee = tee_from_byte(signed[0])?;
     let mut report_data = [0u8; 64];
     report_data.copy_from_slice(&signed[49..113]);
-    Ok(Evidence { tee, measurement: signed[1..49].to_vec(), report_data, tcb_status: TcbStatus::UpToDate })
+    Ok(Evidence {
+        tee,
+        measurement: signed[1..49].to_vec(),
+        report_data,
+        tcb_status: TcbStatus::UpToDate,
+    })
 }
 
 /// Build a synthetic evidence blob (the `[tag][parts]` bytes the node returns over the
 /// channel) for `measurement`, bound to the node's TLS key (`spki`) and the client `nonce`.
 /// This is what a synthetic node computes after reading the client's nonce header.
-pub fn synthetic_evidence(tee: Tee, measurement: &[u8; 48], spki: &[u8], nonce: &[u8; 32]) -> Vec<u8> {
+pub fn synthetic_evidence(
+    tee: Tee,
+    measurement: &[u8; 48],
+    spki: &[u8],
+    nonce: &[u8; 32],
+) -> Vec<u8> {
     let report_data = ratls::bind_report_data(spki, nonce);
     let report = sign(tee, measurement, &report_data);
     ratls::encode(ratls::TAG_SYNTHETIC, &[&report])

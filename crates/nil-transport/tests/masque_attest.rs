@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
 use nil_transport::{connectip, MasqueTransport, Transport};
+use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 
 const MAX_UDP_PAYLOAD: usize = 1420;
@@ -51,7 +52,12 @@ impl TestCert {
         let key_path = dir.join("key.pem");
         std::fs::write(&cert_path, ck.cert.pem()).unwrap();
         std::fs::write(&key_path, ck.key_pair.serialize_pem()).unwrap();
-        TestCert { cert_path, key_path, spki, dir }
+        TestCert {
+            cert_path,
+            key_path,
+            spki,
+            dir,
+        }
     }
 }
 
@@ -144,7 +150,9 @@ async fn run_node(socket: UdpSocket, cert: Arc<TestCert>, local: SocketAddr) {
             loop {
                 match h.poll(c) {
                     Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
-                        if answered { continue; }
+                        if answered {
+                            continue;
+                        }
                         // Build the synthetic report hex for the client's nonce. The owned string
                         // outlives `resp` (which borrows its bytes) below.
                         let report_hex: Option<String> =
@@ -196,7 +204,7 @@ async fn run_node(socket: UdpSocket, cert: Arc<TestCert>, local: SocketAddr) {
     }
 }
 
-fn endpoint(port: u16, measurement: [u8; 48]) -> NodeEndpoint {
+fn endpoint(port: u16, measurement: [u8; 48], tls_spki_sha256: [u8; 32]) -> NodeEndpoint {
     NodeEndpoint {
         host: "127.0.0.1".to_string(),
         port,
@@ -205,31 +213,40 @@ fn endpoint(port: u16, measurement: [u8; 48]) -> NodeEndpoint {
         expected: Some(AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(measurement.to_vec()),
+            tls_spki_sha256: Some(tls_spki_sha256),
             min_tcb_sevsnp: None,
+            tdx_policy: None,
             transparency_log_key: None,
         }),
         grant: None,
     }
 }
 
-async fn spawn_node() -> u16 {
+async fn spawn_node() -> (u16, [u8; 32]) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let local = socket.local_addr().unwrap();
     let port = local.port();
     let cert = Arc::new(TestCert::generate());
+    let tls_spki_sha256 = Sha256::digest(&cert.spki).into();
     tokio::spawn(run_node(socket, cert, local));
-    port
+    (port, tls_spki_sha256)
 }
 
 #[tokio::test]
 async fn masque_connect_accepts_a_matching_attestation() {
-    let port = spawn_node().await;
+    let (port, tls_spki_sha256) = spawn_node().await;
     let transport = MasqueTransport::new();
     // Client pins the node's REAL measurement → the report appraises → tunnel comes up.
-    let target = endpoint(port, NODE_MEASUREMENT);
+    let target = endpoint(port, NODE_MEASUREMENT, tls_spki_sha256);
     let session = tokio::time::timeout(
         Duration::from_secs(10),
-        transport.connect(target, Grant { token: Vec::new(), nonce: [0x11u8; 32] }),
+        transport.connect(
+            target,
+            Grant {
+                token: Vec::new(),
+                nonce: [0x11u8; 32],
+            },
+        ),
     )
     .await
     .expect("connect must not hang")
@@ -240,20 +257,50 @@ async fn masque_connect_accepts_a_matching_attestation() {
 
 #[tokio::test]
 async fn masque_connect_rejects_a_mismatched_measurement() {
-    let port = spawn_node().await;
+    let (port, tls_spki_sha256) = spawn_node().await;
     let transport = MasqueTransport::new();
     // Client pins a DIFFERENT measurement → appraisal fails → connect errors, no tunnel.
     let mut wrong = NODE_MEASUREMENT;
     wrong[0] ^= 0xff;
-    let target = endpoint(port, wrong);
+    let target = endpoint(port, wrong, tls_spki_sha256);
     let res = tokio::time::timeout(
         Duration::from_secs(10),
-        transport.connect(target, Grant { token: Vec::new(), nonce: [0x22u8; 32] }),
+        transport.connect(
+            target,
+            Grant {
+                token: Vec::new(),
+                nonce: [0x22u8; 32],
+            },
+        ),
     )
     .await
     .expect("connect must not hang");
     assert!(
         res.is_err(),
         "a mismatched measurement must be refused (kill-switch holds — no tunnel)"
+    );
+}
+
+#[tokio::test]
+async fn masque_connect_rejects_a_different_registry_tls_identity() {
+    let (port, mut tls_spki_sha256) = spawn_node().await;
+    tls_spki_sha256[0] ^= 0xff;
+    let transport = MasqueTransport::new();
+    let target = endpoint(port, NODE_MEASUREMENT, tls_spki_sha256);
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        transport.connect(
+            target,
+            Grant {
+                token: Vec::new(),
+                nonce: [0x33; 32],
+            },
+        ),
+    )
+    .await
+    .expect("connect must not hang");
+    assert!(
+        result.is_err(),
+        "a valid same-measurement report from a different TLS key must be refused"
     );
 }

@@ -25,35 +25,52 @@ pub trait PaymentWatcher: Send + Sync {
 /// Test/dev watcher: a fixed (or mutable) set of confirmed payment ids — or, for integration
 /// harnesses that pay a *server-minted checkout reference* (a 256-bit value unknowable when the
 /// Portal starts, so it cannot be pre-seeded), a mode that treats every id as confirmed.
+#[cfg(any(debug_assertions, test))]
 pub struct MockWatcher {
     confirmed: Mutex<HashSet<String>>,
     /// Dev/integration only: confirm ANY payment id, standing in for "the buyer paid the reference
     /// the server just minted". This does NOT weaken the front-running guard: issuance still
     /// requires the id to be one the Portal minted via `/v1/billing/checkout`
     /// ([`crate::billing::is_known_reference`]), so an un-minted id is rejected regardless of
-    /// confirmation. Enabled via `NW_MOCK_PAID_ALL`; never reachable in production, where a live
-    /// `NW_MONERO_RPC` watcher takes precedence over any mock.
+    /// confirmation. Enabled via `NW_MOCK_PAID_ALL`; the mock is not compiled into builds without
+    /// debug assertions (except test harnesses).
     confirm_all: bool,
 }
 
+#[cfg(any(debug_assertions, test))]
 impl MockWatcher {
     pub fn with_paid<I: IntoIterator<Item = String>>(ids: I) -> Self {
-        Self { confirmed: Mutex::new(ids.into_iter().collect()), confirm_all: false }
+        Self {
+            confirmed: Mutex::new(ids.into_iter().collect()),
+            confirm_all: false,
+        }
     }
     /// A dev/integration watcher that treats every payment id as confirmed (see `confirm_all`).
     pub fn confirm_everything() -> Self {
-        Self { confirmed: Mutex::new(HashSet::new()), confirm_all: true }
+        Self {
+            confirmed: Mutex::new(HashSet::new()),
+            confirm_all: true,
+        }
     }
     /// Mark a payment confirmed (e.g. when the real watcher observes it). Used by tests.
     #[allow(dead_code)]
     pub fn confirm(&self, payment_id: &str) {
-        self.confirmed.lock().expect("mock watcher mutex").insert(payment_id.to_string());
+        self.confirmed
+            .lock()
+            .expect("mock watcher mutex")
+            .insert(payment_id.to_string());
     }
 }
 
+#[cfg(any(debug_assertions, test))]
 impl PaymentWatcher for MockWatcher {
     fn is_confirmed(&self, payment_id: &str) -> bool {
-        self.confirm_all || self.confirmed.lock().expect("mock watcher mutex").contains(payment_id)
+        self.confirm_all
+            || self
+                .confirmed
+                .lock()
+                .expect("mock watcher mutex")
+                .contains(payment_id)
     }
 }
 
@@ -92,7 +109,8 @@ struct Transfer {
     /// payment-id-free way to attribute a payment to a checkout: one fresh subaddress per
     /// checkout, identified by its `minor` index within the wallet account.
     #[serde(default)]
-    #[allow(dead_code)] // read by parse_confirmed_by_subaddress (subaddress-based checkout path)
+    #[allow(dead_code)]
+    // read by parse_confirmed_by_subaddress (subaddress-based checkout path)
     subaddr_index: SubaddrIndex,
 }
 
@@ -169,7 +187,8 @@ pub fn validate_rpc_url(url: &str) -> anyhow::Result<()> {
     // Shared guard (exact-host loopback check — not a `127.` prefix match, which a host like
     // `127.0.0.1.evil.com` would have slipped past). The RPC is unauthenticated, so a plaintext
     // non-loopback endpoint is an exposure: bind the wallet to loopback or front it with TLS.
-    nil_core::net::require_tls_or_loopback(url).map_err(|e| anyhow::anyhow!("NW_MONERO_RPC: {e}"))
+    nil_core::net::require_https_or_debug_loopback(url)
+        .map_err(|e| anyhow::anyhow!("NW_MONERO_RPC: {e}"))
 }
 
 /// Watches a self-hosted `monero-wallet-rpc`: a background loop polls `get_transfers` and marks
@@ -221,7 +240,9 @@ impl MoneroRpcWatcher {
     pub async fn poll_loop(self: std::sync::Arc<Self>, interval: Duration) {
         loop {
             match self.poll_once().await {
-                Ok(n) if n > 0 => tracing::info!(newly_confirmed = n, "monero: confirmed new payment(s)"),
+                Ok(n) if n > 0 => {
+                    tracing::info!(newly_confirmed = n, "monero: confirmed new payment(s)")
+                }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("monero poll failed (will retry): {e}"),
             }
@@ -232,7 +253,10 @@ impl MoneroRpcWatcher {
 
 impl PaymentWatcher for MoneroRpcWatcher {
     fn is_confirmed(&self, payment_id: &str) -> bool {
-        self.confirmed.lock().expect("watcher mutex").contains(payment_id)
+        self.confirmed
+            .lock()
+            .expect("watcher mutex")
+            .contains(payment_id)
     }
 }
 
@@ -269,10 +293,22 @@ mod tests {
         ]}}"#;
         // Require 10 confirmations AND at least 1000 atomic units.
         let confirmed = parse_confirmed(body, 10, 1000).expect("parse");
-        assert!(confirmed.contains("aaaaaaaaaaaaaaaa"), "12 conf, 1000 ≥ 1000 → confirmed");
-        assert!(!confirmed.contains("bbbbbbbbbbbbbbbb"), "3 < 10 confirmations → not yet");
-        assert!(!confirmed.contains("cccccccccccccccc"), "amount 500 < 1000 → underpaid, rejected");
-        assert!(!confirmed.contains("0000000000000000"), "null payment id is ignored");
+        assert!(
+            confirmed.contains("aaaaaaaaaaaaaaaa"),
+            "12 conf, 1000 ≥ 1000 → confirmed"
+        );
+        assert!(
+            !confirmed.contains("bbbbbbbbbbbbbbbb"),
+            "3 < 10 confirmations → not yet"
+        );
+        assert!(
+            !confirmed.contains("cccccccccccccccc"),
+            "amount 500 < 1000 → underpaid, rejected"
+        );
+        assert!(
+            !confirmed.contains("0000000000000000"),
+            "null payment id is ignored"
+        );
         assert_eq!(confirmed.len(), 1);
     }
 
@@ -284,24 +320,48 @@ mod tests {
             {"subaddr_index":{"major":0,"minor":9},"confirmations":20,"amount":500}
         ]}}"#;
         let confirmed = parse_confirmed_by_subaddress(body, 10, 1000).expect("parse");
-        assert!(confirmed.contains("0/7"), "12 conf, 1000 ≥ 1000 → confirmed");
+        assert!(
+            confirmed.contains("0/7"),
+            "12 conf, 1000 ≥ 1000 → confirmed"
+        );
         assert!(!confirmed.contains("0/8"), "3 < 10 confirmations → not yet");
-        assert!(!confirmed.contains("0/9"), "amount 500 < 1000 → underpaid, rejected");
+        assert!(
+            !confirmed.contains("0/9"),
+            "amount 500 < 1000 → underpaid, rejected"
+        );
         assert_eq!(confirmed.len(), 1);
     }
 
     #[test]
     fn parse_confirmed_handles_an_empty_or_resultless_response() {
-        assert!(parse_confirmed(br#"{"result":{}}"#, 10, 0).unwrap().is_empty());
-        assert!(parse_confirmed(br#"{"error":{"code":-1,"message":"x"}}"#, 10, 0).unwrap().is_empty());
+        assert!(parse_confirmed(br#"{"result":{}}"#, 10, 0)
+            .unwrap()
+            .is_empty());
+        assert!(
+            parse_confirmed(br#"{"error":{"code":-1,"message":"x"}}"#, 10, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn validate_rpc_url_allows_loopback_or_https_only() {
-        assert!(validate_rpc_url("http://127.0.0.1:18082").is_ok());
-        assert!(validate_rpc_url("http://localhost:18082/json_rpc").is_ok());
-        assert!(validate_rpc_url("https://wallet.example.internal").is_ok(), "https remote ok");
-        assert!(validate_rpc_url("http://wallet.example.com:18082").is_err(), "plaintext remote refused");
+    fn validate_rpc_url_requires_https_with_debug_only_loopback_http() {
+        assert_eq!(
+            validate_rpc_url("http://127.0.0.1:18082").is_ok(),
+            cfg!(debug_assertions)
+        );
+        assert_eq!(
+            validate_rpc_url("http://localhost:18082/json_rpc").is_ok(),
+            cfg!(debug_assertions)
+        );
+        assert!(
+            validate_rpc_url("https://wallet.example.internal").is_ok(),
+            "https remote ok"
+        );
+        assert!(
+            validate_rpc_url("http://wallet.example.com:18082").is_err(),
+            "plaintext remote refused"
+        );
         assert!(validate_rpc_url("not-a-url").is_err());
     }
 }

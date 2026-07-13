@@ -1,6 +1,6 @@
 //! NIL VPN client provisioning helper.
 //!
-//! Acquires an unlinkable Privacy Pass token from the Portal and prints the token env
+//! Acquires a blind-signed Privacy Pass token from the Portal and prints the token env
 //! (`NW_TOKEN_MSG` / `NW_TOKEN`) for `nil-cli` to then redeem at the Coordinator for a trust-split
 //! path. This is the "separate client step" the datapath redeem module references; it completes the
 //! client control flow. The real flow is:
@@ -13,7 +13,7 @@
 //! 3. **issue (poll)** — `POST /v1/tokens/issue`; the Portal blind-signs only once the payment for
 //!    the reference confirms on-chain. Until then it returns 402, so we optionally poll at a wide
 //!    interval (`NW_CHECKOUT_POLL_ATTEMPTS` / `NW_CHECKOUT_POLL_INTERVAL_SECS`).
-//! 4. **finalize** — unblind locally into the opaque, unlinkable token.
+//! 4. **finalize** — unblind locally into an opaque token with no direct cryptographic issuance join.
 //!
 //! Privacy: it talks ONLY to the Business plane (Portal) and never sees a packet. The token is
 //! blinded locally, so the Portal's signature cannot be linked to the token the Coordinator later
@@ -46,7 +46,9 @@ fn unhex(s: &str) -> Result<Vec<u8>> {
             _ => anyhow::bail!("invalid hex"),
         }
     }
-    b.chunks_exact(2).map(|p| Ok((nib(p[0])? << 4) | nib(p[1])?)).collect()
+    b.chunks_exact(2)
+        .map(|p| Ok((nib(p[0])? << 4) | nib(p[1])?))
+        .collect()
 }
 
 /// Mint a fresh, unguessable payment reference via `POST /v1/billing/checkout`, and print it (and
@@ -84,13 +86,19 @@ async fn checkout(http: &reqwest::Client, portal: &str) -> Result<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let portal = std::env::var("NW_PORTAL_URL").context("NW_PORTAL_URL (Portal base URL) is required")?;
+    let portal =
+        std::env::var("NW_PORTAL_URL").context("NW_PORTAL_URL (Portal base URL) is required")?;
     let portal = portal.trim_end_matches('/');
-    // The blinded request, the blind signature, and the payment reference are sensitive — never
-    // send them in cleartext to a non-loopback Portal. Require TLS unless loopback, or a dev opt-in.
-    if !nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
-        nil_core::net::require_tls_or_loopback(portal)
-            .map_err(|e| anyhow::anyhow!("NW_PORTAL_URL: {e} (or set NW_INSECURE_CONTROL_PLANE=1 for a trusted local network)"))?;
+    // The blinded request, blind signature, and payment reference are sensitive. Builds without
+    // debug assertions require HTTPS; local integration builds may use loopback HTTP or the
+    // explicitly gated development override.
+    if !nil_core::net::dev_env_flag("NW_INSECURE_CONTROL_PLANE") {
+        nil_core::net::require_https_or_debug_loopback(portal).map_err(|e| {
+            anyhow::anyhow!(
+                "NW_PORTAL_URL: {e} (NW_INSECURE_CONTROL_PLANE is available only in builds with \
+                 debug assertions)"
+            )
+        })?;
     }
     // Bound the round-trips so a hung Portal can't block provisioning forever.
     let http = reqwest::Client::builder()
@@ -121,10 +129,13 @@ async fn main() -> Result<()> {
 
     // 3. Blind a fresh random token message ONCE. The blinding secret stays in this process; the
     //    same blinded request is reused across poll attempts (a 402 attempt issues nothing).
-    let mut msg = [0u8; 32];
-    getrandom::getrandom(&mut msg).map_err(|e| anyhow::anyhow!("rng: {e}"))?;
+    let msg =
+        nil_crypto::token::new_v2_message().map_err(|e| anyhow::anyhow!("token message: {e}"))?;
     let req = token::blind(&pubkey_der, &msg).map_err(|e| anyhow::anyhow!("blind: {e}"))?;
-    let issue = IssueRequest { payment_id: payment_id.clone(), blind_msg: hex(&req.blind_msg) };
+    let issue = IssueRequest {
+        payment_id: payment_id.clone(),
+        blind_msg: hex(&req.blind_msg),
+    };
 
     // 4. Ask the Portal to blind-sign (it verifies the payment confirmed, never seeing `msg`). The
     //    Portal returns 402 until the payment for the reference confirms on-chain; poll at a WIDE
@@ -151,7 +162,7 @@ async fn main() -> Result<()> {
         if resp.status().is_success() {
             let issued: IssueResponse = resp.json().await.context("parse issue response")?;
             let blind_sig = unhex(&issued.blind_sig)?;
-            // 5. Unblind → the final, unlinkable token. Emit the env for the Coordinator redemption.
+            // 5. Unblind → the final token. Emit the env for the Coordinator redemption.
             let tok = token::finalize(&pubkey_der, &req, &blind_sig)
                 .map_err(|e| anyhow::anyhow!("finalize: {e}"))?;
             println!("NW_TOKEN_MSG={}", hex(&msg));
@@ -164,8 +175,15 @@ async fn main() -> Result<()> {
         // anything else is terminal. Draining the budgeted attempts through a throttle beats giving
         // up on the first 429 — and polling is exactly what adds the request volume that trips it.
         if matches!(last_status, 402 | 429) && attempt < attempts {
-            let why = if last_status == 429 { "rate-limited by the Portal" } else { "payment not yet confirmed" };
-            eprintln!("{why} (attempt {attempt}/{attempts}); waiting {}s…", interval.as_secs());
+            let why = if last_status == 429 {
+                "rate-limited by the Portal"
+            } else {
+                "payment not yet confirmed"
+            };
+            eprintln!(
+                "{why} (attempt {attempt}/{attempts}); waiting {}s…",
+                interval.as_secs()
+            );
             tokio::time::sleep(interval).await;
         } else {
             break;

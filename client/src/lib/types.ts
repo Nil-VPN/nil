@@ -8,8 +8,7 @@ export type ConnState =
 
 export interface AnonymousAccount {
   account_number: string;
-  recovery_phrase: string[]; // exactly 7 words
-  recovery_code: string;
+  recovery_phrase: string[]; // exactly 12 BIP39 words (128-bit entropy + checksum)
 }
 
 export interface RecoverResult {

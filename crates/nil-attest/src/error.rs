@@ -27,6 +27,11 @@ pub enum AttestError {
     /// string "measurement mismatch" is asserted by the Docker accept/reject harness.
     #[error("measurement mismatch")]
     MeasurementMismatch,
+    /// The live TLS key does not match the stable node identity published by the registry. This
+    /// check is separate from report_data: a clone can bind a valid report to its own key, but it
+    /// cannot satisfy another node's registry pin.
+    #[error("TLS SPKI identity mismatch")]
+    TlsSpkiMismatch,
     /// `report_data` did not bind the node's TLS key and the client nonce — the report was
     /// not minted for this connection (relay/stale).
     #[error("report_data binding mismatch (wrong TLS key or stale nonce)")]

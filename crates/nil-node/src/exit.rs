@@ -49,10 +49,15 @@ impl Exit {
         // Forward + NAT the tunnel subnet (Linux). ip_forward is also set via the compose
         // `sysctls:` key, so this is best-effort. The rule SET is role-scoped (see `nat_rules`).
         if let Err(e) = sh("sysctl", &["-w", "net.ipv4.ip_forward=1"]) {
-            tracing::warn!("sysctl ip_forward (continuing; likely already set by the container): {e}");
+            tracing::warn!(
+                "sysctl ip_forward (continuing; likely already set by the container): {e}"
+            );
         }
         for rule in nat_rules(cfg) {
-            sh("iptables", &rule.iter().map(String::as_str).collect::<Vec<_>>())?;
+            sh(
+                "iptables",
+                &rule.iter().map(String::as_str).collect::<Vec<_>>(),
+            )?;
         }
         tracing::info!(
             egress = %cfg.egress, subnet = %cfg.tunnel_cidr, role = ?cfg.role,
@@ -60,7 +65,10 @@ impl Exit {
             "datapath NAT/forward armed (open egress only at the exit)"
         );
 
-        Ok(Exit { tun: Arc::new(tun), cfg: cfg.clone() })
+        Ok(Exit {
+            tun: Arc::new(tun),
+            cfg: cfg.clone(),
+        })
     }
 
     pub fn tun(&self) -> Arc<AsyncDevice> {
@@ -74,9 +82,18 @@ impl Drop for Exit {
         for rule in nat_rules(&self.cfg) {
             let del: Vec<String> = rule
                 .iter()
-                .map(|tok| if tok == "-A" { "-D".to_string() } else { tok.clone() })
+                .map(|tok| {
+                    if tok == "-A" {
+                        "-D".to_string()
+                    } else {
+                        tok.clone()
+                    }
+                })
                 .collect();
-            let _ = sh("iptables", &del.iter().map(String::as_str).collect::<Vec<_>>());
+            let _ = sh(
+                "iptables",
+                &del.iter().map(String::as_str).collect::<Vec<_>>(),
+            );
         }
     }
 }
@@ -98,7 +115,18 @@ fn nat_rules(cfg: &NodeConfig) -> Vec<Vec<String>> {
     let eg = cfg.egress.as_str();
     if role_has_open_egress(cfg.role) {
         vec![
-            s(&["-t", "nat", "-A", "POSTROUTING", "-s", cidr, "-o", eg, "-j", "MASQUERADE"]),
+            s(&[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                cidr,
+                "-o",
+                eg,
+                "-j",
+                "MASQUERADE",
+            ]),
             s(&["-A", "FORWARD", "-i", tun, "-j", "ACCEPT"]),
             s(&["-A", "FORWARD", "-o", tun, "-j", "ACCEPT"]),
         ]
@@ -107,9 +135,35 @@ fn nat_rules(cfg: &NodeConfig) -> Vec<Vec<String>> {
         // other tunnel-sourced traffic is dropped (the open-relay guard). First match wins, so the
         // reply + QUIC ACCEPTs precede the catch-all DROP.
         vec![
-            s(&["-t", "nat", "-A", "POSTROUTING", "-s", cidr, "-o", eg, "-p", "udp", "--dport", NODE_QUIC_PORT, "-j", "MASQUERADE"]),
+            s(&[
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-s",
+                cidr,
+                "-o",
+                eg,
+                "-p",
+                "udp",
+                "--dport",
+                NODE_QUIC_PORT,
+                "-j",
+                "MASQUERADE",
+            ]),
             s(&["-A", "FORWARD", "-o", tun, "-j", "ACCEPT"]),
-            s(&["-A", "FORWARD", "-i", tun, "-p", "udp", "--dport", NODE_QUIC_PORT, "-j", "ACCEPT"]),
+            s(&[
+                "-A",
+                "FORWARD",
+                "-i",
+                tun,
+                "-p",
+                "udp",
+                "--dport",
+                NODE_QUIC_PORT,
+                "-j",
+                "ACCEPT",
+            ]),
             s(&["-A", "FORWARD", "-i", tun, "-j", "DROP"]),
         ]
     }
@@ -143,8 +197,14 @@ mod tests {
             mtu: 1420,
             attest: None,
             role,
-            grant_key: None,
+            grant_verifier: None,
+            grant_realm: None,
+            node_id: None,
+            tls_key_file: None,
             allow_ungranted: false,
+            max_connections: 1024,
+            max_connections_per_ip: 32,
+            grant_replay_capacity: 65_536,
         }
     }
 
@@ -160,8 +220,13 @@ mod tests {
         let rules = nat_rules(&cfg(NodeRole::Exit));
         let flat: Vec<String> = rules.iter().map(|r| r.join(" ")).collect();
         // Open MASQUERADE (no --dport restriction) and no DROP guard.
-        assert!(flat.iter().any(|r| r.contains("POSTROUTING") && r.contains("MASQUERADE") && !r.contains("--dport")));
-        assert!(!flat.iter().any(|r| r.contains("-j DROP")), "the exit drops nothing from the tunnel");
+        assert!(flat.iter().any(|r| r.contains("POSTROUTING")
+            && r.contains("MASQUERADE")
+            && !r.contains("--dport")));
+        assert!(
+            !flat.iter().any(|r| r.contains("-j DROP")),
+            "the exit drops nothing from the tunnel"
+        );
     }
 
     #[test]
@@ -170,14 +235,36 @@ mod tests {
             let rules = nat_rules(&cfg(role));
             let flat: Vec<String> = rules.iter().map(|r| r.join(" ")).collect();
             // MASQUERADE is UDP/443-only (no open MASQUERADE).
-            assert!(flat.iter().any(|r| r.contains("MASQUERADE") && r.contains("--dport") && r.contains("443")), "{role:?}");
-            assert!(!flat.iter().any(|r| r.contains("MASQUERADE") && !r.contains("--dport")), "{role:?}: no open MASQUERADE");
+            assert!(
+                flat.iter().any(|r| r.contains("MASQUERADE")
+                    && r.contains("--dport")
+                    && r.contains("443")),
+                "{role:?}"
+            );
+            assert!(
+                !flat
+                    .iter()
+                    .any(|r| r.contains("MASQUERADE") && !r.contains("--dport")),
+                "{role:?}: no open MASQUERADE"
+            );
             // A catch-all DROP for non-QUIC tunnel-sourced traffic (the open-relay guard).
-            assert!(flat.iter().any(|r| r.contains("FORWARD") && r.contains("-i nil0") && r.contains("-j DROP")), "{role:?}");
+            assert!(
+                flat.iter().any(|r| r.contains("FORWARD")
+                    && r.contains("-i nil0")
+                    && r.contains("-j DROP")),
+                "{role:?}"
+            );
             // QUIC out + replies in are permitted, and the QUIC ACCEPT precedes the DROP.
-            let quic = flat.iter().position(|r| r.contains("-i nil0") && r.contains("443") && r.contains("ACCEPT"));
-            let drop = flat.iter().position(|r| r.contains("-i nil0") && r.contains("DROP"));
-            assert!(quic.is_some() && drop.is_some() && quic < drop, "{role:?}: QUIC ACCEPT must precede DROP");
+            let quic = flat
+                .iter()
+                .position(|r| r.contains("-i nil0") && r.contains("443") && r.contains("ACCEPT"));
+            let drop = flat
+                .iter()
+                .position(|r| r.contains("-i nil0") && r.contains("DROP"));
+            assert!(
+                quic.is_some() && drop.is_some() && quic < drop,
+                "{role:?}: QUIC ACCEPT must precede DROP"
+            );
         }
     }
 }

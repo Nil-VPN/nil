@@ -7,4 +7,6 @@ pub enum CryptoError {
     WrongLength { expected: usize, got: usize },
     #[error("unknown word in recovery phrase: {0:?}")]
     UnknownWord(String),
+    #[error("recovery phrase has an invalid BIP39 checksum")]
+    InvalidMnemonicChecksum,
 }

@@ -15,11 +15,11 @@ const CREATE_RATE_MAX: u32 = 10;
 const CREATE_RATE_WINDOW: Duration = Duration::from_secs(60);
 
 /// Per-IP cap on the authenticated/challenge paths (`/v1/account/challenge`, `/v1/account/status`),
-/// and its window. MUCH more generous than the create limiter: every authed op (status, subscribe,
-/// activate, mint) first fetches a challenge, and the client mints a token on demand on EVERY
-/// connect — so a per-connection/poll cadence must not self-throttle. These endpoints write nothing
-/// durable (a challenge is an in-memory nonce), so they don't need the create limiter's tight,
-/// storage-exhaustion-driven cap. Still bounds a flood. Matches the mint endpoint's per-IP guard.
+/// and its window. MUCH more generous than the create limiter: every authenticated operation
+/// (status, subscribe, activate, background batch refill) first fetches a challenge. These
+/// endpoints write nothing durable (a challenge is an in-memory nonce), so they don't need the
+/// create limiter's tight, storage-exhaustion-driven cap. Still bounds a flood and matches the mint
+/// endpoint's per-IP guard.
 const AUTH_RATE_MAX: u32 = 120;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -32,7 +32,7 @@ pub struct AppState {
     /// flooding. PII-free: a transient per-window counter, never persisted or logged.
     pub limiter: Arc<RateLimiter>,
     /// Abuse control on the authed/challenge paths (challenge + status), keyed by client IP.
-    /// Generous (see [`AUTH_RATE_MAX`]) so the per-connect mint flow doesn't self-throttle, while
+    /// Generous (see [`AUTH_RATE_MAX`]) so periodic batch-prefetch auth doesn't self-throttle, while
     /// still bounding a flood. PII-free, transient, never persisted or tied to an account.
     pub auth_limiter: Arc<RateLimiter>,
     /// Single-use, short-TTL account-auth challenges (ADR-0007). In-memory and non-identifying:

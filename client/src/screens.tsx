@@ -4,16 +4,18 @@ import type { SubscriptionStatus } from "./lib/commands";
 import type { AnonymousAccount, ConnState, PortalConfig } from "./lib/types";
 import { HonestLimits, HonestyBanner, StatusPill, TokenBalanceBadge } from "./components";
 
+// The Rust background refiller owns all network activity and its randomized schedule. This fixed,
+// local-only poll merely notices when a prefetched pass has reached the on-device store.
+const TOKEN_BALANCE_POLL_MS = 5_000;
+
 /** First-run: choose how to create/recover an account. Anonymous is the default. */
 export function FirstRunScreen({
   busy,
   onAnonymous,
-  onEmail,
   onRecover,
 }: {
   busy: boolean;
   onAnonymous: () => void;
-  onEmail: () => void;
   onRecover: () => void;
 }) {
   return (
@@ -25,13 +27,10 @@ export function FirstRunScreen({
         Create anonymous account (no email)
       </button>
       <p className="hint">
-        Nothing personal is stored — no email, no name, no signup IP. You'll get a 7-word
-        recovery phrase. Losing it means losing the account; there's no email to reset.
+        Nothing personal is stored — no email, no name, no signup IP. Your device creates a
+        checksummed 12-word recovery phrase; it is never sent to NIL. Losing it means losing the
+        account because there is no email reset.
       </p>
-
-      <button className="btn btn-secondary" disabled={busy} onClick={onEmail}>
-        Use email (easier recovery)
-      </button>
 
       <button className="link" disabled={busy} onClick={onRecover}>
         I already have an account → recover
@@ -42,12 +41,14 @@ export function FirstRunScreen({
   );
 }
 
-/** Shows the 7-word phrase + recovery code exactly once, wallet-seed style. */
+/** Shows the client-generated 12-word BIP39 phrase exactly once, wallet-seed style. */
 export function RecoveryPhraseScreen({
   account,
+  busy,
   onContinue,
 }: {
   account: AnonymousAccount;
+  busy: boolean;
   onContinue: () => void;
 }) {
   const [written, setWritten] = useState(false);
@@ -55,8 +56,8 @@ export function RecoveryPhraseScreen({
     <div className="screen">
       <h2>Write down your recovery phrase</h2>
       <p className="warn">
-        These 7 words <strong>are</strong> your account. Write them down and store them
-        offline. This is shown only once — we cannot recover it for you.
+        These 12 checksummed words <strong>are</strong> your account. They were generated on this
+        device and were never sent to NIL. Store them offline; we cannot recover them for you.
       </p>
 
       <ol className="phrase">
@@ -69,11 +70,6 @@ export function RecoveryPhraseScreen({
       </ol>
 
       <div className="field">
-        <span className="field-label">One-time recovery code</span>
-        <code className="code">{account.recovery_code}</code>
-      </div>
-
-      <div className="field">
         <span className="field-label">Account number</span>
         <code className="code small">{account.account_number}</code>
       </div>
@@ -84,99 +80,48 @@ export function RecoveryPhraseScreen({
           checked={written}
           onChange={(e) => setWritten(e.target.checked)}
         />
-        I've written down my recovery phrase and code.
+        I've written down and checked all 12 words.
       </label>
 
-      <button className="btn btn-primary" disabled={!written} onClick={onContinue}>
+      <button className="btn btn-primary" disabled={!written || busy} onClick={onContinue}>
         Continue
       </button>
     </div>
   );
 }
 
-/** Recover an existing account from the phrase + code. */
+/** Recover an existing account by deriving its auth key locally from the checksummed mnemonic. */
 export function RecoverAccountScreen({
   busy,
   onSubmit,
   onBack,
 }: {
   busy: boolean;
-  onSubmit: (phrase: string[], code: string) => void;
+  onSubmit: (phrase: string[]) => void;
   onBack: () => void;
 }) {
   const [phrase, setPhrase] = useState("");
-  const [code, setCode] = useState("");
   const words = phrase.trim().split(/\s+/).filter(Boolean);
 
   return (
     <div className="screen">
       <h2>Recover your account</h2>
       <label className="field">
-        <span className="field-label">Your 7 words (separated by spaces)</span>
+        <span className="field-label">Your 12 words (separated by spaces)</span>
         <textarea
           className="input"
           rows={3}
           value={phrase}
-          placeholder="word1 word2 word3 word4 word5 word6 word7"
+          placeholder="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
           onChange={(e) => setPhrase(e.target.value)}
         />
       </label>
-      <label className="field">
-        <span className="field-label">Recovery code</span>
-        <input
-          className="input"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-        />
-      </label>
-
       <button
         className="btn btn-primary"
-        disabled={busy || words.length !== 7 || code.trim().length === 0}
-        onClick={() => onSubmit(words, code.trim())}
+        disabled={busy || words.length !== 12}
+        onClick={() => onSubmit(words)}
       >
         Recover
-      </button>
-      <button className="link" disabled={busy} onClick={onBack}>
-        ← Back
-      </button>
-    </div>
-  );
-}
-
-/** "Use email" path — Phase 0 surfaces the not-yet-available message from the Portal. */
-export function EmailSignupScreen({
-  busy,
-  onSubmit,
-  onBack,
-}: {
-  busy: boolean;
-  onSubmit: (email: string) => void;
-  onBack: () => void;
-}) {
-  const [email, setEmail] = useState("");
-  return (
-    <div className="screen">
-      <h2>Use email</h2>
-      <p className="hint">
-        Email accounts store only an encrypted email. (Not available in this Phase&nbsp;0
-        preview — anonymous accounts are fully working.)
-      </p>
-      <label className="field">
-        <span className="field-label">Email address</span>
-        <input
-          className="input"
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-        />
-      </label>
-      <button
-        className="btn btn-primary"
-        disabled={busy || email.trim().length === 0}
-        onClick={() => onSubmit(email.trim())}
-      >
-        Continue
       </button>
       <button className="link" disabled={busy} onClick={onBack}>
         ← Back
@@ -199,28 +144,84 @@ export function MainScreen({
   const [sub, setSub] = useState<SubscriptionStatus | null>(null);
 
   useEffect(() => {
+    let active = true;
+    const refreshBalance = () => {
+      api
+        .tokenBalance()
+        .then((next) => {
+          if (active) setBalance(next);
+        })
+        .catch(() => {
+          // Unknown balance is treated like zero below, so a storage/backend error fails closed.
+          if (active) setBalance(null);
+        });
+    };
+
     api.status().then(setState).catch((e) => onError(String(e)));
-    api.tokenBalance().then(setBalance).catch(() => setBalance(null));
+    refreshBalance();
     api.getConfig().then(setCfg).catch(() => setCfg(null));
     api.subscriptionStatus().then((s) => setSub(s ?? null)).catch(() => setSub(null));
+    const balancePoll = window.setInterval(refreshBalance, TOKEN_BALANCE_POLL_MS);
+    return () => {
+      active = false;
+      window.clearInterval(balancePoll);
+    };
   }, [onError]);
 
   const busy = state === "connecting" || state === "disconnecting";
   const connected = state === "connected";
-  // A real (attested) path is configured when a Coordinator URL is set.
+  const disconnectable = connected || state === "disconnecting";
+  // Only the Coordinator path consumes a subscription pass. The direct-node override is a
+  // debug-only integration path and is labelled separately below.
   const realPath = !!cfg && cfg.coordinator_url.trim().length > 0;
+  const directDebugPath = !!cfg && !realPath && cfg.node_host.trim().length > 0;
   const subscribed = sub?.entitlement === "active";
   const activeUntil = sub?.until ? new Date(sub.until * 1000).toLocaleDateString() : null;
-  // Fail-closed: with a Coordinator configured you need EITHER an active subscription (connect mints
-  // a token on demand) or a leftover token to connect — otherwise no token, no tunnel.
-  const needToken = realPath && !subscribed && (balance ?? 0) === 0;
+  // Subscription status authorizes the separate background refiller. A real connection still
+  // requires a pass already present in the local store.
+  const needPreparedPass = realPath && (balance ?? 0) < 1;
+  const checkingPreparedPass = realPath && balance === null;
+  const preparingSubscribedPasses = needPreparedPass && subscribed && balance === 0;
+
+  let connectionHint: string;
+  if (connected) {
+    if (realPath) {
+      connectionHint =
+        "Connected through an attested path — the client verified every hop's hardware report before accepting the tunnel.";
+    } else if (directDebugPath) {
+      connectionHint =
+        "Connected through the debug-only direct-node path. It bypasses Coordinator redemption and is unavailable in release builds.";
+    } else {
+      connectionHint =
+        "Connected through the debug-only in-memory loopback seam — this is not a VPN tunnel and cannot occur in a release build.";
+    }
+  } else if (cfg === null) {
+    connectionHint = "Loading connection settings…";
+  } else if (checkingPreparedPass) {
+    connectionHint = "Checking for a locally prepared private connection pass…";
+  } else if (preparingSubscribedPasses) {
+    connectionHint =
+      "Private connection passes are being prepared in the background. Connect will unlock when a prefetched pass is stored on this device.";
+  } else if (needPreparedPass) {
+    connectionHint =
+      "Subscribe to prepare private connection passes in the background, or buy a one-off pass (fail-closed: no stored pass, no tunnel).";
+  } else if (realPath) {
+    connectionHint =
+      "Tap Connect to use one locally prepared private connection pass and bring up the attested tunnel.";
+  } else if (directDebugPath) {
+    connectionHint =
+      "Debug-only direct-node mode bypasses Coordinator redemption and does not consume a connection pass. Release builds refuse this path.";
+  } else {
+    connectionHint =
+      "No Coordinator is configured. Debug builds can exercise the in-memory loopback seam (not a VPN); release builds refuse to connect.";
+  }
 
   async function toggle() {
     try {
       if (state === "disconnected") {
         setState("connecting"); // optimistic
         setState(await api.connect());
-      } else if (state === "connected") {
+      } else if (disconnectable) {
         setState("disconnecting"); // optimistic
         setState(await api.disconnect());
       }
@@ -247,40 +248,31 @@ export function MainScreen({
       {realPath && (
         <p className="hint sub-status">
           {subscribed
-            ? `Subscription active${activeUntil ? ` until ${activeUntil}` : ""} — connecting mints a token on demand.`
-            : "No active subscription."}
+            ? `Subscription active${activeUntil ? ` until ${activeUntil}` : ""}. Private connection passes are prepared in small blind-signed batches at randomized times in the background.`
+            : "No active subscription. Connect requires one private connection pass already stored on this device."}
         </p>
       )}
 
       <button
-        className={`toggle ${connected ? "toggle-on" : "toggle-off"}`}
-        // A token is required to CONNECT, but never to disconnect — otherwise, once the last token is
-        // consumed by the active connection (balance → 0), the user could no longer turn the VPN off.
-        disabled={busy || (needToken && !connected)}
+        className={`toggle ${disconnectable ? "toggle-on" : "toggle-off"}`}
+        // A prepared pass is required to CONNECT, but never to disconnect — otherwise, once the last
+        // pass is consumed by the active connection (balance → 0), the user could not turn the VPN off.
+        // Keep Connect locked until config loads too, so the initial unknown state cannot bypass the gate.
+        disabled={
+          state === "connecting" || (!disconnectable && (cfg === null || needPreparedPass))
+        }
         onClick={toggle}
       >
-        {connected ? "Disconnect" : "Connect"}
+        {state === "disconnecting" ? "Retry cleanup" : connected ? "Disconnect" : "Connect"}
       </button>
 
-      <p className="hint">
-        {connected
-          ? realPath
-            ? "Connected through an attested node — the client verified its hardware report before any packet flowed."
-            : "Connected via the in-memory loopback transport (no Coordinator configured — no real tunnel)."
-          : needToken
-            ? "Subscribe — or buy a connection token — to connect (fail-closed: no token, no tunnel)."
-            : realPath
-              ? subscribed
-                ? "Tap Connect — your subscription mints a token and brings up the attested tunnel."
-                : "Tap Connect to redeem a token and bring up the attested tunnel."
-              : "Tap Connect to exercise the engine through the loopback transport."}
-      </p>
+      <p className="hint">{connectionHint}</p>
 
       <button className="btn btn-primary" disabled={busy} onClick={() => onNavigate("subscribe")}>
         {subscribed ? "Manage subscription" : "Subscribe"}
       </button>
       <button className="btn btn-secondary" disabled={busy} onClick={() => onNavigate("buy")}>
-        Buy a one-off connection token
+        Buy a one-off connection pass
       </button>
 
       <HonestLimits />
@@ -288,7 +280,7 @@ export function MainScreen({
   );
 }
 
-/** Buy connection tokens: pay (Monero / comp id), then claim a blind-signed, unlinkable token. */
+/** Buy one connection pass: payment is visible to Portal, while the later token is blind-signed. */
 export function BuyTokensScreen({
   busy,
   onBuy,
@@ -307,10 +299,12 @@ export function BuyTokensScreen({
   const address = cfg?.monero_address?.trim() ?? "";
   return (
     <div className="screen">
-      <h2>Buy connection tokens</h2>
+      <h2>Buy a one-off connection pass</h2>
       <p className="hint">
-        Pay, then claim a token. The token is blind-signed, so what you pay is mathematically
-        unlinkable to what you do (Pillar 4). One token = one connection; top up anytime.
+        Pay, then claim a blind-signed pass. The Portal sees the payment, but cannot derive the
+        unblinded pass later redeemed at the Coordinator. Network timing can still correlate
+        events, so this is not anonymity. Each Connect attempt consumes one locally stored pass,
+        and a later network/tunnel failure may still consume it. Top up anytime.
       </p>
 
       {address ? (
@@ -321,8 +315,8 @@ export function BuyTokensScreen({
         </div>
       ) : (
         <p className="hint">
-          No Monero address is configured. For the closed alpha, enter a comp / invite payment id
-          from the operator. (Set a deposit address in Settings for self-serve Monero.)
+          No Monero deposit address is configured. This screen can claim only a confirmed,
+          Portal-minted payment reference supplied through the operator or a debug harness.
         </p>
       )}
 
@@ -341,7 +335,7 @@ export function BuyTokensScreen({
         disabled={busy || paymentId.trim().length === 0}
         onClick={() => onBuy(paymentId.trim())}
       >
-        Claim token
+        Claim pass
       </button>
       <button className="link" disabled={busy} onClick={onBack}>
         ← Back
@@ -350,8 +344,8 @@ export function BuyTokensScreen({
   );
 }
 
-/** Subscribe / renew (ADR-0007): pay once, then connect freely while active. The app mints unlinkable
- *  tokens on demand, so logging back in on any device reconnects with no extra payment. */
+/** Subscribe / renew (ADR-0007): subscription checks and batched pass preparation happen in the
+ *  background, away from the moment Connect consumes a locally stored pass. */
 export function SubscribeScreen({
   onError,
   onBack,
@@ -406,8 +400,8 @@ export function SubscribeScreen({
       <h2>Subscription</h2>
       <p className="hint">
         {active
-          ? `Active until ${until}. While active, connecting mints unlinkable tokens on demand — log back in on any device and reconnect, no extra payment (Pillar 4).`
-          : "Pay once for a month of access. While active, the app mints unlinkable connection tokens on demand, so what you pay stays unlinkable to what you do — and re-login on any device reconnects without paying again."}
+          ? `Active until ${until}. NIL prepares blind-signed connection passes in small batches at randomized times in the background. Connect uses only a pass already stored on this device; after signing in on a new device, allow time for its first batch.`
+          : "Pay once for a month of access. While active, NIL prepares blind-signed connection passes in small batches at randomized times in the background. Connect waits for a locally stored pass, helping reduce timing correlation between account activity and a connection."}
       </p>
 
       {!reference ? (
@@ -496,13 +490,20 @@ export function SettingsScreen({
     <div className="screen">
       <h2>Settings</h2>
       <label className="field">
-        <span className="field-label">Portal URL (accounts + tokens)</span>
+        <span className="field-label">Portal URL (accounts + connection passes)</span>
         <input className="input" value={cfg.portal_url} onChange={(e) => set({ portal_url: e.target.value })} />
+        <span className="hint">
+          Release builds require HTTPS. Debug builds additionally allow HTTP on genuine loopback
+          addresses for local integration.
+        </span>
       </label>
       <label className="field">
         <span className="field-label">Coordinator URL (attested path)</span>
         <input className="input" value={cfg.coordinator_url} onChange={(e) => set({ coordinator_url: e.target.value })} />
-        <span className="hint">Empty = loopback dev mode (no real tunnel).</span>
+        <span className="hint">
+          Release builds require an HTTPS Coordinator. Empty enables the non-VPN loopback seam in
+          debug builds only; release builds refuse to connect.
+        </span>
       </label>
       <label className="field">
         <span className="field-label">Monero deposit address (optional)</span>
@@ -551,12 +552,20 @@ export function SettingsScreen({
       <details>
         <summary>Advanced</summary>
         <label className="field">
-          <span className="field-label">Direct node host (bypass Coordinator)</span>
+          <span className="field-label">Debug-only direct node host (bypasses Coordinator)</span>
           <input className="input" value={cfg.node_host} onChange={(e) => set({ node_host: e.target.value })} />
+          <span className="hint">
+            Local integration only. It does not consume a connection pass and is unavailable in
+            release builds.
+          </span>
         </label>
         <label className="field">
-          <span className="field-label">Pinned measurement (hex; blank on the Coordinator path)</span>
+          <span className="field-label">Optional embedded measurement selection (hex)</span>
           <input className="input" value={cfg.expected_measurement} onChange={(e) => set({ expected_measurement: e.target.value })} />
+          <span className="hint">
+            A release setting can only select a measurement already embedded in the signed client;
+            it cannot add a new trust root. Debug direct-node tests use this as their explicit pin.
+          </span>
         </label>
         <label className="field">
           <span className="field-label">TEE</span>

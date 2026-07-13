@@ -53,8 +53,9 @@ fn obfuscation_hotpath_throughput_and_correctness() {
     let mb = (ITERS * PKT_LEN) as f64 / (1024.0 * 1024.0);
     let secs = elapsed.as_secs_f64().max(1e-9);
     let mbps = mb / secs;
-    let report =
-        format!("fast-path obfuscation hotpath: {ITERS} pkts x {PKT_LEN}B round-trip = {mbps:.1} MB/s");
+    let report = format!(
+        "fast-path obfuscation hotpath: {ITERS} pkts x {PKT_LEN}B round-trip = {mbps:.1} MB/s"
+    );
     println!("{report}");
 
     // Coarse no-regression floor: any real machine does FAR more than 1 MB/s here; tripping this
@@ -67,7 +68,18 @@ fn obfuscation_hotpath_throughput_and_correctness() {
 
     // PD-3: the bench output must carry no user-linkable address tokens.
     let lower = report.to_lowercase();
-    for tok in ["addr", "peer", "socketaddr", "client_ip", ".host", ".port", "%addr"] {
-        assert!(!lower.contains(tok), "bench output leaked a forbidden token: {tok}");
+    for tok in [
+        "addr",
+        "peer",
+        "socketaddr",
+        "client_ip",
+        ".host",
+        ".port",
+        "%addr",
+    ] {
+        assert!(
+            !lower.contains(tok),
+            "bench output leaked a forbidden token: {tok}"
+        );
     }
 }

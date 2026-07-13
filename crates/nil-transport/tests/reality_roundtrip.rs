@@ -44,14 +44,19 @@ fn tls_acceptor() -> tokio_rustls::TlsAcceptor {
 /// Serve exactly one client: validate its VLESS auth record, complete the WG handshake, then echo
 /// every decapsulated IP packet back through the tunnel. Returns early (dropping the connection) if
 /// the auth ID is wrong — exactly what the production responder does.
-async fn serve<S>(tls: TlsStream<S>, node_secret: StaticSecret, expected_auth: [u8; REALITY_AUTH_ID_LEN])
-where
+async fn serve<S>(
+    tls: TlsStream<S>,
+    node_secret: StaticSecret,
+    expected_auth: [u8; REALITY_AUTH_ID_LEN],
+) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut rd, mut wr): (ReadHalf<TlsStream<S>>, WriteHalf<TlsStream<S>>) = split(tls);
 
     // Record 1: [auth_id ‖ client WG pubkey].
-    let Ok(hello) = read_record_from(&mut rd).await else { return };
+    let Ok(hello) = read_record_from(&mut rd).await else {
+        return;
+    };
     if hello.len() != REALITY_AUTH_ID_LEN + 32 || hello[..REALITY_AUTH_ID_LEN] != expected_auth {
         return; // wrong/short auth → drop without revealing a tunnel
     }
@@ -149,8 +154,16 @@ async fn reality_packet_round_trips_through_tls_vless_wireguard() {
 fn auth_id_is_deterministic_and_key_bound() {
     let a = [7u8; 32];
     let b = [9u8; 32];
-    assert_eq!(derive_auth_id(&a), derive_auth_id(&a), "same key derives the same auth id");
-    assert_ne!(derive_auth_id(&a), derive_auth_id(&b), "different node keys derive different auth ids");
+    assert_eq!(
+        derive_auth_id(&a),
+        derive_auth_id(&a),
+        "same key derives the same auth id"
+    );
+    assert_ne!(
+        derive_auth_id(&a),
+        derive_auth_id(&b),
+        "different node keys derive different auth ids"
+    );
     assert_eq!(derive_auth_id(&a).len(), REALITY_AUTH_ID_LEN);
 }
 
@@ -171,8 +184,12 @@ async fn wrong_auth_id_is_refused() {
     let acceptor = tls_acceptor();
 
     tokio::spawn(async move {
-        let Ok((tcp, _)) = listener.accept().await else { return };
-        let Ok(tls) = acceptor.accept(tcp).await else { return };
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(tls) = acceptor.accept(tcp).await else {
+            return;
+        };
         // Wrong auth → serve() drops the connection without revealing a tunnel.
         serve(tls, node_secret, expected_auth).await;
     });

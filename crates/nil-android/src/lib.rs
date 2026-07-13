@@ -3,7 +3,7 @@
 //! transport with a `socket_hook` that calls `VpnService.protect(fd)` (so the tunnel's own QUIC
 //! to the node bypasses the TUN), then runs [`nil_datapath::Tunnel::up_with_fd`] over the
 //! VpnService-provided TUN fd. Identity never reaches this process — only a node endpoint and an
-//! optional pinned measurement; the unlinkable Privacy Pass token is redeemed in the app process.
+//! optional pinned measurement; the blind-signed Privacy Pass token is redeemed in the app process.
 #![cfg(target_os = "android")]
 
 use std::os::fd::RawFd;
@@ -13,7 +13,9 @@ use jni::objects::{JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jlong, jstring};
 use jni::{JNIEnv, JavaVM};
 
-use nil_core::{AttestExpectation, Grant, Measurement, NodeEndpoint, Tee, TransportKind};
+use nil_core::{
+    AttestExpectation, Grant, Measurement, NodeEndpoint, SevSnpTcbFloor, Tee, TransportKind,
+};
 use nil_datapath::{Tunnel, TunnelConfig};
 use nil_transport::{MasqueConfig, MasqueTransport, Transport};
 
@@ -52,7 +54,15 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     mtu: jint,
     server_name: JString,
     measurement_hex: JString,
+    tls_spki_sha256_hex: JString,
+    transparency_log_key_hex: JString,
     tee_name: JString,
+    min_tcb_present: jboolean,
+    min_tcb_fmc: jint,
+    min_tcb_bootloader: jint,
+    min_tcb_tee: jint,
+    min_tcb_snp: jint,
+    min_tcb_microcode: jint,
     grant_hex: JString,
     grant_nonce_hex: JString,
     allow_unattested: jboolean,
@@ -61,10 +71,73 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     let host = jstr(&mut env, &node_host);
     let sni = jstr(&mut env, &server_name);
     let meas_hex = jstr(&mut env, &measurement_hex);
+    let tls_spki_hex = jstr(&mut env, &tls_spki_sha256_hex);
+    let log_key_hex = jstr(&mut env, &transparency_log_key_hex);
     let tee_name = jstr(&mut env, &tee_name);
     let grant_hex = jstr(&mut env, &grant_hex);
     let grant_nonce_hex = jstr(&mut env, &grant_nonce_hex);
     let allow = allow_unattested != 0;
+    if allow && !cfg!(debug_assertions) {
+        log::error!("allow_unattested is unavailable in release Android builds");
+        return 0;
+    }
+    if tee_name.eq_ignore_ascii_case("tdx") {
+        log::error!(
+            "TDX is unavailable in the Android native bridge until it carries the complete workload policy"
+        );
+        return 0;
+    }
+    let min_tcb_sevsnp = match decode_min_tcb(
+        min_tcb_present != 0,
+        min_tcb_fmc,
+        min_tcb_bootloader,
+        min_tcb_tee,
+        min_tcb_snp,
+        min_tcb_microcode,
+    ) {
+        Some(value) => value,
+        None => {
+            log::error!("invalid SEV-SNP minimum TCB bridge values");
+            return 0;
+        }
+    };
+
+    let tls_spki_sha256 = if tls_spki_hex.trim().is_empty() {
+        None
+    } else {
+        match hex_to_bytes(&tls_spki_hex).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+            Some(digest) => Some(digest),
+            None => {
+                log::error!("TLS SPKI SHA-256 identity must be 32 bytes of hex");
+                return 0;
+            }
+        }
+    };
+
+    // A present key is always parsed strictly. Release engines additionally require it, so a
+    // stale/tampered app-to-service contract cannot silently turn off the transparency proof gate
+    // after the container app cross-checked the embedded trust bundle.
+    let transparency_log_key = if log_key_hex.trim().is_empty() {
+        if !allow && !cfg!(debug_assertions) {
+            log::error!("a transparency-log key is required in release Android builds");
+            return 0;
+        }
+        None
+    } else {
+        match hex_to_bytes(&log_key_hex).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+            Some(key) => Some(key),
+            None => {
+                log::error!("transparency-log key must be 32 bytes of hex");
+                return 0;
+            }
+        }
+    };
+    if allow
+        && (tls_spki_sha256.is_some() || min_tcb_sevsnp.is_some() || transparency_log_key.is_some())
+    {
+        log::error!("attestation policy cannot be paired with allow_unattested");
+        return 0;
+    }
 
     // protect() callback: invoked at the UDP bind site (bind → protect → connect) so the tunnel's
     // own QUIC to the node bypasses the VpnService TUN (no loop).
@@ -91,18 +164,36 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
         false
     });
 
-    let expected = if allow || meas_hex.is_empty() {
+    let expected = if allow {
         None
     } else {
         match hex_to_bytes(&meas_hex) {
-            Some(b) => Some(AttestExpectation {
-                tee: parse_tee(&tee_name),
-                measurement: Measurement(b),
-                min_tcb_sevsnp: None,
-                transparency_log_key: None,
-            }),
-            None => {
-                log::error!("measurement is not valid hex");
+            Some(b) if b.len() == 48 => {
+                let tee = match parse_tee(&tee_name) {
+                    Some(tee) => tee,
+                    None => {
+                        log::error!("unknown TEE name");
+                        return 0;
+                    }
+                };
+                // The JNI contract does not yet carry the complete TDX workload policy. Raw MRTD
+                // is insufficient, so reject before spawning an engine instead of constructing a
+                // policy that can only fail later.
+                if tee == Tee::Tdx {
+                    log::error!("native Android TDX requires the complete workload-policy ABI");
+                    return 0;
+                }
+                Some(AttestExpectation {
+                    tee,
+                    measurement: Measurement(b),
+                    tls_spki_sha256,
+                    min_tcb_sevsnp,
+                    tdx_policy: None,
+                    transparency_log_key,
+                })
+            }
+            _ => {
+                log::error!("measurement must be 48 bytes of hex");
                 return 0;
             }
         }
@@ -120,7 +211,10 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     // here (token + per-connection nonce, both hex). Both present → a real grant the node verifies
     // before accepting CONNECT-IP; both empty → no grant (a dev node that allows ungranted tunnels).
     // A present-but-malformed grant fails closed (returns 0) rather than connecting ungranted.
-    let grant = match (grant_hex.trim().is_empty(), grant_nonce_hex.trim().is_empty()) {
+    let grant = match (
+        grant_hex.trim().is_empty(),
+        grant_nonce_hex.trim().is_empty(),
+    ) {
         (true, true) => None,
         (false, false) => {
             let token = match hex_to_bytes(&grant_hex) {
@@ -196,12 +290,41 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStart(
     Box::into_raw(engine) as jlong
 }
 
-fn parse_tee(s: &str) -> Tee {
+fn parse_tee(s: &str) -> Option<Tee> {
     if s.eq_ignore_ascii_case("tdx") {
-        Tee::Tdx
+        Some(Tee::Tdx)
+    } else if s.eq_ignore_ascii_case("sev-snp") {
+        Some(Tee::SevSnp)
     } else {
-        Tee::SevSnp
+        None
     }
+}
+
+/// `None` is malformed input; `Some(None)` is a deliberately absent policy. JNI uses `-1` as the
+/// no-FMC sentinel because FMC does not exist on pre-Turin processors.
+fn decode_min_tcb(
+    present: bool,
+    fmc: jint,
+    bootloader: jint,
+    tee: jint,
+    snp: jint,
+    microcode: jint,
+) -> Option<Option<SevSnpTcbFloor>> {
+    if !present {
+        return Some(None);
+    }
+    let fmc = match fmc {
+        -1 => None,
+        0..=255 => Some(fmc as u8),
+        _ => return None,
+    };
+    Some(Some(SevSnpTcbFloor {
+        fmc,
+        bootloader: u8::try_from(bootloader).ok()?,
+        tee: u8::try_from(tee).ok()?,
+        snp: u8::try_from(snp).ok()?,
+        microcode: u8::try_from(microcode).ok()?,
+    }))
 }
 
 /// Tear the tunnel down and free the engine. Idempotent on a 0 handle.
@@ -217,7 +340,7 @@ pub extern "system" fn Java_com_nilvpn_NilNative_nativeStop(
     // SAFETY: `handle` is the Box<Engine> pointer returned by nativeStart; Kotlin calls this once.
     let engine = unsafe { Box::from_raw(handle as *mut Engine) };
     if let Ok(mut guard) = engine.tunnel.lock() {
-        if let Some(tunnel) = guard.take() {
+        if let Some(mut tunnel) = guard.take() {
             let _ = engine.rt.block_on(tunnel.down());
         }
     }

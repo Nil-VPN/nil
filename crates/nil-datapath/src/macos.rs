@@ -1,6 +1,7 @@
 //! macOS routing / kill-switch / DNS via `route`, `pfctl`, and `networksetup`.
 //!
-//! Verified in a macOS VM (the host stays untouched). Ordering matches the Linux path:
+//! Designed for privileged macOS VM validation (the development host must stay untouched).
+//! Ordering matches the Linux path:
 //! pin the node route and arm the kill-switch *before* flipping the default route, and
 //! disarm the kill-switch *last* on teardown — so there is never a leak window.
 //!
@@ -12,49 +13,52 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 
-use crate::{ArmParams, NetControl};
+use crate::{ArmParams, CleanupErrors, NetControl};
 
 #[derive(Default)]
 pub struct MacNet {
     armed: bool,
-    node_ip: Option<IpAddr>,
-    tun_name: Option<String>,
-    kill_switch: bool,
     pf_was_enabled: bool,
+    pf_touched: bool,
     dns_service: Option<String>,
     dns_backup: Option<Vec<String>>,
-    /// Extra node IPs host-route-excepted (cascade fallback nodes), to clean up on teardown.
-    also_except: Vec<IpAddr>,
+    dns_touched: bool,
+    low_default_added: bool,
+    high_default_added: bool,
+    /// Host routes that this instance actually added. Pre-existing routes are never deleted.
+    pinned_routes: Vec<IpAddr>,
 }
 
 impl NetControl for MacNet {
     fn arm(&mut self, p: &ArmParams) -> anyhow::Result<()> {
-        self.node_ip = Some(p.node_ip);
-        self.tun_name = Some(p.tun_name.clone());
+        if self.armed {
+            anyhow::bail!("macOS datapath is already armed or still requires rollback");
+        }
+        // Roll back even if route/PF setup fails before the final success marker.
+        self.armed = true;
 
         // 1. Capture the original default route.
         let (gw, ifc) = capture_default()?;
 
         // 2. Pin the node via the original gateway so the tunnel's QUIC bypasses the TUN
         //    (best-effort: an on-link node is already covered by the connected route).
-        if let Err(e) = sh(
+        match sh(
             "route",
             &["-n", "add", "-host", &p.node_ip.to_string(), &gw],
         ) {
-            tracing::warn!("pin node route (continuing; may be on-link): {e}");
+            Ok(()) => self.pinned_routes.push(p.node_ip),
+            Err(e) => tracing::warn!("pin node route (continuing; may be on-link): {e}"),
         }
         // Pin any cascade fallback nodes too, so their traffic also bypasses the TUN.
         for ip in &p.also_except {
-            if let Err(e) = sh("route", &["-n", "add", "-host", &ip.to_string(), &gw]) {
-                tracing::warn!("pin fallback node route (continuing): {e}");
+            match sh("route", &["-n", "add", "-host", &ip.to_string(), &gw]) {
+                Ok(()) => self.pinned_routes.push(*ip),
+                Err(e) => tracing::warn!("pin fallback node route (continuing): {e}"),
             }
         }
-        self.also_except = p.also_except.clone();
-
         // 3. Arm the kill-switch BEFORE flipping the default route.
         if p.kill_switch {
             self.arm_pf(p.node_ip, &p.also_except, &p.tun_name)?;
-            self.kill_switch = true;
         }
 
         // 4. Route all traffic through the TUN via two /1 routes (leaves the real default
@@ -63,6 +67,7 @@ impl NetControl for MacNet {
             "route",
             &["-n", "add", "-net", "0.0.0.0/1", "-interface", &p.tun_name],
         )?;
+        self.low_default_added = true;
         sh(
             "route",
             &[
@@ -74,54 +79,100 @@ impl NetControl for MacNet {
                 &p.tun_name,
             ],
         )?;
+        self.high_default_added = true;
 
         // 5. Point DNS at the tunnel resolver(s).
         if !p.dns.is_empty() {
             if let Some(service) = primary_service(&ifc) {
-                self.dns_backup = Some(get_dns(&service));
+                self.dns_backup = Some(get_dns(&service)?);
+                self.dns_service = Some(service.clone());
                 let dns: Vec<String> = p.dns.iter().map(|d| d.to_string()).collect();
-                if let Err(e) = set_dns(&service, &dns) {
-                    tracing::warn!("set tunnel DNS: {e}");
-                }
-                self.dns_service = Some(service);
+                // Record before the mutating command: networksetup may change one resolver before
+                // returning an error, and that partial write must still be restored.
+                self.dns_touched = true;
+                set_dns(&service, &dns)?;
             } else {
                 tracing::warn!("could not find a network service for {ifc}; DNS not changed");
             }
         }
 
-        self.armed = true;
         tracing::info!(tun = %p.tun_name, kill_switch = p.kill_switch, "macOS datapath armed");
         Ok(())
     }
 
-    fn teardown(&mut self) {
+    fn teardown(&mut self) -> anyhow::Result<()> {
         if !self.armed {
-            return;
+            return Ok(());
         }
+        let mut errors = CleanupErrors::default();
+
         // Restore DNS.
-        if let (Some(service), Some(backup)) = (self.dns_service.clone(), self.dns_backup.clone()) {
-            let _ = restore_dns(&service, &backup);
-            let _ = flush_dns();
-        }
-        // Remove our default routes.
-        let _ = sh("route", &["-n", "delete", "-net", "0.0.0.0/1"]);
-        let _ = sh("route", &["-n", "delete", "-net", "128.0.0.0/1"]);
-        // Remove the pinned node route(s).
-        if let Some(ip) = self.node_ip {
-            let _ = sh("route", &["-n", "delete", "-host", &ip.to_string()]);
-        }
-        for ip in &self.also_except {
-            let _ = sh("route", &["-n", "delete", "-host", &ip.to_string()]);
-        }
-        // Disarm the kill-switch LAST (connectivity only returns once routes/DNS are sane).
-        if self.kill_switch {
-            let _ = sh("pfctl", &["-a", PF_ANCHOR, "-F", "all"]);
-            if !self.pf_was_enabled {
-                let _ = sh("pfctl", &["-d"]);
+        if self.dns_touched {
+            let restored = match (self.dns_service.as_deref(), self.dns_backup.as_deref()) {
+                (Some(service), Some(backup)) => {
+                    errors.attempt("restore DNS", restore_dns(service, backup))
+                }
+                _ => errors.attempt("restore DNS", Err(anyhow::anyhow!("backup is missing"))),
+            };
+            if restored {
+                self.dns_touched = false;
+                if let Err(error) = flush_dns() {
+                    tracing::warn!("flush restored DNS cache: {error:#}");
+                }
             }
         }
-        self.armed = false;
-        tracing::info!("macOS datapath torn down; networking restored");
+
+        if self.high_default_added
+            && errors.attempt(
+                "remove upper tunnel route",
+                sh("route", &["-n", "delete", "-net", "128.0.0.0/1"]),
+            )
+        {
+            self.high_default_added = false;
+        }
+        if self.low_default_added
+            && errors.attempt(
+                "remove lower tunnel route",
+                sh("route", &["-n", "delete", "-net", "0.0.0.0/1"]),
+            )
+        {
+            self.low_default_added = false;
+        }
+
+        let mut failed_routes = Vec::new();
+        for ip in self.pinned_routes.drain(..) {
+            if !errors.attempt(
+                "remove pinned node route",
+                sh("route", &["-n", "delete", "-host", &ip.to_string()]),
+            ) {
+                failed_routes.push(ip);
+            }
+        }
+        self.pinned_routes = failed_routes;
+
+        // Release PF only after every route and DNS mutation is known restored. A failed cleanup
+        // deliberately leaves the anchor active, producing an obvious blackhole instead of a leak.
+        if errors.is_empty()
+            && self.pf_touched
+            && errors.attempt(
+                "flush NIL PF anchor",
+                sh("pfctl", &["-a", PF_ANCHOR, "-F", "all"]),
+            )
+            && (self.pf_was_enabled
+                || errors.attempt("restore disabled PF state", sh("pfctl", &["-d"])))
+        {
+            self.pf_touched = false;
+        }
+
+        self.armed = self.dns_touched
+            || self.low_default_added
+            || self.high_default_added
+            || !self.pinned_routes.is_empty()
+            || self.pf_touched;
+        if !self.armed {
+            tracing::info!("macOS datapath torn down; networking restored");
+        }
+        errors.finish()
     }
 }
 
@@ -130,12 +181,12 @@ impl MacNet {
         // macOS's default pf.conf evaluates `com.apple/*`; use a private child anchor under it
         // so we do not replace or snapshot the host ruleset. If an operator removed that root
         // anchor, fail closed instead of loading inert rules.
-        let root = Command::new("pfctl").args(["-sr"]).output()?;
+        let root = output("pfctl", &["-sr"])?;
         let root_rules = String::from_utf8_lossy(&root.stdout);
         if !root_rules.contains("anchor \"com.apple/*\"") {
             anyhow::bail!("macOS pf root ruleset does not evaluate com.apple/* anchors");
         }
-        let info = Command::new("pfctl").args(["-s", "info"]).output()?;
+        let info = output("pfctl", &["-s", "info"])?;
         self.pf_was_enabled = String::from_utf8_lossy(&info.stdout).contains("Status: Enabled");
 
         let node = node_ip.to_string();
@@ -160,6 +211,8 @@ impl MacNet {
         // but ALL other v6 egress is dropped wholesale — no dual-stack leak. Loopback v6 is exempt
         // via `set skip on lo0`. Placed last so it cannot shadow an intended v6 pass.
         rules.push_str("block drop quick inet6 all\n");
+        // The anchor may be partially changed even if spawn/write/wait later reports an error.
+        self.pf_touched = true;
         let mut child = Command::new("pfctl")
             .args(["-a", PF_ANCHOR, "-f", "-"])
             .stdin(Stdio::piped())
@@ -173,8 +226,15 @@ impl MacNet {
         if !child.wait()?.success() {
             anyhow::bail!("pfctl failed to load kill-switch ruleset");
         }
-        // Enable pf (best-effort: errors if already enabled).
-        let _ = sh("pfctl", &["-e"]);
+        // Enable pf and verify the kernel reports it enabled. A loaded anchor with PF disabled is
+        // not a kill-switch and must never be reported as a successful arm.
+        if !self.pf_was_enabled {
+            sh("pfctl", &["-e"])?;
+        }
+        let info = output("pfctl", &["-s", "info"])?;
+        if !String::from_utf8_lossy(&info.stdout).contains("Status: Enabled") {
+            anyhow::bail!("pfctl rules loaded but PF is not enabled");
+        }
         Ok(())
     }
 }
@@ -182,9 +242,7 @@ impl MacNet {
 const PF_ANCHOR: &str = "com.apple/nilvpn";
 
 fn capture_default() -> anyhow::Result<(String, String)> {
-    let out = Command::new("route")
-        .args(["-n", "get", "default"])
-        .output()?;
+    let out = output("route", &["-n", "get", "default"])?;
     let s = String::from_utf8_lossy(&out.stdout);
     let gw = field_after(&s, "gateway:").ok_or_else(|| anyhow::anyhow!("no default gateway"))?;
     let ifc =
@@ -216,23 +274,24 @@ fn primary_service(ifc: &str) -> Option<String> {
     None
 }
 
-fn get_dns(service: &str) -> Vec<String> {
-    let out = match Command::new("networksetup")
-        .args(["-getdnsservers", service])
-        .output()
-    {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
+fn get_dns(service: &str) -> anyhow::Result<Vec<String>> {
+    let out = output("networksetup", &["-getdnsservers", service])?;
     let s = String::from_utf8_lossy(&out.stdout);
     if s.contains("aren't any") {
-        return Vec::new(); // empty sentinel → restore as DHCP-provided
+        return Ok(Vec::new()); // empty sentinel → restore as DHCP-provided
     }
-    s.lines()
+    let servers: Vec<String> = s
+        .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && l.parse::<IpAddr>().is_ok())
         .map(String::from)
-        .collect()
+        .collect();
+    if servers.is_empty() && !s.trim().is_empty() {
+        anyhow::bail!(
+            "networksetup returned an unrecognized DNS configuration; refusing a lossy backup"
+        );
+    }
+    Ok(servers)
 }
 
 fn set_dns(service: &str, dns: &[String]) -> anyhow::Result<()> {
@@ -258,6 +317,23 @@ fn field_after(s: &str, key: &str) -> Option<String> {
     s.lines()
         .find_map(|l| l.trim().strip_prefix(key))
         .map(|v| v.trim().to_string())
+}
+
+fn output(cmd: &str, args: &[&str]) -> anyhow::Result<std::process::Output> {
+    tracing::debug!("$ {cmd} {}", args.join(" "));
+    let out = Command::new(cmd)
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("spawn {cmd}: {e}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "`{cmd} {}` exited with {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(out)
 }
 
 fn sh(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
