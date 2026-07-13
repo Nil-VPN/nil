@@ -29,17 +29,22 @@ NODE_HOST="${NW_NODE_HOST:-}"
 NODE_PORT="${NW_NODE_PORT:-443}"
 MEAS="${NW_EXPECTED_MEASUREMENT:-}"
 EGRESS_URL="${NW_E2E_EGRESS_URL:-https://api.ipify.org}"
-BIN="$ROOT/target/release/nil-client-e2e"
+# Optimized local-integration profile: release-like performance with debug assertions, which keep
+# the explicitly labelled loopback/direct E2E paths available. A true release client compiles those
+# paths out and must never be used for the local subscription leg below.
+BIN="$ROOT/target/e2e/nil-client-e2e"
+PORTAL_BIN="$ROOT/target/e2e/nil-portal"
 
-# Subscription e2e mode (NW_SUBSCRIBE=1): exercise the merged subscribe -> activate -> mint-on-demand
+# Subscription e2e mode (NW_SUBSCRIBE=1): exercise subscribe -> activate -> batch prefetch
 # -> connect -> re-login -> reconnect flow on the REAL macOS engine, against a LOCAL mock-paid portal
 # (the live Portal doesn't yet carry the subscription endpoints). Loopback connect, so NO root, NO
 # node, NO comp-id. Proves the subscription path on macOS with one command, fully headless.
 if [ "${NW_SUBSCRIBE:-0}" = "1" ]; then
   echo "== NIL macOS subscription e2e (local mock-paid portal, loopback connect) =="
-  ( cd "$ROOT" && cargo build --release --bin nil-client-e2e --bin nil-portal ) || { echo "FAIL: build"; exit 1; }
+  ( cd "$ROOT" && cargo build --profile e2e --bin nil-client-e2e --bin nil-portal ) || { echo "FAIL: build"; exit 1; }
   SUB_PORT="${NW_SUB_PORT:-8088}"
-  NW_MOCK_PAID_ALL=1 NW_PORTAL_ADDR="127.0.0.1:$SUB_PORT" RUST_LOG=warn "$ROOT/target/release/nil-portal" \
+  NW_ALLOW_DEV_FALLBACKS=1 NW_MOCK_PAID_ALL=1 \
+    NW_PORTAL_ADDR="127.0.0.1:$SUB_PORT" RUST_LOG=warn "$PORTAL_BIN" \
     >"${TMPDIR:-/tmp}/nil-sub-portal.$$.log" 2>&1 &
   SUB_PORTAL_PID=$!
   trap '[ -n "${SUB_PORTAL_PID:-}" ] && kill "$SUB_PORTAL_PID" 2>/dev/null' EXIT
@@ -51,10 +56,10 @@ if [ "${NW_SUBSCRIBE:-0}" = "1" ]; then
   printf '%s\n' "$OUT"
   echo "------------------------------------------------------------"
   if [ $RC -eq 0 ] \
-     && printf '%s' "$OUT" | grep -q '^MINT-ON-DEMAND-OK' \
+     && printf '%s' "$OUT" | grep -q '^BATCH-PREFETCH-OK count=8' \
      && printf '%s' "$OUT" | grep -q '^RELOGIN-RECONNECT-OK' \
      && printf '%s' "$OUT" | grep -q '^E2E-OK'; then
-    echo "PASS ✅  macOS subscription e2e: subscribe -> activate -> mint-on-demand -> connect -> re-login -> reconnect (no new payment)."
+    echo "PASS ✅  macOS subscription e2e: subscribe -> activate -> batch prefetch -> connect -> re-login -> prefetch (no new payment)."
     exit 0
   fi
   echo "FAIL ❌  macOS subscription e2e (rc=$RC)"
@@ -85,8 +90,8 @@ fi
 # pin and look like an attestation bypass when it is really just old code. Set NW_E2E_NO_REBUILD=1
 # only to deliberately test an already-built binary.
 if [ "${NW_E2E_NO_REBUILD:-0}" != "1" ] || [ ! -x "$BIN" ]; then
-  echo "building nil-client-e2e (release) from the current checkout…"
-  ( cd "$ROOT" && cargo build --release --bin nil-client-e2e ) \
+  echo "building nil-client-e2e (optimized e2e profile) from the current checkout…"
+  ( cd "$ROOT" && cargo build --profile e2e --bin nil-client-e2e ) \
     || { echo "FAIL: cargo build"; exit 1; }
 fi
 

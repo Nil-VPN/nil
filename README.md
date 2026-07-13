@@ -2,77 +2,100 @@
 
 > *"What do we have on you? Nil."*
 
-A privacy-first VPN. **Lawful by posture, empty by design**: a US-based operator that
-complies with valid legal process, but is engineered so that nothing identifying
-*exists* to produce.
+NIL is an experimental privacy-first VPN. Its goal is to minimize application-controlled
+persistent data and separate account/payment activity from tunnel authorization. A VPN still
+**moves trust** from the local network and ISP to the VPN path; it is not anonymity and does not
+defeat endpoint identification or a global observer.
 
-**Honest scope:** a VPN hides your traffic from your local network and ISP and resists
-DPI fingerprinting. It is **not** anonymity — a logged-in account deanonymizes you
-regardless of any VPN, and a global passive adversary watching both ends is out of
-scope (that is a mixnet's job). We say so plainly, in the product and in the code.
+> **Status: engineering alpha, not production-ready.** The code contains the security boundaries
+> described below and exercises many of them in unit and synthetic integration tests. A live
+> multi-operator service, real-TEE deployment, native mobile multi-hop path, and complete signed
+> release-to-runtime evidence chain have not been validated.
 
-## The four pillars
-1. **Resistance-first transport cascade** — MASQUE/QUIC (RFC 9484 CONNECT-IP) is the
-   primary transport: it looks like ordinary HTTPS/QUIC on UDP 443. If MASQUE is blocked,
-   the cascade falls back through AmneziaWG → wstunnel → REALITY in that order. Raw
-   WireGuard (the 148/92-byte handshake fingerprint) is never exposed directly; every
-   transport lives behind the `Transport` trait in `nil-transport`.
-2. **Verifiable trust via TEE attestation** — the client verifies a node's SEV-SNP/TDX
-   report (RA-TLS) against a pinned measurement before any packet flows.
-3. **Trust-split multi-hop** across legally independent operators/jurisdictions.
-4. **Unlinkable payments** — Privacy Pass blind tokens (RFC 9578), issuer and verifier
-   kept in separate trust domains, plus self-hosted Monero.
+## Design pillars and current boundary
+
+1. **Censorship-resistant transport.** Production-profile artifacts contain the attested
+   MASQUE/QUIC CONNECT-IP path. AmneziaWG, wstunnel, REALITY, automatic selection, direct-node
+   mode, and loopback are development capabilities; compile guards exclude them from builds
+   without debug assertions until they enforce the same grant and attestation contract.
+2. **Verifiable trust.** Release clients cannot be built without an embedded bundle of accepted
+   issuer keys, node measurements, and a transparency-log key. The MASQUE path appraises a fresh
+   SEV-SNP/TDX report before accepting a hop. This logic is test-covered, but has not yet been
+   proven against NIL's own live TEE fleet, and the guest measurement is not yet a complete binding
+   to the dynamically launched `nil-node` artifact.
+3. **Trust-split multi-hop.** Builds without debug assertions reject paths shorter than two hops.
+   The nested path is exercised with synthetic attestation in Docker; operation across genuinely
+   independent companies, jurisdictions, and hardware has not yet been demonstrated.
+4. **Payment/session separation.** The Portal blind-signs Privacy Pass credentials and the
+   Coordinator verifies them without receiving an account number. Subscription clients prefetch a
+   small batch at a randomized time and Connect spends only a locally stored pass. Blinding blocks
+   a direct cryptographic issuance-to-redemption join; timing, network metadata, a small user set,
+   and external payment records can still correlate events.
+
+## Implemented account and client model
+
+- The client generates a standard checksummed 12-word BIP39 phrase from 128 bits of OS entropy and
+  derives the account identifier and Ed25519 authentication key locally.
+- Registration sends only the 32-byte account identifier, public authentication key, and a proof
+  of possession. The Portal never receives or returns the phrase, and there is no server recovery
+  endpoint or separate recovery code.
+- The Portal account record contains only the stable account identifier, entitlement/expiry, and
+  public authentication key. The identifier is pseudonymous, not proof of a real-world identity,
+  but it links that account's authenticated Portal operations.
+- The client stores its auth seed and bearer passes in one encrypted vault protected by Apple
+  Keychain, Android Keystore, Windows DPAPI, or Linux Secret Service. The recovery phrase is not
+  cached.
+- Subscription refill targets eight passes, refills at or below three, waits a random 30–300
+  seconds after a hint, and also wakes on a random 3–6 hour interval. One authenticated request
+  carries a bounded batch (at most 16) whose messages share an hourly rounded, roughly one-day
+  expiry; Connect never contacts the issuer.
 
 ## Workspace map
+
 | Crate | Plane | Role |
 |---|---|---|
-| `nil-core` | — | shared domain types, errors (no I/O) |
-| `nil-proto` | — | wire formats / API DTOs (serde) |
-| `nil-crypto` | — | account derivation; PQ PSK + RA-TLS helpers (later phases) |
-| `nil-transport` | data | the `Transport` trait + pluggable impls (MASQUE/QUIC default; AmneziaWG + wstunnel cascade; loopback for dev) |
-| `nil-attest` | control/user | SEV-SNP/TDX report parse + appraisal (Phase 2) |
-| `nil-portal` | business | Axum REST: accounts, billing, Privacy Pass issuer |
-| `nil-coordinator` | control | node registry, path selection, token *verifier* |
-| `nil-node` | data | MASQUE datapath, RA-TLS, entry/middle/exit roles |
-| `client/` | user | Tauri v2 desktop+mobile app (reuses the shared crates) |
+| `nil-core` | shared | domain types, grants, durable primitives, and network-policy helpers |
+| `nil-proto` | shared | wire/API DTOs |
+| `nil-crypto` | shared | account derivation, blind tokens, PQ helpers, and transparency proofs |
+| `nil-attest` | user/data | SEV-SNP/TDX evidence parsing and appraisal |
+| `nil-transport` | data | transport seam; production MASQUE plus development-only alternatives |
+| `nil-datapath` | user | TUN, routing, DNS, kill-switch, redemption, and multi-hop assembly |
+| `nil-portal` | business | accounts, subscriptions, payment confirmation, and token issuer |
+| `nil-coordinator` | control | token verifier, atomic nullifier/encrypted retry ledger, registry, grants, and path selection |
+| `nil-node` | data | authorized MASQUE datapath and entry/middle/exit roles |
+| `client/` | user | Tauri/React client and native platform bridges |
 
-## Status: single-hop attested MASQUE (closed alpha)
-The default transport is a **real attested MASQUE/QUIC tunnel**: the client redeems an
-unlinkable Privacy Pass token at the Coordinator, verifies each node's TEE attestation
-report against the pinned measurement, and only then lets packets flow (no proof →
-kill-switch holds → no traffic). This datapath is wired end to end and exercised on
-Linux, macOS, and Android; the desktop and Android in-app Connect drive it directly, and
-an AmneziaWG → wstunnel obfuscation cascade backs up the primary MASQUE rung.
+## Release versus development
 
-**Honest about what's still alpha:**
-- **Single-hop**, not yet trust-split — one node sees both your IP and your destination.
-  Multi-hop across legally independent operators is the next milestone.
-- **iOS** has the native `PacketTunnelProvider` engine in-tree but is not yet verified on
-  a real device; some platform paths (e.g. the packaged iOS datapath) remain unproven.
-- **Attestation caveat (TEE.Fail, Oct 2025):** an attacker with physical memory access to
-  a node could forge a report. Vendor/jurisdiction diversity across hops is the mitigation;
-  the single-hop alpha does not yet have it.
-- With no Coordinator configured, the client falls back to an in-memory loopback transport
-  (no real tunnel) so the engine/state machine can be exercised in dev — the UI says so,
-  so it never reads as protection it isn't providing.
-- **Automatic transport probing and cascade selection are not yet implemented.** The active
-  rung is operator-configured; the client does not yet probe the network and auto-select the
-  hardest-to-block transport that works.
+- Release desktop code accepts only an HTTPS Coordinator path, requires a prefetched pass and
+  embedded trust roots, and rejects one-hop, direct, loopback, synthetic-attestation, diagnostic,
+  and alternate-fallback modes.
+- The Android, iOS, and macOS network-extension engines currently support one hop. Packaged builds
+  therefore refuse to connect before consuming a pass until native multi-hop is implemented.
+- Debug and the reviewed `e2e` profile retain local loopback, direct/single-hop, synthetic, and
+  alternate-transport harnesses. Their success is development evidence, not a production claim.
 
-## Build & verify
+## Build and verify
+
 ```bash
-cargo build --workspace && cargo test --workspace   # green = workspace builds + tests pass
-cargo deny check                                     # supply-chain gate
+cargo build --workspace --locked
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo deny check
 
-# anonymous signup smoke test (Business plane)
-cargo run -p nil-portal &                            # http://127.0.0.1:8080
-curl -s -X POST http://127.0.0.1:8080/v1/account \
-  -H 'content-type: application/json' -d '{"type":"anonymous"}'
-# → { "account_number": "...", "recovery_phrase": [7 words], "recovery_code": "..." }
-
-# client
-cd client && pnpm install && pnpm tauri dev
+pnpm --dir client install --frozen-lockfile
+pnpm --dir client build
+pnpm --dir client test
 ```
 
+Account creation is intentionally client-driven; the old bare `POST /v1/account` example is not a
+valid signup flow because recovery material must never be generated by the Portal.
+
+## Canonical documentation
+
+- [Retained data](RETAINED_DATA.md) and [threat model](THREAT_MODEL.md) — scoped data inventory and
+  adversary limits.
+
 ## License
+
 AGPL-3.0-or-later. See [LICENSE](LICENSE).

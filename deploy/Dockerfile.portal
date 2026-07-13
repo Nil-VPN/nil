@@ -1,12 +1,12 @@
 # Builds nil-portal (Business plane: Privacy Pass issuer + PII-free accounts) as a PUBLIC,
 # signed, digest-pinned production image (ghcr.io/nil-vpn/nil-portal).
 #
-# Default build: file-backed durable account store, rustls TLS for the Monero wallet client,
-# NO database driver, no card-payments HMAC deps. To opt in later, add the matching feature to
-# the cargo build below:
+# Production build: file-backed durable account store, rustls TLS for the Monero wallet client,
+# and the mandatory PKCS#11 HSM issuer backend. The RSA issuer private key is never built or mounted
+# into this image. Optional data/payment features can be added to the cargo build below:
 #   --features postgres        clustered Postgres account store; set NW_PORTAL_PG_URL
 #                              (loopback / TLS-connected only — see crates/nil-portal/src/store/postgres.rs)
-#   --features card-payments   Merchant-of-Record webhook rail (Monero stays the unlinkable one)
+#   --features card-payments   Merchant-of-Record webhook rail (Monero avoids cardholder data)
 #
 # Bases are digest-pinned + --platform=linux/amd64 to match deploy/Dockerfile.node /
 # deploy/Dockerfile.repro, so the whole service fleet shares ONE attestable base and a floating-tag
@@ -23,9 +23,13 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     TZ=UTC \
     RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
-COPY . .
-# `--locked` pins the committed Cargo.lock. Default features only (see header to opt in).
-RUN cargo build --release --locked -p nil-portal \
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY client/src-tauri/ ./client/src-tauri/
+COPY client/trust/ ./client/trust/
+# `--locked` pins the committed Cargo.lock. `hsm` is mandatory for the production image; release
+# startup additionally rejects a software issuer even though debug builds retain it for tests.
+RUN cargo build --release --locked -p nil-portal --features hsm \
  && cp target/release/nil-portal /nil-portal
 
 FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
@@ -34,11 +38,16 @@ FROM --platform=linux/amd64 debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl && rm -rf /var/lib/apt/lists/*
 # Non-root (PD-7: even we cannot betray you — no admin/shell path inside). Fixed uid/gid so a
-# mounted state volume keeps stable ownership across rebuilds.
+# mounted state volume keeps stable ownership across rebuilds. The empty legacy fence seeds a
+# brand-new Docker named volume; Docker does not overwrite a non-empty volume during upgrade, so
+# existing pre-atomic activation entries survive.
 RUN groupadd --gid 10001 nil \
  && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin nil \
  && mkdir -p /var/lib/nil-portal \
- && chown nil:nil /var/lib/nil-portal
+ && install -d -o root -g root -m 0555 /opt/nil/pkcs11 \
+ && chown nil:nil /var/lib/nil-portal \
+ && install -o nil -g nil -m 0400 /dev/null /var/lib/nil-portal/issued.log \
+ && install -o nil -g nil -m 0400 /dev/null /var/lib/nil-portal/subscription-activated-legacy.log
 COPY --from=builder /nil-portal /usr/local/bin/nil-portal
 USER nil:nil
 # Plain HTTP — the Caddy proxy terminates TLS in front of this. Default bind 127.0.0.1:8080

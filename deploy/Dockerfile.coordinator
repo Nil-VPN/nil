@@ -19,7 +19,10 @@ ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
     TZ=UTC \
     RUSTFLAGS="--remap-path-prefix=/build=/src --remap-path-prefix=/usr/local/cargo=/cargo -Clink-arg=-Wl,--build-id=none"
 WORKDIR /build
-COPY . .
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates/ ./crates/
+COPY client/src-tauri/ ./client/src-tauri/
+COPY client/trust/ ./client/trust/
 # `--locked` pins the committed Cargo.lock.
 RUN cargo build --release --locked -p nil-coordinator \
  && cp target/release/nil-coordinator /nil-coordinator

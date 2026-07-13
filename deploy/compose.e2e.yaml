@@ -1,19 +1,23 @@
 # Host-safe FULL-STACK end-to-end verification: the whole pipeline on one private bridge —
-# nil-portal (issues an unlinkable Privacy Pass token) → nil-coordinator (verifies the token,
+# nil-portal (blind-signs a Privacy Pass token) → nil-coordinator (verifies the token,
 # enforces single-use, selects a trust-split path) → the datapath (brings up the 3-hop attested
 # MASQUE onion using the granted path) → real traffic. deploy/verify-e2e.sh drives it. Nothing
 # touches the host network.
 #
 # The Portal and Coordinator are deliberately SEPARATE services (Pillar 4: issuer ≠ verifier).
 # The Coordinator runs as `sleep infinity` and the script starts nil-coordinator via exec, once
-# it has read the Portal's issuer public key from the Portal log and written the node registry —
-# so the committed compose bakes no key. All three planes share the image (deploy/Dockerfile.e2e).
+# it has read the Portal's issuer public key from the Portal log and written the node registry.
+# The committed node configuration contains only the RFC 8032 test PUBLIC key; verify-e2e.sh
+# injects the matching test seed into the Coordinator. These public test vectors are E2E-only.
+# All three planes share the image (deploy/Dockerfile.e2e).
 
 x-node-base: &node-base
   build:
     context: ..
     dockerfile: deploy/Dockerfile.e2e
-  command: ["nil-node"]
+  # Generate a per-container stable key before node startup. The harness reads only the public
+  # SPKI digest into its runtime registry; the private key never leaves the node container.
+  command: ["sh", "-ec", "nil-node tls-keygen /tmp/node-tls-key.pem > /tmp/tls-meta; exec env NW_NODE_TLS_KEY_FILE=/tmp/node-tls-key.pem nil-node"]
   cap_add: ["NET_ADMIN"]
   devices: ["/dev/net/tun"]
   sysctls:
@@ -32,14 +36,15 @@ services:
     command: ["nil-portal"]
     environment:
       - NW_PORTAL_ADDR=0.0.0.0:8080
+      - NW_ALLOW_DEV_FALLBACKS=1
       - NW_MOCK_PAID_ALL=1
       - RUST_LOG=info,nil_portal=debug
     networks:
       nilnet:
         ipv4_address: 10.82.0.5
 
-  # Control plane: verifies tokens (Portal's PUBLIC key only), keeps the spent-token nullifier,
-  # selects an operator/jurisdiction-diverse path. Started by the script via exec.
+  # Control plane: verifies tokens (Portal's PUBLIC key only), keeps the permanent nullifier plus
+  # encrypted grant-lifetime retry result, and selects a diverse path. Started via exec.
   coordinator:
     build:
       context: ..
@@ -56,11 +61,13 @@ services:
     <<: *node-base
     environment:
       - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_ID=entry
       - NW_NODE_EGRESS=eth0
       - NW_NODE_ROLE=entry
       - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
       - NW_NODE_TEE=sev-snp
-      - NW_ALLOW_UNGRANTED=1
+      - NW_GRANT_REALM=nil-e2e
+      - NW_GRANT_VERIFY_KEYS=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
       - RUST_LOG=info,nil_node=debug
     networks:
       nilnet:
@@ -70,11 +77,13 @@ services:
     <<: *node-base
     environment:
       - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_ID=middle
       - NW_NODE_EGRESS=eth0
       - NW_NODE_ROLE=middle
       - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
       - NW_NODE_TEE=sev-snp
-      - NW_ALLOW_UNGRANTED=1
+      - NW_GRANT_REALM=nil-e2e
+      - NW_GRANT_VERIFY_KEYS=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
       - RUST_LOG=info,nil_node=debug
     networks:
       nilnet:
@@ -84,11 +93,13 @@ services:
     <<: *node-base
     environment:
       - NW_NODE_BIND=0.0.0.0:443
+      - NW_NODE_ID=exit
       - NW_NODE_EGRESS=eth0
       - NW_NODE_ROLE=exit
       - NW_NODE_MEASUREMENT=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f
       - NW_NODE_TEE=sev-snp
-      - NW_ALLOW_UNGRANTED=1
+      - NW_GRANT_REALM=nil-e2e
+      - NW_GRANT_VERIFY_KEYS=d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
       - RUST_LOG=info,nil_node=debug
     networks:
       nilnet:

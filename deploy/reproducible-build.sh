@@ -9,6 +9,12 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+OUTPUT=""
+if [ "${1:-}" = "--output" ]; then
+  OUTPUT="${2:-}"
+  [ -n "$OUTPUT" ] || { echo "--output requires a path"; exit 2; }
+fi
+
 SDE=$(git log -1 --pretty=%ct 2>/dev/null || echo 0)
 echo "==> SOURCE_DATE_EPOCH=$SDE (commit time)"
 
@@ -25,6 +31,17 @@ echo "  A: ${A:-<none>}"
 echo "  B: ${B:-<none>}"
 
 if [ -n "$A" ] && [ "$A" = "$B" ]; then
+  if [ -n "$OUTPUT" ]; then
+    mkdir -p "$(dirname "$OUTPUT")"
+    docker run --rm --entrypoint cat nil-node-repro:a /nil-node > "$OUTPUT" || {
+      echo "could not extract reproducible nil-node"; exit 1;
+    }
+    GOT=$(sha256sum "$OUTPUT" | awk '{print $1}')
+    [ "$GOT" = "$A" ] || {
+      echo "extracted nil-node hash $GOT does not match $A"; exit 1;
+    }
+    echo "ARTIFACT=$OUTPUT"
+  fi
   echo "MEASUREMENT=$A"
   echo "RESULT: nil-node build is reproducible ✅"
   exit 0

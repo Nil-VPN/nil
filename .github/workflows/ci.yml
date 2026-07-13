@@ -7,6 +7,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 permissions:
   contents: read
@@ -22,10 +23,58 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Public claims are part of the security boundary (a VPN is not anonymity; be honest about
+      # limits). These exact phrases describe superseded account, connect-time minting, one-hop
+      # release, fallback, and validation claims. Keep this deliberately small and high-signal.
+      - name: Public documentation claim-drift guard
+        shell: bash
+        run: |
+          canonical=(
+            README.md THREAT_MODEL.md RELEASE.md RETAINED_DATA.md
+            deploy/IMAGES.md
+            deploy/PROXY-PRIVACY.md
+            deploy/monitoring/README.md client/trust/README.md
+            crates/nil-android/README.md crates/nil-android/DEVICE_VERIFY.md
+            crates/nil-apple/README.md crates/nil-apple/DEVICE_VERIFY.md
+            crates/nil-apple/MACOS_DEVICE_VERIFY.md
+            client/README.md client/mobile/README.md
+            client/src/components.tsx client/src/screens.tsx
+          )
+          for file in "${canonical[@]}"; do
+            test -s "$file" || { echo "missing canonical public document: $file"; exit 1; }
+          done
+          stale=(
+            "single-hop attested MASQUE (closed alpha)"
+            "These 7 words"
+            "one-time recovery code"
+            "connecting mints a token"
+            "backs up the primary MASQUE rung"
+            "unlinkability is **information-theoretic**"
+            "Residual: none known at the alpha scope"
+            "Per-OS runtime behaviour is verified"
+            "closes the chain from reproducible source"
+            "allowUnattested"
+            "block_without_vpn"
+          )
+          for phrase in "${stale[@]}"; do
+            if grep -Fini -- "$phrase" "${canonical[@]}"; then
+              echo "stale public claim returned: $phrase"
+              exit 1
+            fi
+          done
+
+      - name: Public proxy privacy/config guard
+        shell: bash
+        run: bash deploy/verify-proxy-privacy.sh
+
+      - name: Release workflow and Docker-context guard
+        shell: bash
+        run: bash deploy/verify-release-config.sh
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -44,9 +93,9 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
             cmake clang pkg-config build-essential
 
-      # No `cargo fmt --check` gate: the codebase uses a deliberate wide hand-formatted style
-      # (no rustfmt.toml) that default rustfmt would rewrite repo-wide. Clippy (-D warnings) is the
-      # enforced style/quality gate; new code should read like the surrounding code.
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
       - name: Build
         run: cargo build --workspace --locked
 
@@ -54,7 +103,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # The security-critical suites live behind off-by-default Cargo features, so the plain
   # `cargo test --workspace` in `check` never compiles — let alone runs — them. This job turns
@@ -71,10 +120,10 @@ jobs:
   feature-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
@@ -95,8 +144,8 @@ jobs:
         run: cargo test -p nil-attest --features synthetic --locked
 
       # WireGuard-over-WebSocket-over-TLS round-trip (transitively enables pqwg + masque).
-      - name: wstunnel round-trip (nil-transport wstunnel)
-        run: cargo test -p nil-transport --features wstunnel --locked
+      - name: Development fallback round-trips (nil-transport dev-fallbacks)
+        run: cargo test -p nil-transport --features dev-fallbacks --locked
 
       # Network-aware selector: probe → fast/resistant rung ordering + step-down + the datapath
       # NW_SELECTOR wiring (transitively enables reality + wstunnel + pqwg + masque).
@@ -138,7 +187,7 @@ jobs:
       # Synthetic RA-TLS datapath wiring (node report + client/datapath appraisal acceptance).
       - name: Synthetic-attest datapath (node + datapath + cli)
         run: |
-          cargo test -p nil-node --features synthetic-attest --locked
+          cargo test -p nil-node --no-default-features --features synthetic-attest --locked
           cargo test -p nil-datapath --features synthetic-attest --locked
           cargo test -p nil-cli --features synthetic-attest --locked
 
@@ -151,7 +200,7 @@ jobs:
       # and datapath with it on, so the PII-free counters can't bitrot.
       - name: dev-trace diagnostics (node + cli + transport + datapath)
         run: |
-          cargo test -p nil-node --features synthetic-attest,dev-trace --locked
+          cargo test -p nil-node --no-default-features --features synthetic-attest,dev-trace --locked
           cargo test -p nil-cli --features synthetic-attest,dev-trace --locked
           cargo test -p nil-transport --features masque,pqwg,dev-trace --locked
           cargo test -p nil-datapath --features synthetic-attest,dev-trace --locked
@@ -170,22 +219,44 @@ jobs:
           fi
           echo "OK: production Dockerfiles do not reference dev-trace"
 
+      # P0.6 release boundary: optimized production artifacts must compile in their safe default
+      # posture, while every explicit development capability is rejected by a compile-time guard.
+      - name: Release posture compile guards
+        run: |
+          cargo check --release -p nil-node --locked
+          cargo check --release -p nil-cli --locked
+          cargo check --release -p nil-datapath --features launch --locked
+          if cargo check --release -p nil-node --no-default-features --features synthetic-attest --locked 2>/dev/null; then
+            echo "FAIL: release nil-node accepted synthetic-attest"; exit 1
+          fi
+          if cargo check --release -p nil-cli --features dev-fallbacks --locked 2>/dev/null; then
+            echo "FAIL: release nil-cli accepted dev-fallbacks"; exit 1
+          fi
+          if cargo check --release -p nil-datapath --features dev-trace --locked 2>/dev/null; then
+            echo "FAIL: release nil-datapath accepted dev-trace"; exit 1
+          fi
+          echo "OK: release builds reject synthetic attestation, alternate fallbacks, and dev tracing"
+
   # The desktop client's React frontend: type-check (tsc), bundle (vite), and the vitest unit
   # tests (fail-closed token gate, buy/settings flows). The Rust side is covered by `check`.
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
-          version: 10
-      - uses: actions/setup-node@v4
+          version: 10.33.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 22
+          node-version: 22.17.1
           cache: pnpm
           cache-dependency-path: client/pnpm-lock.yaml
       - name: Install
         run: pnpm --dir client install --frozen-lockfile
+      - name: Advisory gate (all frontend build and runtime dependencies)
+        run: pnpm --dir client audit --audit-level high
+      - name: License policy gate
+        run: bash deploy/verify-frontend-licenses.sh
       - name: Build (tsc + vite)
         run: pnpm --dir client build
       - name: Test (vitest)
@@ -198,9 +269,9 @@ jobs:
   windows-check:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Clippy (windows datapath)
-        run: cargo clippy -p nil-datapath --all-targets -- -D warnings
+        run: cargo clippy -p nil-datapath --all-targets --locked -- -D warnings
 
   # Compile-check the Apple engine (nil-apple) for macOS (arm64+x86_64) AND iOS (device + simulator)
   # and package the NilApple.xcframework — catches Apple-target bitrot (BoringSSL/quiche for the iOS
@@ -209,7 +280,7 @@ jobs:
   apple-check:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Build the Apple engine xcframework (macOS + iOS slices)
         run: NIL_APPLE_WITH_IOS=1 bash client/apple/build-engine.sh debug
 
@@ -220,7 +291,7 @@ jobs:
   macos-se-build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Build the macOS system extension (unsigned)
@@ -229,23 +300,27 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Licenses, advisories, bans, sources
-        uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-
-      - name: SBOM (CycloneDX)
-        continue-on-error: true
         run: |
-          cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --all --format json
+          cargo install cargo-deny --version 0.19.9 --locked
+          # Warnings are fatal. Duplicate transitive versions are the one explicitly reviewed
+          # debt class; allowing that lint removes warning-only behavior without pretending the
+          # current Tauri/attestation graph can be collapsed locally.
+          cargo deny check -D warnings -A duplicate
+
+      - name: Workspace SBOM (CycloneDX; Rust and lockfile-discovered packages)
+        uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: workspace.cdx.json
+          upload-artifact: false
 
       - name: Upload SBOM
-        if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom
-          path: "**/*.cdx.json"
-          if-no-files-found: ignore
+          path: workspace.cdx.json
+          if-no-files-found: error

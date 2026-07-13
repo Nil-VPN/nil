@@ -1,31 +1,79 @@
-# On a version tag: build nil-node reproducibly and publish its measurement + SBOM to the
-# Sigstore/Rekor transparency log (keyless via OIDC). The job FAILS if the double build is not
-# byte-identical, so a non-reproducible build can never be published. Clients then attest
-# nodes against the pinned measurement (architecture spec §5, runbook §4).
-name: release-attest
+name: release-node-evidence
 
+# Reusable, secretless release gate. The sole v* entrypoint is release.yml; this workflow cannot
+# publish independently. It double-builds the production node and exports the exact ELF hash for
+# comparison with the node extracted from the candidate OCI image.
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    outputs:
+      node_sha256:
+        description: SHA-256 of the byte-identical production nil-node ELF
+        value: ${{ jobs.reproducible.outputs.node_sha256 }}
+      evidence_sha256:
+        description: SHA-256 of the node source/build-input evidence document
+        value: ${{ jobs.reproducible.outputs.evidence_sha256 }}
 
 permissions:
-  id-token: write   # keyless signing (Fulcio/Rekor OIDC identity)
   contents: read
 
 jobs:
-  measure-and-publish:
+  reproducible:
     runs-on: ubuntu-latest
+    outputs:
+      node_sha256: ${{ steps.measure.outputs.node_sha256 }}
+      evidence_sha256: ${{ steps.evidence.outputs.evidence_sha256 }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Reproducible build (asserts byte-identical nil-node)
-        run: ./deploy/reproducible-build.sh
-
-      - name: Install SBOM + signing tooling
-        run: cargo install cargo-cyclonedx --locked
-      - uses: sigstore/cosign-installer@v3
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          cosign-release: v2.4.1
+          persist-credentials: false
 
-      - name: Publish measurement + SBOM to Rekor (keyless)
-        run: ./deploy/publish-measurement.sh --mode real
+      - name: Double-build and extract the byte-identical node ELF
+        id: measure
+        run: |
+          set -euo pipefail
+          mkdir -p release-node
+          deploy/reproducible-build.sh --output release-node/nil-node | tee release-node/reproducibility.txt
+          measurement="$(sed -n 's/^MEASUREMENT=//p' release-node/reproducibility.txt)"
+          printf '%s' "$measurement" | grep -Eq '^[0-9a-f]{64}$' || {
+            echo "invalid node measurement" >&2; exit 1;
+          }
+          printf '%s  %s\n' "$measurement" nil-node > release-node/SHA256SUMS
+          echo "node_sha256=$measurement" >> "$GITHUB_OUTPUT"
+
+      - name: Node release source SBOM
+        uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: release-node/nil-node.cdx.json
+          upload-artifact: false
+
+      - name: Record source/build inputs
+        id: evidence
+        run: |
+          set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          source_epoch="$(git log -1 --pretty=%ct)"
+          cargo_lock="$(sha256sum Cargo.lock | awk '{print $1}')"
+          rust_toolchain="$(sha256sum rust-toolchain.toml | awk '{print $1}')"
+          node_sha="$(awk '{print $1}' release-node/SHA256SUMS)"
+          sbom_sha="$(sha256sum release-node/nil-node.cdx.json | awk '{print $1}')"
+          jq -n \
+            --arg source_sha "$source_sha" \
+            --arg source_epoch "$source_epoch" \
+            --arg cargo_lock_sha256 "$cargo_lock" \
+            --arg rust_toolchain_sha256 "$rust_toolchain" \
+            --arg node_elf_sha256 "$node_sha" \
+            --arg sbom_sha256 "$sbom_sha" \
+            '{schema:"https://nilvpn.net/release-node-evidence/v1",source_sha:$source_sha,source_date_epoch:($source_epoch|tonumber),cargo_lock_sha256:$cargo_lock_sha256,rust_toolchain_sha256:$rust_toolchain_sha256,node_elf_sha256:$node_elf_sha256,sbom_sha256:$sbom_sha256}' \
+            > release-node/evidence.json
+          evidence_sha="$(sha256sum release-node/evidence.json | awk '{print $1}')"
+          echo "evidence_sha256=$evidence_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Upload node evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-node-evidence-${{ github.run_attempt }}
+          path: release-node
+          if-no-files-found: error
+          retention-days: 30

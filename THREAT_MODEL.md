@@ -1,102 +1,134 @@
-# NIL VPN — Threat model (what we do and, honestly, do not defend)
+# NIL VPN — threat model
 
-> **Status: working draft.** The *limitations* below are stated plainly and are safe to rely on as
-> honest disclosure. The *affirmative* protections describe design intent and current implementation;
-> several are not yet live in production (see "Verifiability status") and the affirmative claims are
-> pending independent security + counsel review before being represented to users as guarantees.
-> This page is versioned; when a claim changes, the change is visible in git history.
+> **Status: working engineering draft.** Limitations below are current disclosures. Affirmative
+> protections describe code paths and test evidence unless this page explicitly says they were
+> validated on live infrastructure. They are not an independent security or legal assurance.
 
-A VPN **moves trust** — from your local network and ISP to NIL's egress. It does not erase trust,
-and it is **not anonymity**. NIL's design goal is to minimize what any single party can be trusted
-*with*, and to make that checkable rather than promised (see `RETAINED_DATA.md` for exactly what is
-stored). This page is indexed by adversary so you can see exactly where the line is.
+A VPN moves trust from the user's local network and ISP to the VPN path. It does not make a user
+anonymous. NIL's goal is to minimize what each application plane learns and persists, then make the
+remaining boundaries testable.
 
 ## Adversary-by-adversary
 
-### Your local network / ISP / Wi-Fi operator (passive)
-- **Defended:** the tunnel (MASQUE/QUIC on UDP 443, looking like ordinary HTTPS/QUIC) hides your
-  destinations and content from the local network. DNS resolves through the tunnel.
-- **Not fully defended:** traffic-analysis. Packet sizes and timing can leak information even inside
-  a tunnel. Website-fingerprinting and flow-correlation attacks are effective in the literature
-  (e.g. DeepCoFFEA, IEEE S&P 2022; ESPRESSO, APNet 2024). NIL does **not yet** ship a
-  traffic-analysis defense (padding/timing, e.g. a DAITA/Maybenot-style layer) — this is planned,
-  not present.
+### Local network, ISP, or Wi-Fi operator
 
-### An active-probing censor / DPI regime (GFW, Iran, Russia)
-- **Defended (partially):** MASQUE/QUIC-on-443 is the same protocol family Apple iCloud Private
-  Relay and Cloudflare WARP use, so it rides a large legitimate cover population; a cascade of
-  fallback transports exists for when it's blocked. Raw WireGuard's fixed fingerprint is never
-  exposed.
-- **Not yet achieved / honest limits:** the REALITY fallback rung is currently a *cosmetic*
-  self-signed-TLS borrow — an active prober can distinguish it; it is not yet a forged
-  foreign-site handshake. The outer QUIC/TLS ClientHello is not yet matched to a specific real
-  browser fingerprint (JA4-class). A determined, sophisticated censor may still detect or block
-  NIL. We do not claim guaranteed circumvention.
+- After a real tunnel is successfully established, the implementation routes client traffic and
+  DNS through an encrypted MASQUE/QUIC path and installs platform firewall controls.
+- Desktop firewall/routing setup and rollback are not yet fully transactional. A failure between
+  host mutations can leave stale state, and privileged fault-injection/crash-recovery evidence is
+  still required; “fail-closed” must not be inferred from the happy-path state machine alone.
+- Packet sizes, timing, connection duration, and endpoint behavior remain visible. NIL does not yet
+  ship an evaluated padding or timing defense, so website fingerprinting and end-to-end flow
+  correlation remain possible.
+- These routing/leak properties still require privileged runtime validation on every supported OS;
+  compilation and synthetic tests are not equivalent to a device leak test.
 
-### NIL itself (the operator) — and a compelled or malicious future operator
-- **Defended, structurally:** the design splits *who-pays* from *what-flows*. Payments use blind
-  Privacy Pass tokens (RFC 9578): the issuer (business plane) and verifier (control plane) share
-  only a public key, and blind-signature unlinkability is **information-theoretic** — a redemption
-  cannot be linked to a payment even if the two planes collude, and no future quantum computer can
-  retroactively un-blind past redemptions. The data plane sees only short-lived, unlinkable grants,
-  never an account (PD-3). Nodes keep **no disk logs**. See `RETAINED_DATA.md` for the complete,
-  minimal list of what is persisted.
-- **In-code separation vs. operator non-collusion — the honest distinction:** NIL's crate
-  boundaries enforce, *in code*, that identity-linking fields and joins do not exist (checked by a
-  compile-time tripwire, a runtime schema audit, and the open-source code). That is a real,
-  verifiable structural guarantee. It is **not** the same as OHTTP/Apple-Private-Relay-style
-  operational non-collusion between *independent companies*. **In the current alpha, NIL operates
-  all planes itself (single operator).** The multi-hop trust-split across legally-independent
-  operators and jurisdictions is the design target and roadmap, not a property you can assume is
-  live today. The guarantees that *are* live today are the blind-token payment unlinkability and
-  the no-logs data plane.
-- **Anonymity-set caveat:** blind-token unlinkability is defined relative to the set of other users
-  redeeming in the same window. With few users, that set is small and timing-correlatable in
-  practice, even though the cryptography is sound. Unlinkability strengthens as the user base grows.
+### Active censor or DPI regime
 
-### A global passive adversary (watches the network at both ends simultaneously)
-- **Out of scope — and this is a mathematical limit, not a missing feature.** Any low-latency,
-  low-overhead system (which NIL is, deliberately, to be usable) provably cannot be strongly
-  anonymous against an adversary observing both ends (the anonymity trilemma, IEEE S&P 2018).
-  Defeating a global passive adversary is a mixnet's job — it costs seconds of added latency and
-  cover traffic (e.g. Nym). NIL is a fast VPN, not a mixnet, and does not claim GPA resistance.
+- The production-profile transport is MASQUE/QUIC on UDP 443. It may share protocol traits with
+  ordinary HTTP/3 traffic, but its full wire image is not proven indistinguishable from a browser or
+  a large cover protocol.
+- AmneziaWG, wstunnel, REALITY, and the network selector exist only in debug-assertion development
+  artifacts. Their responders do not yet have production-equivalent grant and hardware-attestation
+  semantics, so release builds compile them out instead of silently weakening security.
+- A censor can still fingerprint, throttle, block UDP, or actively probe NIL. Guaranteed
+  circumvention is not a claim.
 
-### A physical adversary at a node (server seizure, coercive host, hardware attack)
-- **Partially defended, with an honest post-TEE.Fail correction.** NIL verifies each node's TEE
-  attestation (AMD SEV-SNP / Intel TDX) against a pinned measurement before any packet flows, and
-  the node keeps nothing on disk — so a seizure finds no traffic records. But as of the "TEE.Fail"
-  results (Oct 2025), TEE attestation can be **forged under physical memory access**; the CPU
-  vendors themselves declare physical attacks out of scope. So attestation should be understood as
-  raising the cost of *remote / software-only* host compromise and proving the *integrity of the
-  running code*, **not** as a shield against a physical adversary. The mitigation for the physical
-  case is architectural: trust-split across independent jurisdictions + AMD/Intel vendor diversity
-  (so no single seized machine, and no single TEE vendor, is load-bearing) plus the no-logs posture
-  (nothing identifying exists to seize).
+### NIL, a compelled operator, or a malicious future operator
 
-### The user's own behavior / endpoints
-- **Not defendable by any VPN.** Logging into an identifying service (email, social, bank),
-  browser and device fingerprinting, cookies, and correlating behavior deanonymize you regardless
-  of the tunnel. A VPN protects the transport; it cannot protect what you tell the far end about
-  yourself.
+- Release clients accept only token issuer keys embedded at build time, preventing a Portal from
+  silently introducing an unreviewed per-user key as a tagging channel. A reviewed rotation bundle
+  can contain more than one accepted key, so its scope and lifetime still matter. The Portal
+  blind-signs values it cannot unblind; the Coordinator sees a bearer message/signature but no
+  account field.
+- Blind signing prevents a direct cryptographic join between an issuance transcript and the later
+  bearer credential. It does **not** make linkage information-theoretically impossible. The Portal
+  sees the stable pseudonymous account during an authenticated batch mint, and timing, IP metadata,
+  payment records, a small anonymity set, or modified infrastructure can correlate issuance and
+  redemption. Randomized background batches reduce direct timing coupling; they do not create
+  anonymity or make collusion harmless.
+- Current code DTOs keep account/payment fields out of the Coordinator and node. Schema tripwires
+  cover specific application stores; they do not prove that a future operator, reverse proxy,
+  hosting platform, or modified binary cannot collect additional metadata.
+- Multi-hop selection enforces operator/jurisdiction diversity fields in code, but deployment across
+  genuinely independent operators has not been demonstrated. NIL must not represent in-code plane
+  separation as independent-company non-collusion.
 
-## Verifiability status ("prove, don't promise" — where the chain is and isn't complete)
-- The `nil-node` build is reproducible and its measurement is published to a transparency log
-  (Sigstore/Rekor); the pinned measurement the client enforces should trace to that.
-- **Incomplete today (disclosed honestly):** the client currently matches a *Coordinator-pinned*
-  measurement rather than fetching and checking a transparency-log inclusion proof itself at connect
-  time; and full-platform **client** reproducibility + binary transparency is not established for
-  desktop (Tauri) and iOS (Android is reproducible). A targeted malicious client build is therefore
-  the largest residual transparency gap. These are tracked as work, not claimed as done.
-- **Attestation has not yet run against real TEE hardware in production** — the CI/e2e path uses a
-  synthetic attestation report standing in for the hardware vendor chain (the vendor-root
-  verification logic itself is unit-tested). Treat every attestation-dependent protection above as
-  "as designed / to be verified live," not "proven in production," until that is stated otherwise.
+### Global passive adversary
+
+Out of scope. A low-latency VPN does not defeat an observer able to watch both the client side and
+the destination side and correlate timing and volume. That requires a different latency/cover-
+traffic tradeoff, such as a mixnet.
+
+### Node host, seizure, or physical hardware attacker
+
+- Nodes hold only Coordinator Ed25519 public grant keys. `NWG2` binds a signature to the deployment
+  realm, stable node ID, intended role, MASQUE transport, TEE, measurement, stable TLS-SPKI digest,
+  expected predecessor IPv4, exact next-hop IPv4/UDP socket, lifetime, and nonce. A same-measurement
+  clone with another TLS key cannot accept the victim's grant; a client cannot directly redeem a
+  middle/exit grant from the wrong source; and an intermediate admits only its signed next hop.
+  Compromise of one node does not expose a fleet-wide grant-minting secret. Compromise of the
+  Coordinator signer, its configuration authority, source-address routing, or enough independent
+  operators remains in scope and requires rotation/revocation procedures.
+- A verified NWG2 bearer grant is accepted once per node process. Nodes retain only its anonymous
+  key ID, nonce, and expiry in a bounded memory cache, fail closed at capacity, and reject grants
+  issued before process start after a restart. One-second grant timestamps leave a disclosed
+  sub-second same-timestamp restart residual; eliminating it requires durable anonymous replay
+  state or a Coordinator-signed node boot identifier, neither of which is claimed here.
+- The MASQUE client code checks the registry-pinned live TLS-SPKI digest, TEE family, vendor evidence
+  chain, fresh nonce and report TLS-key binding, expected measurement, TCB status, and—when
+  configured—a stapled transparency proof before accepting a hop.
+- This path has unit, known-answer, and synthetic integration coverage, not a completed NIL
+  production deployment on real SEV-SNP/TDX hardware. TDX appraisal now pins non-debug attributes,
+  configuration/owner identities, all four RTMRs, report-body/service identity, and a clean
+  `UpToDate`/no-advisory collateral result in one client-pinned SHA-384 identity. The exact measured
+  boot policy, live collateral handling, and artifact-to-RTMR chain still require independent review
+  and hardware validation.
+- A guest-launch measurement does not currently prove that the dynamically launched container or
+  `nil-node` binary is the reviewed release artifact. Until an immutable measured image or verified
+  runtime digest closes that link, attestation must not be described as proof of the exact running
+  application.
+- TEE.Fail-class physical memory attacks weaken the meaning of an otherwise valid report. Hardware
+  attestation raises the cost of some remote/software attacks; it is not a physical-adversary shield.
+- The reviewed Caddyfiles disable HTTP access logging and their Compose services discard Caddy
+  operational output. Portal/Coordinator/wallet operational logs are bounded but not assumed
+  anonymous. `nil-node` contains no application traffic-log store, but it writes operational events
+  to stdout. Journald, container runtimes, external edges, firewalls, backups, support systems, and
+  infrastructure providers can still persist metadata; source configuration does not control or
+  attest to those layers.
+
+### The user's endpoints and behavior
+
+No VPN can hide identity deliberately disclosed to a destination. Logged-in accounts, cookies,
+browser/device fingerprints, malware, unencrypted application traffic, and recognizable behavior
+can identify a user regardless of the tunnel.
+
+## Verifiability status
+
+Implemented and test-covered:
+
+- release builds require an embedded trust-bundle v1 containing accepted issuer keys, node
+  measurements, and a transparency-log public key; runtime environment values may narrow but not
+  expand those roots;
+- per-hop report appraisal and fail-closed measurement/transparency checks;
+- production-profile compile guards for loopback, direct/single-hop paths, synthetic attestation,
+  diagnostics, and alternate fallback transports;
+- a nested multi-hop Docker harness using synthetic attestation.
+
+Not yet established:
+
+- a live multi-operator path on real TEE hardware;
+- a signed mapping from reviewed source and OCI digest through the guest measurement to the exact
+  running node artifact, including production generation of the stapled log proof;
+- independently reproduced and transparency-logged client packages on every platform;
+- packaged native mobile/system-extension multi-hop (release native clients currently refuse to
+  connect before spending a pass);
+- a tag publication process gated on the exact CI-tested commit and independently verified public
+  signatures, SBOMs, provenance, and transparency entries.
 
 ## Operator posture
-NIL is US-based with a public, named founder (Alejandro Conde) and complies with valid legal
-process — the defense is that there is nothing identifying to produce, not that we resist lawful
-demands. We do not pretend to be a faceless offshore entity.
 
----
-*See also: `RETAINED_DATA.md` (every field NIL persists). Honesty about limits is part of the
-product, not a footnote.*
+The project states that NIL is US-based, has a public named founder, and intends to comply with
+valid legal process. The engineering defense is data minimization, not a promise to resist lawful
+demands. See [RETAINED_DATA.md](RETAINED_DATA.md) for application-controlled persistence and
+[RELEASE.md](RELEASE.md) for current release readiness.

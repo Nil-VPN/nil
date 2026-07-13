@@ -1,7 +1,45 @@
-target
+# Allowlist the only source inputs required by the Rust service/test images. The default-deny rule
+# prevents git-excluded deployment overlays, local credentials, and unrelated client build output
+# from ever reaching a local or remote Docker daemon.
+**
+!.dockerignore
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!crates/
+!crates/**
+!client/
+!client/src-tauri/
+!client/src-tauri/**
+!client/trust/
+!client/trust/**
+!deploy/
+!deploy/Dockerfile
+!deploy/Dockerfile.*
+
+# Re-apply sensitive/generated exclusions after directory negations (last matching rule wins).
 **/target
-client/node_modules
-client/dist
-client/src-tauri/gen
-.git
-.DS_Store
+**/target/**
+**/node_modules
+**/node_modules/**
+**/gen
+**/gen/**
+**/*.env
+**/*.env.*
+**/secrets
+**/secrets/**
+**/credentials
+**/credentials/**
+**/private
+**/private/**
+**/*.key
+**/*.pem
+**/*.p12
+**/*.p8
+**/*.der
+**/*.crt
+**/*.cer
+**/*.jks
+**/*.keystore
+**/*credential*
+**/*secret*

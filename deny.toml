@@ -10,16 +10,14 @@ ignore = [
     # so this single ID-ignore silences both — documented honestly (PD-5):
     #   1. `rsa 0.9` via `sev`/`dcap-qvl` → `nil-attest`, which only VERIFIES signatures with the
     #      AMD/Intel PUBLIC keys (no RSA private-key op), so the sidechannel does not apply there.
-    #   2. `rsa 0.10.0-rc.18` via `blind-rsa-signatures` → `nil-crypto` → `nil-portal`, which DOES
-    #      perform an RSA PRIVATE-key blind-signing operation on network-reachable input at
-    #      POST /v1/tokens/mint and POST /v1/tokens/issue. This path is exposed but MITIGATED: the
-    #      blind-RSA base blinding is active (the signed message is blinded per request) and both
-    #      endpoints are strictly rate-capped (per-IP, plus per-account for mint), so the millions
-    #      of precisely-timed samples a Marvin key-recovery needs are not achievable at the deployed
-    #      request rates. NOT a documented "no private-key op" exemption — a tracked, rate-limited
-    #      exposure. Revisit: (a) move to a constant-time RSA backend when RUSTSEC-2023-0071 gets a
-    #      fixed `rsa` release, and (b) `rsa 0.10.0-rc.18` is a pre-release pinned by
-    #      `blind-rsa-signatures` — move to a stable release when one is available.
+    #   2. `rsa 0.10.0-rc.18` via `blind-rsa-signatures` → `nil-crypto` remains in the graph for
+    #      client blinding/finalization and debug issuer fixtures. Optimized nil-portal now refuses
+    #      the software issuer and requires its PKCS#11 HSM backend, so the network-facing service
+    #      delegates the private RSA operation to the configured device. That device/mechanism still
+    #      requires independent constant-time review; this ignore is not production clearance.
+    #      Exception owner: NIL security team (security@nilvpn.net).
+    #      Review/expiry: 2026-10-12. Remove or renew with evidence by that date; also migrate off
+    #      the pre-release RSA dependency when blind-rsa-signatures publishes a fixed stable path.
     "RUSTSEC-2023-0071",
     # quick-xml DoS advisories (RUSTSEC-2026-0194: quadratic runtime on duplicate start-tag
     # attributes; RUSTSEC-2026-0195: unbounded namespace-declaration allocation in `NsReader`).
@@ -44,7 +42,6 @@ version = 2
 # crates.io in Phase 0 is permissive (MIT / Apache-2.0 / BSD / ISC / CC0 / Unicode).
 allow = [
     "AGPL-3.0-or-later",
-    "AGPL-3.0",
     "MIT",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
@@ -54,7 +51,6 @@ allow = [
     "Zlib",
     "CC0-1.0",
     "MPL-2.0",
-    "Unicode-DFS-2016",
     "Unicode-3.0",
     # Mozilla root-cert data bundle (webpki-roots), pulled by reqwest's rustls TLS.
     "CDLA-Permissive-2.0",

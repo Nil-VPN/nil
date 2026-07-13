@@ -1,360 +1,619 @@
-# Build + SIGN the NIL VPN desktop client on a version tag.
-#
-# Trigger: a `v*` tag (same convention as release-attest.yml). The job builds the Tauri v2
-# desktop bundles and signs them per-platform with credentials that live ONLY in GitHub
-# repository secrets — nothing signing-related is ever committed:
-#   - macOS : Developer ID Application cert + Apple notarization (notarytool), stapled.
-#   - Windows: Authenticode signature over the .exe/.msi (signtool).
-#   - Linux : detached GPG signatures (.asc) over the .deb / .AppImage.
-#
-# Signed artifacts are uploaded per-platform. Promotion to a public GitHub Release is left to
-# the founder (the `release` job at the bottom is gated + commented) so unsigned/partial runs
-# never publish.
-#
-# This workflow signs the *installer bundles*. The Tauri auto-updater signature (a separate
-# minisign keypair) is a TODO below, gated on the founder generating an updater key — until
-# then the app ships without in-app auto-update, which is the correct closed-alpha posture.
-name: release-sign
+name: release-client-candidates
 
+# Reusable release stage. Unsigned desktop bundles are built in jobs with no signing secrets and
+# checkout credentials disabled. Protected signing jobs download immutable runner artifacts and
+# execute only platform signing/notarization tools; they never check out or execute repository code.
+# Signed candidates remain Actions artifacts until the external atomic-promotion gate is satisfied.
 on:
-  push:
-    tags: ["v*"]
-  # Manual re-run for a tag that already exists (e.g. after adding a missing secret), without
-  # re-tagging. Provide the tag ref to check out.
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to build + sign (e.g. v0.1.0)"
-        required: true
-        type: string
+  workflow_call:
+    secrets:
+      APPLE_CERTIFICATE:
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        required: false
+      APPLE_API_KEY_P8:
+        required: false
+      APPLE_API_ISSUER:
+        required: false
+      APPLE_API_KEY:
+        required: false
+      WINDOWS_CERTIFICATE:
+        required: false
+      WINDOWS_CERTIFICATE_PASSWORD:
+        required: false
+      GPG_PRIVATE_KEY:
+        required: false
+      GPG_PASSPHRASE:
+        required: false
+    outputs:
+      client_manifest_sha256:
+        description: SHA-256 of the keyless-signed client candidate manifest
+        value: ${{ jobs.client-manifest.outputs.client_manifest_sha256 }}
 
 permissions:
   contents: read
 
-concurrency:
-  group: release-sign-${{ github.ref }}
-  cancel-in-progress: false
-
 env:
   CARGO_TERM_COLOR: always
-  # Tauri reads the app version from tauri.conf.json; the workspace is pinned to the same
-  # version via rust-toolchain.toml (1.96.0), installed automatically on first cargo call.
-  TAURI_CLIENT_DIR: client
+  NODE_VERSION: "22.17.1"
+  PNPM_VERSION: "10.33.0"
 
 jobs:
-  # ---------------------------------------------------------------------------------------
-  # Validate the workflow_dispatch tag once, into an output the build jobs consume. A tag-push
-  # run uses github.ref directly (no untrusted input), so this only constrains the manual path.
-  # ---------------------------------------------------------------------------------------
-  resolve-ref:
-    runs-on: ubuntu-latest
-    outputs:
-      ref: ${{ steps.pick.outputs.ref }}
-    steps:
-      - name: Resolve + validate the ref to build
-        id: pick
-        env:
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          PUSH_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          if [ -n "${INPUT_TAG:-}" ]; then
-            # Reject anything that is not a plain version tag — no path traversal into ref:.
-            if ! printf '%s' "$INPUT_TAG" | grep -Eq '^v[0-9A-Za-z._-]+$'; then
-              echo "Refusing tag '${INPUT_TAG}': must match ^v[0-9A-Za-z._-]+$" >&2
-              exit 1
-            fi
-            echo "ref=refs/tags/${INPUT_TAG}" >> "$GITHUB_OUTPUT"
-          else
-            echo "ref=${PUSH_REF}" >> "$GITHUB_OUTPUT"
-          fi
-
-  # ---------------------------------------------------------------------------------------
-  # macOS — Developer ID signing + Apple notarization (Tauri does both via tauri-action when
-  # the APPLE_* env vars are present; notarytool staples the ticket into the .app/.dmg).
-  # ---------------------------------------------------------------------------------------
-  macos:
-    needs: resolve-ref
+  build-macos:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          # Validated upstream (resolve-ref): a plain `vX` tag or the pushed tag ref.
-          ref: ${{ needs.resolve-ref.outputs.ref }}
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
-          version: 9
-
-      - name: Setup Node (pnpm cache)
-        uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
-
-      # Both Apple Silicon and Intel from the macos-14 (arm64) runner.
-      - name: Add Rust targets
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+          cache-dependency-path: client/pnpm-lock.yaml
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install frontend deps
-        working-directory: ${{ env.TAURI_CLIENT_DIR }}
-        run: pnpm install --frozen-lockfile
-
-      # Materialize the App Store Connect API key (.p8) from a secret into a temp file BEFORE the
-      # build; tauri-action reads its path via APPLE_API_KEY_PATH to drive notarytool.
-      #   APPLE_API_KEY_P8 secret = full contents of the AuthKey_XXXXXXXXXX.p8 file.
-      - name: Write App Store Connect API key from secret
+          key: ${{ runner.os }}-cargo-client-${{ hashFiles('Cargo.lock') }}
+      - name: Install and build unsigned universal macOS bundles
         env:
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
         run: |
           set -euo pipefail
-          if [ -z "${APPLE_API_KEY_P8:-}" ]; then
-            echo "APPLE_API_KEY_P8 secret is not set — add the AuthKey_*.p8 contents as a repo secret." >&2
-            exit 1
-          fi
-          printf '%s' "$APPLE_API_KEY_P8" > "${RUNNER_TEMP}/asc_api_key.p8"
-
-      - name: Build, sign (Developer ID) and notarize
-        uses: tauri-apps/tauri-action@v0
-        env:
-          # --- Apple code-signing identity (founder must add all of these as repo secrets) ---
-          # APPLE_CERTIFICATE: base64 of the "Developer ID Application" .p12 export
-          #   (`base64 -i DeveloperIDApplication.p12 | pbcopy`).
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          # APPLE_CERTIFICATE_PASSWORD: the password set when exporting that .p12.
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          # APPLE_SIGNING_IDENTITY: the identity string, e.g.
-          #   "Developer ID Application: Your Name (TEAMID1234)".
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          # --- Apple notarization (App Store Connect API key — preferred over app-specific pw) ---
-          # APPLE_API_ISSUER: the Issuer ID (UUID) from App Store Connect > Users and Access > Keys.
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-          # APPLE_API_KEY: the Key ID (10 chars) of that App Store Connect API key.
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          # APPLE_API_KEY_PATH is written below from the secret file content; tauri-action reads it.
-          APPLE_API_KEY_PATH: ${{ runner.temp }}/asc_api_key.p8
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          pnpm --dir client install --frozen-lockfile
+          pnpm --dir client tauri build --target universal-apple-darwin
+          tar -czf unsigned-macos.tar.gz \
+            -C client/src-tauri/target/universal-apple-darwin/release/bundle .
+          shasum -a 256 unsigned-macos.tar.gz > unsigned-macos.tar.gz.SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          projectPath: ${{ env.TAURI_CLIENT_DIR }}
-          # Universal binary so one .dmg covers Apple Silicon + Intel.
-          args: --target universal-apple-darwin
-        # tauri-action invokes `pnpm build` (beforeBuildCommand) then bundles + signs.
-
-      - name: Upload signed macOS bundles
-        uses: actions/upload-artifact@v4
-        with:
-          name: nilvpn-macos-signed
+          name: unsigned-client-macos-${{ github.run_attempt }}
           path: |
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
+            unsigned-macos.tar.gz
+            unsigned-macos.tar.gz.SHA256SUMS
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
-  # ---------------------------------------------------------------------------------------
-  # Windows — Authenticode signing of the bundled .msi / .exe via signtool.
-  # tauri-action builds the bundle; we sign with the founder's code-signing cert afterward so
-  # signtool flags (timestamp URL, digest) are explicit and auditable.
-  # ---------------------------------------------------------------------------------------
-  windows:
-    needs: resolve-ref
+  build-windows:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.resolve-ref.outputs.ref }}
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
-          version: 9
-
-      - name: Setup Node (pnpm cache)
-        uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+          cache-dependency-path: client/pnpm-lock.yaml
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install frontend deps
-        working-directory: ${{ env.TAURI_CLIENT_DIR }}
-        run: pnpm install --frozen-lockfile
-
-      # Build the bundle UNSIGNED here; signtool runs in the next step so the cert never touches
-      # the build env and the signing command is explicit.
-      - name: Build Windows bundle
-        uses: tauri-apps/tauri-action@v0
-        with:
-          projectPath: ${{ env.TAURI_CLIENT_DIR }}
-
-      # Materialize the code-signing cert from a base64 secret into a temp .pfx, sign every
-      # produced .msi/.exe with an RFC-3161 timestamp, then delete the .pfx.
-      #   WINDOWS_CERTIFICATE          : base64 of the Authenticode code-signing .pfx
-      #                                  (`certutil -encode cert.pfx cert.b64`, strip headers, or
-      #                                   `[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`).
-      #   WINDOWS_CERTIFICATE_PASSWORD : the .pfx export password.
-      - name: Sign Windows bundle (Authenticode)
+          key: ${{ runner.os }}-cargo-client-${{ hashFiles('Cargo.lock') }}
+      - name: Install and build unsigned Windows bundles
         shell: pwsh
         env:
-          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
-          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
         run: |
-          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE)) {
-            Write-Error "WINDOWS_CERTIFICATE secret is not set — add the base64 .pfx as a repo secret."
-            exit 1
-          }
-          $pfxPath = Join-Path $env:RUNNER_TEMP "codesign.pfx"
-          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
-          # Locate signtool from the installed Windows SDK.
-          $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
-            Where-Object { $_.FullName -match "x64" } | Select-Object -First 1 -ExpandProperty FullName
-          if (-not $signtool) { Write-Error "signtool.exe not found in Windows SDK"; exit 1 }
-          $bundleRoot = Join-Path $env:GITHUB_WORKSPACE "$env:TAURI_CLIENT_DIR\src-tauri\target\release\bundle"
-          $targets = Get-ChildItem -Path $bundleRoot -Recurse -Include *.msi,*.exe
-          if (-not $targets) { Write-Error "No .msi/.exe produced under $bundleRoot"; exit 1 }
-          foreach ($f in $targets) {
-            & $signtool sign /f $pfxPath /p $env:WINDOWS_CERTIFICATE_PASSWORD `
-              /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 /v $f.FullName
-            if ($LASTEXITCODE -ne 0) { Write-Error "signtool failed for $($f.FullName)"; exit 1 }
-            & $signtool verify /pa /v $f.FullName
-            if ($LASTEXITCODE -ne 0) { Write-Error "signature verify failed for $($f.FullName)"; exit 1 }
-          }
-          Remove-Item $pfxPath -Force
-
-      - name: Upload signed Windows bundles
-        uses: actions/upload-artifact@v4
+          pnpm --dir client install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          pnpm --dir client tauri build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tar -a -c -f unsigned-windows.zip -C client/src-tauri/target/release/bundle .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash unsigned-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  unsigned-windows.zip" | Set-Content -NoNewline unsigned-windows.zip.SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nilvpn-windows-signed
+          name: unsigned-client-windows-${{ github.run_attempt }}
           path: |
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/msi/*.msi
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/nsis/*.exe
+            unsigned-windows.zip
+            unsigned-windows.zip.SHA256SUMS
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
-  # ---------------------------------------------------------------------------------------
-  # Linux — build the .deb / .AppImage, then attach detached GPG signatures (.asc) so users
-  # can verify provenance with the project's published public key.
-  # Same system build deps as .github/workflows/ci.yml (WebKitGTK/GTK/glib + cmake/clang).
-  # ---------------------------------------------------------------------------------------
-  linux:
-    needs: resolve-ref
+  build-linux:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: ${{ needs.resolve-ref.outputs.ref }}
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
+          persist-credentials: false
+      - uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4.1.0
         with:
-          version: 9
-
-      - name: Setup Node (pnpm cache)
-        uses: actions/setup-node@v4
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: ${{ env.NODE_VERSION }}
           cache: pnpm
-          cache-dependency-path: ${{ env.TAURI_CLIENT_DIR }}/pnpm-lock.yaml
-
-      # Mirrors the system libraries the workspace build needs on Linux (see ci.yml): the Tauri
-      # client pulls glib/gtk/webkit2gtk-sys (need the -dev packages + pkg-config), and
-      # quiche/BoringSSL needs cmake + clang. Without these the *-sys build scripts fail.
-      - name: Install Linux build deps (Tauri + BoringSSL/quiche)
+          cache-dependency-path: client/pnpm-lock.yaml
+      - uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-client-${{ hashFiles('Cargo.lock') }}
+      - name: Install Linux build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libglib2.0-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
             cmake clang pkg-config build-essential
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Install, audit, and build unsigned Linux bundles
+        env:
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
+        run: |
+          set -euo pipefail
+          pnpm --dir client install --frozen-lockfile
+          pnpm --dir client audit --audit-level high
+          bash deploy/verify-frontend-licenses.sh
+          pnpm --dir client tauri build
+          tar -czf unsigned-linux.tar.gz -C client/src-tauri/target/release/bundle .
+          sha256sum unsigned-linux.tar.gz > unsigned-linux.tar.gz.SHA256SUMS
+      - name: Combined Rust/npm client SBOM
+        uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
+          # Root scanning includes the workspace Cargo.lock and client/pnpm-lock.yaml; limiting the
+          # path to client/ would silently omit the Rust lockfile shared by nil-client.
+          path: .
+          format: cyclonedx-json
+          output-file: client.cdx.json
+          upload-artifact: false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-client-linux-${{ github.run_attempt }}
           path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-sign-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install frontend deps
-        working-directory: ${{ env.TAURI_CLIENT_DIR }}
-        run: pnpm install --frozen-lockfile
-
-      - name: Build Linux bundles
-        uses: tauri-apps/tauri-action@v0
+            unsigned-linux.tar.gz
+            unsigned-linux.tar.gz.SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          projectPath: ${{ env.TAURI_CLIENT_DIR }}
+          name: client-combined-sbom-${{ github.run_attempt }}
+          path: client.cdx.json
+          if-no-files-found: error
+          retention-days: 30
 
-      # Detached GPG signatures over each .deb / .AppImage.
-      #   GPG_PRIVATE_KEY : ASCII-armored private signing key
-      #                     (`gpg --armor --export-secret-keys KEYID`).
-      #   GPG_PASSPHRASE  : passphrase protecting that key.
-      - name: Sign Linux bundles (detached GPG)
+  sign-macos:
+    needs: build-macos
+    runs-on: macos-14
+    environment: release-signing-macos
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-client-macos-${{ github.run_attempt }}
+      - name: Validate macOS archive paths and entry types before exposing secrets
+        run: |
+          set -euo pipefail
+          grep -Eq '^[0-9a-f]{64}  unsigned-macos\.tar\.gz$' unsigned-macos.tar.gz.SHA256SUMS
+          shasum -a 256 -c unsigned-macos.tar.gz.SHA256SUMS
+          python3 - <<'PY'
+          import pathlib
+          import tarfile
+          import unicodedata
+
+          seen = set()
+          count = 0
+          total = 0
+          with tarfile.open("unsigned-macos.tar.gz", "r:gz") as archive:
+              for member in archive.getmembers():
+                  count += 1
+                  if count > 50_000:
+                      raise SystemExit("archive has too many entries")
+                  raw = member.name
+                  if (not raw or len(raw.encode("utf-8")) > 4096 or "\\" in raw or
+                          raw.startswith("/") or any(ord(ch) < 32 for ch in raw)):
+                      raise SystemExit(f"unsafe archive path: {raw!r}")
+                  while raw.startswith("./"):
+                      raw = raw[2:]
+                  if raw in ("", "."):
+                      if not member.isdir():
+                          raise SystemExit("archive root entry is not a directory")
+                      continue
+                  path = pathlib.PurePosixPath(raw)
+                  if any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"unsafe archive component: {member.name!r}")
+                  if any(len(part.encode("utf-8")) > 255 for part in path.parts):
+                      raise SystemExit(f"oversized archive component: {member.name!r}")
+                  key = unicodedata.normalize("NFC", raw).casefold()
+                  if key in seen:
+                      raise SystemExit(f"duplicate/case-colliding archive path: {raw!r}")
+                  seen.add(key)
+                  if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                      raise SystemExit(f"links/special entries are forbidden: {raw!r}")
+                  if member.mode & 0o7000:
+                      raise SystemExit(f"setid/sticky archive mode is forbidden: {raw!r}")
+                  if member.size > 4 * 1024**3:
+                      raise SystemExit(f"archive member too large: {raw!r}")
+                  total += member.size
+                  if total > 8 * 1024**3:
+                      raise SystemExit("archive uncompressed size exceeds limit")
+          PY
+          mkdir unsigned
+          tar -xzf unsigned-macos.tar.gz -C unsigned
+          if [ -n "$(find unsigned -type l -print -quit)" ]; then
+            echo "extracted macOS tree contains a symlink" >&2; exit 1
+          fi
+          if [ -n "$(find unsigned -type f -links +1 -print -quit)" ]; then
+            echo "extracted macOS tree contains a hardlink" >&2; exit 1
+          fi
+          if [ -n "$(find unsigned ! -type f ! -type d -print -quit)" ]; then
+            echo "extracted macOS tree contains a special entry" >&2; exit 1
+          fi
+      - name: Verify, sign, notarize, and staple the prebuilt app
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+          expected="$(awk '{print $1}' unsigned-macos.tar.gz.SHA256SUMS)"
+          actual="$(shasum -a 256 unsigned-macos.tar.gz | awk '{print $1}')"
+          [ "$actual" = "$expected" ] || { echo "unsigned macOS artifact hash mismatch" >&2; exit 1; }
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_API_KEY_P8 APPLE_API_ISSUER APPLE_API_KEY; do
+            [ -n "${!name:-}" ] || { echo "missing protected signing secret: $name" >&2; exit 1; }
+          done
+          keychain="$RUNNER_TEMP/nil-release.keychain-db"
+          p12="$RUNNER_TEMP/codesign.p12"
+          api_key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          password="$(uuidgen)"
+          cleanup() {
+            security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            rm -f "$p12" "$api_key"
+          }
+          trap cleanup EXIT
+          printf '%s' "$APPLE_CERTIFICATE" | base64 -D > "$p12"
+          printf '%s' "$APPLE_API_KEY_P8" > "$api_key"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$p12" -k "$keychain" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          mkdir signed
+          app="$(find unsigned -type d -name '*.app' -print -quit)"
+          [ -n "$app" ] || { echo "unsigned macOS artifact contains no .app" >&2; exit 1; }
+          codesign --force --deep --options runtime --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/notarize-app.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize-app.zip" \
+            --key "$api_key" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple "$app"
+          cp -R "$app" signed/
+          hdiutil create -volname "NIL VPN" -srcfolder "$app" -ov -format UDZO signed/NIL-VPN.dmg
+          codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" signed/NIL-VPN.dmg
+          xcrun notarytool submit signed/NIL-VPN.dmg \
+            --key "$api_key" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" --wait
+          xcrun stapler staple signed/NIL-VPN.dmg
+          tar -czf signed-client-macos.tar.gz -C signed .
+          shasum -a 256 signed-client-macos.tar.gz > signed-client-macos.tar.gz.SHA256SUMS
+      - name: Attest signed macOS candidate provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: signed-client-macos.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-client-macos-${{ github.run_attempt }}
+          path: |
+            signed-client-macos.tar.gz
+            signed-client-macos.tar.gz.SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  sign-windows:
+    needs: build-windows
+    runs-on: windows-2022
+    environment: release-signing-windows
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-client-windows-${{ github.run_attempt }}
+      - name: Validate Windows archive paths and entry types before exposing secrets
+        shell: pwsh
+        run: |
+          $expected = (Get-Content unsigned-windows.zip.SHA256SUMS).Split(' ')[0]
+          $actual = (Get-FileHash unsigned-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { Write-Error "unsigned Windows artifact hash mismatch"; exit 1 }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+          $count = 0
+          [long]$total = 0
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path unsigned-windows.zip))
+          try {
+            foreach ($entry in $zip.Entries) {
+              $count++
+              if ($count -gt 50000) { throw "archive has too many entries" }
+              $raw = $entry.FullName.Replace('\', '/')
+              if ([string]::IsNullOrWhiteSpace($raw) -or $raw.Length -gt 4096 -or $raw.StartsWith('/') -or
+                  $raw -match '^[A-Za-z]:' -or $raw.Contains(':') -or
+                  $raw -match '[\x00-\x1F]') {
+                throw "unsafe archive path: $raw"
+              }
+              $isDirectory = $raw.EndsWith('/')
+              while ($raw.StartsWith('./')) { $raw = $raw.Substring(2) }
+              $trimmed = $raw.TrimEnd('/')
+              if ([string]::IsNullOrEmpty($trimmed)) {
+                if (-not $isDirectory) { throw "archive root entry is not a directory" }
+                continue
+              }
+              $parts = $trimmed.Split('/')
+              foreach ($part in $parts) {
+                if ([string]::IsNullOrEmpty($part) -or $part -eq '.' -or $part -eq '..' -or
+                    $part.Length -gt 255 -or $part.EndsWith('.') -or $part.EndsWith(' ')) {
+                  throw "unsafe archive component: $raw"
+                }
+                $stem = ($part -split '\.')[0]
+                if ($stem -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+                  throw "reserved Windows archive component: $raw"
+                }
+              }
+              if (-not $seen.Add($trimmed)) { throw "duplicate/case-colliding archive path: $raw" }
+              $unixType = (($entry.ExternalAttributes -shr 16) -band 0xF000)
+              if ($unixType -eq 0xA000 -or ($unixType -ne 0 -and $unixType -ne 0x8000 -and $unixType -ne 0x4000)) {
+                throw "links/special entries are forbidden: $raw"
+              }
+              if (((($entry.ExternalAttributes -shr 16) -band 0x0E00)) -ne 0) {
+                throw "setid/sticky archive mode is forbidden: $raw"
+              }
+              if ($entry.Length -gt 4GB) { throw "archive member too large: $raw" }
+              $total += $entry.Length
+              if ($total -gt 8GB) { throw "archive uncompressed size exceeds limit" }
+              if ($isDirectory -and $entry.Length -ne 0) { throw "directory entry has data: $raw" }
+            }
+          } finally {
+            $zip.Dispose()
+          }
+          New-Item -ItemType Directory -Path unsigned | Out-Null
+          [IO.Compression.ZipFile]::ExtractToDirectory(
+            (Resolve-Path unsigned-windows.zip), (Resolve-Path unsigned))
+          $root = ([IO.Path]::GetFullPath((Resolve-Path unsigned).Path)).TrimEnd('\') + '\'
+          foreach ($item in Get-ChildItem unsigned -Force -Recurse) {
+            $full = [IO.Path]::GetFullPath($item.FullName)
+            if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "extracted path escaped validation root: $full"
+            }
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw "extracted Windows tree contains a reparse point: $full"
+            }
+          }
+      - name: Verify and Authenticode-sign prebuilt bundles
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $expected = (Get-Content unsigned-windows.zip.SHA256SUMS).Split(' ')[0]
+          $actual = (Get-FileHash unsigned-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { Write-Error "unsigned Windows artifact hash mismatch"; exit 1 }
+          if ([string]::IsNullOrEmpty($env:WINDOWS_CERTIFICATE)) { Write-Error "missing protected Windows certificate"; exit 1 }
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+            $signtool = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+              Where-Object { $_.FullName -match "x64" } | Select-Object -First 1 -ExpandProperty FullName
+            if (-not $signtool) { Write-Error "signtool.exe not found"; exit 1 }
+            $targets = Get-ChildItem unsigned -Recurse -Include *.msi,*.exe
+            if (-not $targets) { Write-Error "no Windows installers in unsigned artifact"; exit 1 }
+            foreach ($file in $targets) {
+              & $signtool sign /f $pfx /p $env:WINDOWS_CERTIFICATE_PASSWORD /fd SHA256 `
+                /tr "http://timestamp.digicert.com" /td SHA256 /v $file.FullName
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              & $signtool verify /pa /v $file.FullName
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            tar -a -c -f signed-client-windows.zip -C unsigned .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $hash = (Get-FileHash signed-client-windows.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  signed-client-windows.zip" | Set-Content -NoNewline signed-client-windows.zip.SHA256SUMS
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+      - name: Attest signed Windows candidate provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: signed-client-windows.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-client-windows-${{ github.run_attempt }}
+          path: |
+            signed-client-windows.zip
+            signed-client-windows.zip.SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+  sign-linux:
+    needs: build-linux
+    runs-on: ubuntu-22.04
+    environment: release-signing-linux
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-client-linux-${{ github.run_attempt }}
+      - name: Validate Linux archive paths and entry types before exposing secrets
+        run: |
+          set -euo pipefail
+          grep -Eq '^[0-9a-f]{64}  unsigned-linux\.tar\.gz$' unsigned-linux.tar.gz.SHA256SUMS
+          sha256sum --check unsigned-linux.tar.gz.SHA256SUMS
+          python3 - <<'PY'
+          import pathlib
+          import tarfile
+          import unicodedata
+
+          seen = set()
+          count = 0
+          total = 0
+          with tarfile.open("unsigned-linux.tar.gz", "r:gz") as archive:
+              for member in archive.getmembers():
+                  count += 1
+                  if count > 50_000:
+                      raise SystemExit("archive has too many entries")
+                  raw = member.name
+                  if (not raw or len(raw.encode("utf-8")) > 4096 or "\\" in raw or
+                          raw.startswith("/") or any(ord(ch) < 32 for ch in raw)):
+                      raise SystemExit(f"unsafe archive path: {raw!r}")
+                  while raw.startswith("./"):
+                      raw = raw[2:]
+                  if raw in ("", "."):
+                      if not member.isdir():
+                          raise SystemExit("archive root entry is not a directory")
+                      continue
+                  path = pathlib.PurePosixPath(raw)
+                  if any(part in ("", ".", "..") for part in path.parts):
+                      raise SystemExit(f"unsafe archive component: {member.name!r}")
+                  if any(len(part.encode("utf-8")) > 255 for part in path.parts):
+                      raise SystemExit(f"oversized archive component: {member.name!r}")
+                  key = unicodedata.normalize("NFC", raw).casefold()
+                  if key in seen:
+                      raise SystemExit(f"duplicate/case-colliding archive path: {raw!r}")
+                  seen.add(key)
+                  if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                      raise SystemExit(f"links/special entries are forbidden: {raw!r}")
+                  if member.mode & 0o7000:
+                      raise SystemExit(f"setid/sticky archive mode is forbidden: {raw!r}")
+                  if member.size > 4 * 1024**3:
+                      raise SystemExit(f"archive member too large: {raw!r}")
+                  total += member.size
+                  if total > 8 * 1024**3:
+                      raise SystemExit("archive uncompressed size exceeds limit")
+          PY
+          mkdir unsigned
+          tar -xzf unsigned-linux.tar.gz -C unsigned
+          if [ -n "$(find unsigned -type l -print -quit)" ]; then
+            echo "extracted Linux tree contains a symlink" >&2; exit 1
+          fi
+          if [ -n "$(find unsigned -type f -links +1 -print -quit)" ]; then
+            echo "extracted Linux tree contains a hardlink" >&2; exit 1
+          fi
+          if [ -n "$(find unsigned ! -type f ! -type d -print -quit)" ]; then
+            echo "extracted Linux tree contains a special entry" >&2; exit 1
+          fi
+      - name: Verify and GPG-sign prebuilt bundles
         env:
           GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
-          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
-            echo "GPG_PRIVATE_KEY secret is not set — add the armored private key as a repo secret." >&2
-            exit 1
-          fi
+          expected="$(awk '{print $1}' unsigned-linux.tar.gz.SHA256SUMS)"
+          actual="$(sha256sum unsigned-linux.tar.gz | awk '{print $1}')"
+          [ "$actual" = "$expected" ] || { echo "unsigned Linux artifact hash mismatch" >&2; exit 1; }
+          [ -n "${GPG_PRIVATE_KEY:-}" ] || { echo "missing protected GPG key" >&2; exit 1; }
           export GNUPGHOME="$(mktemp -d)"
+          trap 'rm -rf "$GNUPGHOME"' EXIT
           printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
-          bundle_root="${TAURI_CLIENT_DIR}/src-tauri/target/release/bundle"
-          mapfile -t artifacts < <(find "$bundle_root" -type f \( -name '*.deb' -o -name '*.AppImage' \))
-          if [ "${#artifacts[@]}" -eq 0 ]; then
-            echo "No .deb/.AppImage produced under $bundle_root" >&2
-            exit 1
-          fi
-          for f in "${artifacts[@]}"; do
+          mapfile -t targets < <(find unsigned -type f \( -name '*.deb' -o -name '*.AppImage' \))
+          [ "${#targets[@]}" -gt 0 ] || { echo "no Linux bundles in unsigned artifact" >&2; exit 1; }
+          for file in "${targets[@]}"; do
             gpg --batch --yes --pinentry-mode loopback --passphrase "$GPG_PASSPHRASE" \
-              --armor --detach-sign --output "${f}.asc" "$f"
-            gpg --batch --verify "${f}.asc" "$f"
+              --armor --detach-sign --output "${file}.asc" "$file"
+            gpg --batch --verify "${file}.asc" "$file"
           done
-          rm -rf "$GNUPGHOME"
-
-      - name: Upload signed Linux bundles
-        uses: actions/upload-artifact@v4
+          tar -czf signed-client-linux.tar.gz -C unsigned .
+          sha256sum signed-client-linux.tar.gz > signed-client-linux.tar.gz.SHA256SUMS
+      - name: Attest signed Linux candidate provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          name: nilvpn-linux-signed
+          subject-path: signed-client-linux.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-client-linux-${{ github.run_attempt }}
           path: |
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/deb/*.deb
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/deb/*.deb.asc
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/appimage/*.AppImage
-            ${{ env.TAURI_CLIENT_DIR }}/src-tauri/target/release/bundle/appimage/*.AppImage.asc
+            signed-client-linux.tar.gz
+            signed-client-linux.tar.gz.SHA256SUMS
           if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
 
-# ===========================================================================================
-# TODO (founder) — Tauri auto-updater signing. The in-app updater requires its OWN minisign
-# keypair (NOT the OS code-signing certs above):
-#   1. `pnpm --dir client tauri signer generate -w nilvpn-updater.key`   (keep the .key OFFLINE).
-#   2. Add the PUBLIC key to client/src-tauri/tauri.conf.json under `plugins.updater.pubkey`
-#      and configure an `endpoints` URL.
-#   3. Add repo secrets TAURI_SIGNING_PRIVATE_KEY (the .key contents) and
-#      TAURI_SIGNING_PRIVATE_KEY_PASSWORD (its passphrase).
-#   4. Set both as `env:` on each tauri-apps/tauri-action step above — tauri-action then emits
-#      the signed `latest.json` + `*.sig` updater artifacts automatically.
-# Until the founder completes this, the app ships WITHOUT auto-update (correct for closed alpha).
-#
-# TODO (founder) — promote to a public GitHub Release. Intentionally NOT automated so a
-# partial/unsigned run never publishes. After verifying the three `nilvpn-*-signed` artifacts,
-# enable a `release` job that downloads them and runs softprops/action-gh-release (needs
-# `permissions: contents: write`).
-# ===========================================================================================
+  client-manifest:
+    needs: [sign-macos, sign-windows, sign-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      client_manifest_sha256: ${{ steps.manifest.outputs.sha256 }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: signed-client-*-${{ github.run_attempt }}
+          path: signed-clients
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: client-combined-sbom-${{ github.run_attempt }}
+          path: client-manifest
+      - uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+        with:
+          cosign-release: v2.4.1
+      - name: Build and keyless-sign the complete client candidate manifest
+        id: manifest
+        env:
+          COSIGN_YES: "true"
+        run: |
+          set -euo pipefail
+          mkdir -p client-manifest
+          for platform in macos windows linux; do
+            platform_dir="signed-clients/signed-client-${platform}-${GITHUB_RUN_ATTEMPT}"
+            checksum="$(find "$platform_dir" -name '*.SHA256SUMS' -type f -print -quit)"
+            [ -s "$checksum" ] || { echo "missing $platform checksum" >&2; exit 1; }
+            archive="$(find "$platform_dir" -type f ! -name '*.SHA256SUMS' -print -quit)"
+            [ -s "$archive" ] || { echo "missing $platform signed archive" >&2; exit 1; }
+            expected="$(awk '{print $1}' "$checksum")"
+            actual="$(sha256sum "$archive" | awk '{print $1}')"
+            [ "$actual" = "$expected" ] || { echo "$platform signed archive hash mismatch" >&2; exit 1; }
+            cp "$checksum" "client-manifest/${platform}.SHA256SUMS"
+          done
+          macos="$(awk '{print $1}' client-manifest/macos.SHA256SUMS)"
+          windows="$(awk '{print $1}' client-manifest/windows.SHA256SUMS)"
+          linux="$(awk '{print $1}' client-manifest/linux.SHA256SUMS)"
+          sbom="$(sha256sum client-manifest/client.cdx.json | awk '{print $1}')"
+          jq -n --arg source_sha "$GITHUB_SHA" --arg github_run_id "$GITHUB_RUN_ID" \
+            --argjson github_run_attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg macos "$macos" --arg windows "$windows" \
+            --arg linux "$linux" --arg sbom "$sbom" \
+            '{schema:"https://nilvpn.net/release-client-set/v1",source_sha:$source_sha,github_run_id:$github_run_id,github_run_attempt:$github_run_attempt,node:"22.17.1",pnpm:"10.33.0",artifacts:{macos_sha256:$macos,windows_sha256:$windows,linux_sha256:$linux},combined_sbom_sha256:$sbom,published_release:false}' \
+            > client-manifest/clients.json
+          sha="$(sha256sum client-manifest/clients.json | awk '{print $1}')"
+          printf '%s  %s\n' "$sha" clients.json > client-manifest/SHA256SUMS
+          cosign sign-blob --yes --bundle client-manifest/clients.sigstore.json \
+            client-manifest/clients.json
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-client-manifest-${{ github.run_attempt }}
+          path: client-manifest
+          if-no-files-found: error
+          retention-days: 30

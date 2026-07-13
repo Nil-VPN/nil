@@ -31,14 +31,24 @@ bash "$APPLE_DIR/build-engine.sh" release
 #    per-target scheme (visible via `xcodebuild -list`); signing is fully disabled so no
 #    certs/team/provisioning are needed. -scheme is required alongside -derivedDataPath.
 rm -rf "$OUT_DIR"
-xcodebuild \
+BUILD_LOG="$OUT_DIR/xcodebuild.log"
+mkdir -p "$OUT_DIR"
+if ! xcodebuild \
   -project "$PROJ" \
   -scheme PacketTunnel \
   -configuration Release \
   -sdk macosx \
   -derivedDataPath "$OUT_DIR/DerivedData" \
   CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO DEVELOPMENT_TEAM="" \
-  build
+  build 2>&1 | tee "$BUILD_LOG"; then
+  echo "FAIL: xcodebuild failed" >&2
+  exit 1
+fi
+if grep -Eiq "(object file|was built).*newer.*(macOS|deployment|being linked)" "$BUILD_LOG"; then
+  echo "FAIL: a native object was built for a newer macOS deployment target" >&2
+  grep -Ei "(object file|was built).*newer.*(macOS|deployment|being linked)" "$BUILD_LOG" >&2
+  exit 1
+fi
 
 # 4. Assert the artifact: a .systemextension bundle with an arm64 Mach-O executable inside.
 SE="$(find "$OUT_DIR/DerivedData/Build/Products" -type d -name '*.systemextension' | head -1)"
@@ -46,6 +56,12 @@ SE="$(find "$OUT_DIR/DerivedData/Build/Products" -type d -name '*.systemextensio
 MACH_O="$SE/Contents/MacOS/com.nilvpn.client.PacketTunnel"
 [[ -f "$MACH_O" ]] || { echo "FAIL: no Mach-O executable inside the SE bundle"; exit 1; }
 file "$MACH_O" | grep -q "Mach-O.*arm64" || { echo "FAIL: SE executable is not an arm64 Mach-O"; exit 1; }
+MIN_OS=$(xcrun vtool -show-build "$MACH_O" | awk '/minos/{print $2; exit}')
+[[ "$MIN_OS" == "13.0" ]] \
+  || { echo "FAIL: SE Mach-O minimum OS is ${MIN_OS:-missing}, expected 13.0" >&2; exit 1; }
+PLIST_MIN=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$SE/Contents/Info.plist")
+[[ "$PLIST_MIN" == "13.0" ]] \
+  || { echo "FAIL: SE Info.plist minimum OS is ${PLIST_MIN:-missing}, expected 13.0" >&2; exit 1; }
 
 # 5. Best-effort: confirm the nil-apple engine symbols linked in (not fatal — a stripped release
 #    build may hide them; the link itself already succeeded above if we got here).
