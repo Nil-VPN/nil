@@ -135,7 +135,9 @@ async fn serve<S>(
     // A malformed/short offer drops the connection (the slot frees; no PII is logged).
     let psk = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, recv_binary(&mut ws)).await {
         Ok(Some(offer_bytes)) => {
-            let Some(parts) = decode_parts(&offer_bytes) else { return };
+            let Some(parts) = decode_parts(&offer_bytes) else {
+                return;
+            };
             if parts.len() != 2 {
                 return;
             }
@@ -157,7 +159,10 @@ async fn serve<S>(
                 _ => return,
             };
             if ws
-                .send(Message::Binary(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct])))
+                .send(Message::Binary(encode_parts(&[
+                    &cts.mlkem_ct,
+                    &cts.mceliece_ct,
+                ])))
                 .await
                 .is_err()
             {
@@ -221,7 +226,8 @@ where
 /// A TLS acceptor with a fresh self-signed dev cert (the TLS is the obfuscation envelope, not the
 /// trust boundary — the inner WireGuard is).
 fn tls_acceptor() -> anyhow::Result<tokio_rustls::TlsAcceptor> {
-    let ck = rcgen::generate_simple_self_signed(vec!["nil-node".to_string(), "localhost".to_string()])?;
+    let ck =
+        rcgen::generate_simple_self_signed(vec!["nil-node".to_string(), "localhost".to_string()])?;
     let cert_der = ck.cert.der().clone();
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(ck.key_pair.serialize_der())
         .map_err(|e| anyhow::anyhow!("wstunnel server key: {e}"))?;

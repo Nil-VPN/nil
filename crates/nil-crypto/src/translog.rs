@@ -1,7 +1,7 @@
 //! Transparency-log inclusion verification (architecture review: "prove, don't promise").
 //!
 //! The client should be able to check *itself* that a node's reproducible-build measurement is
-//! present in a public append-only transparency log (Sigstore/Rekor), rather than trusting a
+//! present in an independently operated append-only transparency log, rather than trusting a
 //! Coordinator-pinned value — so a compromised/coerced Coordinator (or a malicious future owner)
 //! cannot substitute a measurement pointing at a backdoored node without leaving a publicly visible,
 //! log-detectable trace (PD-5/PD-7).
@@ -13,9 +13,12 @@
 //! so the client never phones home to the log — which would leak *which* node it is verifying (PD-3).
 //!
 //! Merkle hashing follows RFC 6962 §2.1 (leaf prefix 0x00, node prefix 0x01) and the inclusion-proof
-//! reconstruction is the standard Trillian decomposition. The checkpoint body is the Go/Sigstore
-//! signed-note layout (`origin\n<size>\n<base64 root>\n`); adapting a real Rekor bundle is a matter
-//! of parsing its note + inclusion proof into [`LogProof`].
+//! reconstruction is the standard Trillian decomposition. This verifier currently defines a
+//! NIL-specific Ed25519 checkpoint body (`origin\n<size>\n<base64 root>\n`) whose leaf is the raw
+//! measurement bytes. It is **not** a Sigstore bundle/Rekor adapter: Rekor proves inclusion of a
+//! canonicalized transparency entry and uses a signed-note envelope/trusted-root policy. Production
+//! use requires a reviewed converter/verifier that binds that entry's signed attestation predicate
+//! to the exact measurement; treating a cosign bundle as [`LogProof`] would be unsafe.
 
 use data_encoding::BASE64;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
@@ -59,8 +62,10 @@ pub struct LogProof {
 impl LogProof {
     /// Serialize for stapling alongside attestation evidence. Self-describing, big-endian:
     /// `[u16 origin_len][origin][u64 tree_size][u64 leaf_index][32 root][u16 path_len][path*32]
-    /// [u16 sig_len][sig]`. The deploy pipeline emits this from a real Rekor bundle; the client
-    /// decodes it with [`LogProof::decode`] and never trusts it until [`verify_logged`] passes.
+    /// [u16 sig_len][sig]`. A compatible NIL log operator may emit this directly. A Sigstore/Rekor
+    /// bundle cannot be copied into this shape without separately verifying and binding its signed
+    /// entry/attestation semantics; see the module-level limitation. The client decodes the bytes
+    /// with [`LogProof::decode`] and never trusts them until [`verify_logged`] passes.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let origin = self.origin.as_bytes();
@@ -96,7 +101,14 @@ impl LogProof {
         if !b.is_empty() {
             return None; // trailing garbage ⇒ reject rather than silently ignore
         }
-        Some(LogProof { origin, tree_size, leaf_index, root, audit_path, checkpoint_sig })
+        Some(LogProof {
+            origin,
+            tree_size,
+            leaf_index,
+            root,
+            audit_path,
+            checkpoint_sig,
+        })
     }
 }
 
@@ -177,8 +189,12 @@ pub fn verify_logged(leaf_data: &[u8], proof: &LogProof, log_pubkey: &[u8; 32]) 
     if !verify_checkpoint(proof, &log_key) {
         return false;
     }
-    root_from_inclusion(proof.leaf_index, proof.tree_size, leaf_hash(leaf_data), &proof.audit_path)
-        == Some(proof.root)
+    root_from_inclusion(
+        proof.leaf_index,
+        proof.tree_size,
+        leaf_hash(leaf_data),
+        &proof.audit_path,
+    ) == Some(proof.root)
 }
 
 #[cfg(test)]
@@ -266,31 +282,51 @@ mod tests {
         let good = proof_for(5, &leaves, &sk, "nil.transparency.v1");
 
         // Wrong leaf data (a substituted measurement) → not included.
-        assert!(!verify_logged(&[0xFFu8; 48], &good, &pk), "substituted leaf rejected");
+        assert!(
+            !verify_logged(&[0xFFu8; 48], &good, &pk),
+            "substituted leaf rejected"
+        );
 
         // Tampered root → checkpoint signature no longer matches.
         let mut bad_root = good.clone();
         bad_root.root[0] ^= 1;
-        assert!(!verify_logged(&leaves[5], &bad_root, &pk), "tampered root rejected");
+        assert!(
+            !verify_logged(&leaves[5], &bad_root, &pk),
+            "tampered root rejected"
+        );
 
         // Corrupted audit path → wrong reconstructed root.
         let mut bad_path = good.clone();
         bad_path.audit_path[0][0] ^= 1;
-        assert!(!verify_logged(&leaves[5], &bad_path, &pk), "corrupted path rejected");
+        assert!(
+            !verify_logged(&leaves[5], &bad_path, &pk),
+            "corrupted path rejected"
+        );
 
         // Wrong log key (a forged checkpoint signed by someone else) → rejected.
-        let other = SigningKey::from_bytes(&[1u8; 32]).verifying_key().to_bytes();
-        assert!(!verify_logged(&leaves[5], &good, &other), "wrong log key rejected");
+        let other = SigningKey::from_bytes(&[1u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(
+            !verify_logged(&leaves[5], &good, &other),
+            "wrong log key rejected"
+        );
 
         // Garbage signature → rejected.
         let mut bad_sig = good.clone();
         bad_sig.checkpoint_sig = vec![0u8; 64];
-        assert!(!verify_logged(&leaves[5], &bad_sig, &pk), "bad signature rejected");
+        assert!(
+            !verify_logged(&leaves[5], &bad_sig, &pk),
+            "bad signature rejected"
+        );
 
         // Mismatched index (claiming a different position) → wrong root.
         let mut bad_idx = good.clone();
         bad_idx.leaf_index = 6;
-        assert!(!verify_logged(&leaves[5], &bad_idx, &pk), "wrong index rejected");
+        assert!(
+            !verify_logged(&leaves[5], &bad_idx, &pk),
+            "wrong index rejected"
+        );
     }
 
     #[test]
@@ -309,7 +345,10 @@ mod tests {
         assert_eq!(back.audit_path, proof.audit_path);
         assert_eq!(back.checkpoint_sig, proof.checkpoint_sig);
         // The decoded proof still verifies against the same pinned key + leaf.
-        assert!(verify_logged(&leaves[9], &back, &pk), "decoded proof must still verify");
+        assert!(
+            verify_logged(&leaves[9], &back, &pk),
+            "decoded proof must still verify"
+        );
     }
 
     #[test]
@@ -319,10 +358,16 @@ mod tests {
         let bytes = proof_for(2, &leaves, &sk, "nil.transparency.v1").encode();
 
         for cut in 0..bytes.len() {
-            assert!(LogProof::decode(&bytes[..cut]).is_none(), "truncated at {cut} must be None");
+            assert!(
+                LogProof::decode(&bytes[..cut]).is_none(),
+                "truncated at {cut} must be None"
+            );
         }
         let mut extra = bytes.clone();
         extra.push(0);
-        assert!(LogProof::decode(&extra).is_none(), "trailing garbage must be None");
+        assert!(
+            LogProof::decode(&extra).is_none(),
+            "trailing garbage must be None"
+        );
     }
 }

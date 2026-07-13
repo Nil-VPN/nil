@@ -107,14 +107,18 @@ impl Responder {
             self.admit(client_pub, from);
             return Vec::new();
         }
-        let Some(wg) = self.obfs.deobfuscate(wire) else { return Vec::new() };
+        let Some(wg) = self.obfs.deobfuscate(wire) else {
+            return Vec::new();
+        };
         // Select the client's WireGuard core by UDP source address.
         if !self.clients.contains_key(&from) {
             return Vec::new();
         }
         // Present per the guard above; capture `seq` up-front so route learning (which needs a
         // separate &mut self borrow) can run after the per-client core borrow is released.
-        let Some(seq) = self.clients.get(&from).map(|c| c.seq) else { return Vec::new() };
+        let Some(seq) = self.clients.get(&from).map(|c| c.seq) else {
+            return Vec::new();
+        };
         let mut out = Vec::new();
         let mut input = wg;
         let mut learned_src = None;
@@ -156,8 +160,10 @@ impl Responder {
             if owner_addr == from && owner_seq == seq {
                 return; // already ours — no new entry, no growth
             }
-            let owned_by_other_live =
-                self.clients.get(&owner_addr).is_some_and(|c| c.seq == owner_seq);
+            let owned_by_other_live = self
+                .clients
+                .get(&owner_addr)
+                .is_some_and(|c| c.seq == owner_seq);
             if owned_by_other_live {
                 return; // a different live client owns this inner IP — drop, never hijack
             }
@@ -165,7 +171,9 @@ impl Responder {
         }
         // Update the owning client's bounded route list, evicting its oldest route if at the cap.
         let evicted = {
-            let Some(client) = self.clients.get_mut(&from) else { return };
+            let Some(client) = self.clients.get_mut(&from) else {
+                return;
+            };
             let evicted = (client.owned_routes.len() >= MAX_ROUTES_PER_CLIENT)
                 .then(|| client.owned_routes.remove(0));
             client.owned_routes.push(src);
@@ -174,7 +182,11 @@ impl Responder {
         if let Some(old) = evicted {
             // Only drop the shared route if THIS client still owns it (a stale-takeover elsewhere
             // may have reassigned it in the meantime).
-            if self.routes.get(&old).is_some_and(|&(a, s)| a == from && s == seq) {
+            if self
+                .routes
+                .get(&old)
+                .is_some_and(|&(a, s)| a == from && s == seq)
+            {
                 self.routes.remove(&old);
             }
         }
@@ -183,8 +195,12 @@ impl Responder {
 
     /// A reply arriving on the shared exit TUN → route to the owning client by destination IP.
     fn handle_tun(&mut self, ip: &[u8]) -> Vec<Action> {
-        let Some(dst) = ipv4_dst(ip) else { return Vec::new() };
-        let Some(&(addr, seq)) = self.routes.get(&dst) else { return Vec::new() };
+        let Some(dst) = ipv4_dst(ip) else {
+            return Vec::new();
+        };
+        let Some(&(addr, seq)) = self.routes.get(&dst) else {
+            return Vec::new();
+        };
         // Forward ONLY if the client currently at `addr` is the same instance that created the
         // route (`seq` match). Otherwise the original owner disconnected/was replaced: drop the
         // packet — never encapsulate one user's reply under another user's session — and purge the
@@ -254,16 +270,24 @@ impl Responder {
         self.next_seq += 1;
         self.clients.insert(
             from,
-            Client { pubkey: client_pub, core, established: false, seq, owned_routes: Vec::new() },
+            Client {
+                pubkey: client_pub,
+                core,
+                established: false,
+                seq,
+                owned_routes: Vec::new(),
+            },
         );
     }
 }
 
 fn ipv4_src(pkt: &[u8]) -> Option<Ipv4Addr> {
-    (pkt.len() >= 20 && (pkt[0] >> 4) == 4).then(|| Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
+    (pkt.len() >= 20 && (pkt[0] >> 4) == 4)
+        .then(|| Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]))
 }
 fn ipv4_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
-    (pkt.len() >= 20 && (pkt[0] >> 4) == 4).then(|| Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+    (pkt.len() >= 20 && (pkt[0] >> 4) == 4)
+        .then(|| Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
 }
 
 pub async fn run(cfg: &NodeConfig, tun: Arc<AsyncDevice>) -> anyhow::Result<()> {
@@ -347,7 +371,12 @@ mod tests {
     }
 
     /// Bring a client to "established" against the responder and return its core + the IP it uses.
-    fn establish(responder: &mut Responder, node_pub: PublicKey, addr: SocketAddr, index: u32) -> PqWgCore {
+    fn establish(
+        responder: &mut Responder,
+        node_pub: PublicKey,
+        addr: SocketAddr,
+        index: u32,
+    ) -> PqWgCore {
         let obfs = ObfsParams::derive(node_pub.as_bytes());
         let kp = WgKeypair::generate().unwrap();
         let mut core = PqWgCore::without_psk(kp.secret, node_pub, index);
@@ -379,7 +408,11 @@ mod tests {
         let addr_b: SocketAddr = "203.0.113.2:51820".parse().unwrap();
         let mut core_a = establish(&mut responder, node_pub, addr_a, 101);
         let mut core_b = establish(&mut responder, node_pub, addr_b, 102);
-        assert_eq!(responder.clients.len(), 2, "both clients tracked concurrently");
+        assert_eq!(
+            responder.clients.len(),
+            2,
+            "both clients tracked concurrently"
+        );
 
         let obfs = ObfsParams::derive(node_pub.as_bytes());
         let ip_a = [10, 74, 0, 2];
@@ -399,8 +432,14 @@ mod tests {
             assert_eq!(to_tun.len(), 1, "one inner packet reaches the TUN");
             assert_eq!(ipv4_src(&to_tun[0]), Some(Ipv4Addr::from(ip)));
         }
-        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_a)).map(|v| v.0), Some(addr_a));
-        assert_eq!(responder.routes.get(&Ipv4Addr::from(ip_b)).map(|v| v.0), Some(addr_b));
+        assert_eq!(
+            responder.routes.get(&Ipv4Addr::from(ip_a)).map(|v| v.0),
+            Some(addr_a)
+        );
+        assert_eq!(
+            responder.routes.get(&Ipv4Addr::from(ip_b)).map(|v| v.0),
+            Some(addr_b)
+        );
 
         // A reply addressed to client B's inner IP must encapsulate to B (not A), and decapsulate
         // cleanly on B's core — proving the shared-TUN dispatch picks the correct client.
@@ -451,8 +490,14 @@ mod tests {
         // the map bounded — a preface flood can't lock out room for new peers.
         r.admit([255u8; 32], addr(MAX_CLIENTS));
         assert_eq!(r.clients.len(), MAX_CLIENTS, "stays bounded at capacity");
-        assert!(!r.clients.contains_key(&addr(0)), "oldest non-established evicted");
-        assert!(r.clients.contains_key(&addr(MAX_CLIENTS)), "new client admitted");
+        assert!(
+            !r.clients.contains_key(&addr(0)),
+            "oldest non-established evicted"
+        );
+        assert!(
+            r.clients.contains_key(&addr(MAX_CLIENTS)),
+            "new client admitted"
+        );
     }
 
     #[test]
@@ -465,7 +510,9 @@ mod tests {
         let obfs = ObfsParams::derive(node_pub.as_bytes());
 
         // A data packet flips the client to "established" (handshake alone does not).
-        let data = core.encapsulate(&ipv4([10, 74, 0, 2], [1, 1, 1, 1])).unwrap();
+        let data = core
+            .encapsulate(&ipv4([10, 74, 0, 2], [1, 1, 1, 1]))
+            .unwrap();
         r.handle_udp(&obfs.obfuscate(&data), addr);
         let (real_key, was_established) = {
             let c = r.clients.get(&addr).expect("client present");
@@ -479,7 +526,10 @@ mod tests {
 
         let c = r.clients.get(&addr).expect("client still present");
         assert!(c.established, "established flag preserved");
-        assert_eq!(c.pubkey, real_key, "a bare preface cannot swap an established peer's key");
+        assert_eq!(
+            c.pubkey, real_key,
+            "a bare preface cannot swap an established peer's key"
+        );
     }
 
     #[test]
@@ -523,7 +573,10 @@ mod tests {
         let a_data = core_a.encapsulate(&ipv4(shared_ip, [1, 1, 1, 1])).unwrap();
         r.handle_udp(&obfs.obfuscate(&a_data), addr_a);
         let a_seq = r.clients.get(&addr_a).unwrap().seq;
-        assert_eq!(r.routes.get(&Ipv4Addr::from(shared_ip)).copied(), Some((addr_a, a_seq)));
+        assert_eq!(
+            r.routes.get(&Ipv4Addr::from(shared_ip)).copied(),
+            Some((addr_a, a_seq))
+        );
 
         // B spoofs the SAME inner source IP. The responder must NOT reassign the route to B — doing
         // so would hijack A's return traffic. A keeps ownership.
@@ -555,7 +608,13 @@ mod tests {
         // longer matches the client now at `addr`). A reply for that IP must be DROPPED — never
         // encapsulated under a different client's session — and the stale route purged.
         r.routes.insert(Ipv4Addr::from(ip), (addr, 9999));
-        assert!(r.handle_tun(&ipv4([1, 1, 1, 1], ip)).is_empty(), "stale-seq reply dropped");
-        assert!(!r.routes.contains_key(&Ipv4Addr::from(ip)), "stale route purged");
+        assert!(
+            r.handle_tun(&ipv4([1, 1, 1, 1], ip)).is_empty(),
+            "stale-seq reply dropped"
+        );
+        assert!(
+            !r.routes.contains_key(&Ipv4Addr::from(ip)),
+            "stale route purged"
+        );
     }
 }

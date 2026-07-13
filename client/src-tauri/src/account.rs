@@ -1,14 +1,17 @@
 //! Talks to the Business plane (`nil-portal`) over HTTP.
 //!
-//! Account creation is a real `POST /v1/account` to the Portal, so Phase 0 actually
-//! validates the client↔Portal 7-word contract. The client is built lazily and never
-//! connects at startup, so a Portal that is down surfaces as an error in the UI — it
-//! never stops the app from launching (fail-soft).
+//! Account creation is local-first: the client creates the checksummed recovery mnemonic and
+//! derives the account/authentication keys on-device, then `POST /v1/account` sends only the
+//! anonymous account number, public key, and a proof of possession. Recovery material never crosses
+//! the network. The HTTP client is lazy, so a Portal outage never prevents the app from launching.
 
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use nil_proto::account::{AccountAuth, AccountStatusResponse, ActivateRequest, ChallengeResponse};
+use nil_proto::account::{
+    AccountAuth, AccountStatusResponse, ActivateRequest, ChallengeResponse, CreateAccountRequest,
+    CreateAccountResponse, EntitlementDto,
+};
 use nil_proto::token::CheckoutResponse;
 
 use crate::authstore::AccountAuthMaterial;
@@ -30,7 +33,8 @@ impl Default for PortalClient {
 }
 
 impl PortalClient {
-    /// Read `PORTAL_URL` (default `http://127.0.0.1:8080`). Does not connect.
+    /// Read `PORTAL_URL` (debug-local default `http://127.0.0.1:8080`). Does not connect; release
+    /// URL policy rejects that plaintext default before any request if no HTTPS URL is configured.
     pub fn from_env() -> Self {
         let base_url =
             std::env::var("PORTAL_URL").unwrap_or_else(|_| DEFAULT_PORTAL_URL.to_string());
@@ -51,35 +55,37 @@ impl PortalClient {
 
     pub async fn create_anonymous(&self) -> Result<AnonymousAccount, PortalError> {
         self.ensure_safe_base_url()?;
-        self.http
+        // Generate every secret locally. Only public, anonymous registration material is serialized
+        // below; the Portal never sees the mnemonic or the derived signing seed (SOUL PD-7).
+        let derived = nil_crypto::account::create_account_os();
+        let account_number = *derived.account_number.as_bytes();
+        let keypair = nil_crypto::account::AuthKeypair::from_phrase(&derived.recovery_phrase)
+            .map_err(|e| PortalError::Crypto(e.to_string()))?;
+        let expected_account = to_hex(&account_number);
+        let request = CreateAccountRequest::Anonymous {
+            account_number: expected_account.clone(),
+            auth_pubkey: to_hex(&derived.auth_public_key),
+            registration_signature: to_hex(&keypair.sign_registration(&account_number)),
+        };
+        let response = self
+            .http
             .post(format!("{}/v1/account", self.base_url))
-            .json(&serde_json::json!({ "type": "anonymous" }))
+            .json(&request)
             .send()
             .await?
             .error_for_status()?
-            .json::<AnonymousAccount>()
+            .json::<CreateAccountResponse>()
             .await
-            .map_err(Into::into)
-    }
-
-    pub async fn recover(
-        &self,
-        recovery_phrase: Vec<String>,
-        recovery_code: String,
-    ) -> Result<RecoverResult, PortalError> {
-        self.ensure_safe_base_url()?;
-        self.http
-            .post(format!("{}/v1/account/recover", self.base_url))
-            .json(&serde_json::json!({
-                "recovery_phrase": recovery_phrase,
-                "recovery_code": recovery_code,
-            }))
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<RecoverResult>()
-            .await
-            .map_err(Into::into)
+            .map_err(PortalError::from)?;
+        if response.account_number != expected_account {
+            return Err(PortalError::Crypto(
+                "Portal returned a different account number after registration".into(),
+            ));
+        }
+        Ok(AnonymousAccount {
+            account_number: expected_account,
+            recovery_phrase: derived.recovery_phrase.to_vec(),
+        })
     }
 
     /// Subscribe: prove account ownership, then mint a payment reference to pay (ADR-0007). The
@@ -115,7 +121,10 @@ impl PortalClient {
         let resp = self
             .http
             .post(format!("{base}/v1/billing/activate"))
-            .json(&ActivateRequest { auth, payment_reference })
+            .json(&ActivateRequest {
+                auth,
+                payment_reference,
+            })
             .send()
             .await?;
         let status = resp.status();
@@ -149,10 +158,7 @@ impl PortalClient {
     }
 
     fn ensure_safe_base_url(&self) -> Result<(), PortalError> {
-        if nil_core::net::env_flag("NW_INSECURE_CONTROL_PLANE") {
-            return Ok(());
-        }
-        nil_core::net::require_tls_or_loopback(&self.base_url).map_err(PortalError::UnsafeUrl)
+        crate::netpolicy::require_safe_control_url(&self.base_url).map_err(PortalError::UnsafeUrl)
     }
 }
 
@@ -208,18 +214,18 @@ fn parse_hex32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// Response from anonymous signup — mirrors `nil-proto::CreateAccountResponse`.
+/// Local result of anonymous signup. The Portal response contains only `account_number`; the
+/// mnemonic is added here from the client-generated account and never came from the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnonymousAccount {
     pub account_number: String,
     pub recovery_phrase: Vec<String>,
-    pub recovery_code: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecoverResult {
     pub account_number: String,
-    pub entitlement: String,
+    pub entitlement: EntitlementDto,
 }
 
 /// A mocked VPN location (Phase 0 — real path selection arrives with the Coordinator).
@@ -272,10 +278,25 @@ mod tests {
     }
 
     #[test]
-    fn accepts_https_and_loopback_portal_urls() {
+    fn accepts_https_portal_urls() {
         let https = PortalClient::with_base_url("https://portal.example.com".to_string());
-        let local = PortalClient::with_base_url("http://127.0.0.1:8080".to_string());
         assert!(https.ensure_safe_base_url().is_ok());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_accepts_loopback_portal_urls() {
+        let local = PortalClient::with_base_url("http://127.0.0.1:8080".to_string());
         assert!(local.ensure_safe_base_url().is_ok());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_rejects_loopback_portal_urls() {
+        let local = PortalClient::with_base_url("http://127.0.0.1:8080".to_string());
+        assert!(matches!(
+            local.ensure_safe_base_url(),
+            Err(PortalError::UnsafeUrl(_))
+        ));
     }
 }

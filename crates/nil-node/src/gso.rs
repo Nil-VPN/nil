@@ -39,9 +39,15 @@ pub async fn send_segmented(
         let res = socket.try_io(tokio::io::Interest::WRITABLE, || {
             let iov = [IoSlice::new(batch)];
             let cmsg = [ControlMessage::UdpGsoSegments(&seg)];
-            sendmsg(socket.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), Some(&addr))
-                .map(|_| ())
-                .map_err(std::io::Error::from)
+            sendmsg(
+                socket.as_raw_fd(),
+                &iov,
+                &cmsg,
+                MsgFlags::empty(),
+                Some(&addr),
+            )
+            .map(|_| ())
+            .map_err(std::io::Error::from)
         });
         match res {
             Ok(()) => return Ok(()),
@@ -102,7 +108,10 @@ mod tests {
         assert_eq!(got.len(), full + 1, "N full + 1 tail segment");
         for (i, d) in got.iter().take(full).enumerate() {
             assert_eq!(d.len(), seg, "full segment {i} is one MSS");
-            assert!(d.iter().all(|&b| b == i as u8 + 1), "segment {i} bytes intact");
+            assert!(
+                d.iter().all(|&b| b == i as u8 + 1),
+                "segment {i} bytes intact"
+            );
         }
         assert_eq!(got[full].len(), tail, "final short segment");
         assert!(got[full].iter().all(|&b| b == 0xEE), "tail bytes intact");

@@ -1,61 +1,75 @@
 //! HTTP handlers for the account endpoints (architecture spec §7.5, §8, §13.3).
 
-use std::net::SocketAddr;
-
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 
-use nil_crypto::account::{self, Phrase, RecoveryCode};
+use nil_crypto::account::{verify_registration_signature, AUTH_PUBKEY_LEN, AUTH_SIG_LEN};
 use nil_proto::account::{
     AccountAuth, AccountStatusResponse, ChallengeResponse, CreateAccountRequest,
-    CreateAccountResponse, RecoverRequest, RecoverResponse,
+    CreateAccountResponse,
 };
 
 use crate::account::auth::{authenticate, AuthError};
 use crate::account::error::ApiError;
 use crate::account::model::{AccountRecord, Entitlement};
+use crate::client_ip::ClientIp;
 use crate::state::AppState;
+use crate::store::{hex32, StoreError};
 
 /// `POST /v1/account` — create an account.
 ///
-/// For `{"type":"anonymous"}` the Portal generates a 256-bit secret (derived from a
-/// fresh 7-word phrase), an account number `= H(secret)`, and a one-time recovery
-/// code, then stores ONLY `H(secret)` + the recovery-code hash + entitlement. The
-/// phrase and code are returned to the user and never persisted.
+/// For `{"type":"anonymous", ...}` the client generates and retains all secret material. The
+/// Portal accepts only `H(secret)`, the public authentication key, and a signature proving
+/// possession of the corresponding private key. Recovery material never crosses the network.
 pub async fn create_account(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     State(state): State<AppState>,
     Json(req): Json<CreateAccountRequest>,
 ) -> Result<(StatusCode, Json<CreateAccountResponse>), ApiError> {
     // Abuse control: cap account creations per client IP to stop storage-exhaustion flooding.
     // The IP is used transiently for the counter only — never stored, logged, or tied to an
     // account (PD-3: no identity in the data we keep).
-    if !state.limiter.check(&peer.ip().to_string()) {
+    if !state.limiter.check(&client_ip.to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     match req {
-        CreateAccountRequest::Anonymous => {
-            let derived = account::create_account_os();
+        CreateAccountRequest::Anonymous {
+            account_number,
+            auth_pubkey,
+            registration_signature,
+        } => {
+            let account_number = parse_lower_hex::<32>(&account_number).ok_or(
+                ApiError::BadRequest("account_number must be 64 lowercase hex characters"),
+            )?;
+            let auth_pubkey = parse_lower_hex::<AUTH_PUBKEY_LEN>(&auth_pubkey).ok_or(
+                ApiError::BadRequest("auth_pubkey must be 64 lowercase hex characters"),
+            )?;
+            let registration_signature = parse_lower_hex::<AUTH_SIG_LEN>(&registration_signature)
+                .ok_or(ApiError::BadRequest(
+                "registration_signature must be 128 lowercase hex characters",
+            ))?;
+
+            if !verify_registration_signature(
+                &account_number,
+                &auth_pubkey,
+                &registration_signature,
+            ) {
+                return Err(ApiError::Unauthorized);
+            }
+
             let record = AccountRecord {
-                account_number: *derived.account_number.as_bytes(),
-                recovery_code_hash: derived.recovery_code_hash,
+                account_number,
                 entitlement: Entitlement::None,
-                // Store the PUBLIC auth key so the account can later prove ownership via a signed
-                // challenge (ADR-0007). The secret half is derived on the client from the phrase
-                // and never leaves it.
-                auth_pubkey: derived.auth_public_key,
+                auth_pubkey,
             };
-            state
-                .store
-                .insert(record)
-                .await
-                .map_err(|_| ApiError::Internal)?;
+            state.store.insert(record).await.map_err(|e| match e {
+                StoreError::Duplicate => ApiError::Conflict,
+                StoreError::Backend(_) => ApiError::Internal,
+            })?;
 
             let resp = CreateAccountResponse {
-                account_number: derived.account_number.display(),
-                recovery_phrase: derived.recovery_phrase.to_vec(),
-                recovery_code: derived.recovery_code.display(),
+                account_number: hex32(&account_number),
             };
             Ok((StatusCode::CREATED, Json(resp)))
         }
@@ -64,62 +78,18 @@ pub async fn create_account(
     }
 }
 
-/// `POST /v1/account/recover` — recover via the 7-word phrase + one-time code.
-pub async fn recover_account(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    State(state): State<AppState>,
-    Json(req): Json<RecoverRequest>,
-) -> Result<Json<RecoverResponse>, ApiError> {
-    // Rate-limit per client IP — recovery checks an 8-char one-time code against a known account,
-    // so an unthrottled endpoint is a brute-force oracle. The IP is used transiently for the
-    // counter only — never stored, logged, or tied to an account (PD-3). Mirrors `create_account`.
-    if !state.limiter.check(&peer.ip().to_string()) {
-        return Err(ApiError::TooManyRequests);
-    }
-    let phrase =
-        Phrase::parse(&req.recovery_phrase).map_err(|e| ApiError::BadPhrase(e.to_string()))?;
-    let account_number = account::account_number_from_phrase(&phrase)
-        .map_err(|e| ApiError::BadPhrase(e.to_string()))?;
-
-    // No existence oracle: a well-formed phrase that maps to NO account returns the SAME
-    // Unauthorized as a real account with a wrong recovery code (PD-3 — don't confirm whether a
-    // given phrase is a registered account; the phrase is itself a bearer credential). A malformed
-    // phrase still 400s (BadPhrase) — that's structural validation, not an existence signal.
-    let record = state
-        .store
-        .get(account_number.as_bytes())
-        .await
-        .map_err(|_| ApiError::Internal)?
-        .ok_or(ApiError::Unauthorized)?;
-
-    let submitted = RecoveryCode::parse(&req.recovery_code);
-    if !account::verify_recovery_code(&submitted, &record.recovery_code_hash) {
-        return Err(ApiError::Unauthorized);
-    }
-
-    // Resolve a lapsed subscription against the clock (a gate: "has the deadline passed?"), so use
-    // the fail-closed clock — an unknown clock reads as Expired (refuse), never as still-Active.
-    let now = nil_core::grant::now_unix_secs_for_expiry();
-    let entitlement = record.entitlement.resolved(now);
-    Ok(Json(RecoverResponse {
-        account_number: account_number.display(),
-        entitlement: entitlement.into(),
-        until: entitlement.active_until(now),
-    }))
-}
-
 /// `POST /v1/account/challenge` — mint a single-use, short-TTL nonce for account auth (ADR-0007).
 ///
 /// No request body and no account identifier: a challenge is account-agnostic (the signature, which
 /// only the key holder can produce, ties it to an account at verify time), so issuing one reveals
 /// nothing — not even whether any account exists. Rate-limited per IP like the other write paths.
 pub async fn account_challenge(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     State(state): State<AppState>,
 ) -> Result<Json<ChallengeResponse>, ApiError> {
     // The generous auth limiter, NOT the tight create limiter: a challenge is fetched before every
-    // authed op (and on every connect's mint-on-demand), and mints nothing durable.
-    if !state.auth_limiter.check(&peer.ip().to_string()) {
+    // authenticated operation (including a background batch prefetch), and mints nothing durable.
+    if !state.auth_limiter.check(&client_ip.to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     let now = nil_core::grant::now_unix_secs();
@@ -138,17 +108,19 @@ pub async fn account_challenge(
 /// against the clock, and returns status only — never any identity. This is what a re-logged-in
 /// client calls to learn "am I still subscribed, and until when?".
 pub async fn account_status(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ClientIp(client_ip): ClientIp,
     State(state): State<AppState>,
     Json(auth): Json<AccountAuth>,
 ) -> Result<Json<AccountStatusResponse>, ApiError> {
     // Generous auth limiter (a client may poll status); not the tight create limiter.
-    if !state.auth_limiter.check(&peer.ip().to_string()) {
+    if !state.auth_limiter.check(&client_ip.to_string()) {
         return Err(ApiError::TooManyRequests);
     }
     // A gate ("is the subscription still live?") → fail-closed clock: unknown clock reads as Expired.
     let now = nil_core::grant::now_unix_secs_for_expiry();
-    let record = authenticate(&state, &auth, now).await.map_err(map_auth_err)?;
+    let record = authenticate(&state, &auth, now)
+        .await
+        .map_err(map_auth_err)?;
     let entitlement = record.entitlement.resolved(now);
     Ok(Json(AccountStatusResponse {
         entitlement: entitlement.into(),
@@ -169,4 +141,43 @@ pub(crate) fn map_auth_err(e: AuthError) -> ApiError {
 /// `GET /v1/account` — account + entitlement status. Session-authenticated; Phase 1.
 pub async fn get_account() -> ApiError {
     ApiError::NotImplemented
+}
+
+/// Parse an exact-length canonical lowercase hexadecimal field.
+///
+/// Registration has one canonical wire representation so alternate case cannot create distinct
+/// rate-limit, cache, or audit identities for the same byte string.
+fn parse_lower_hex<const N: usize>(s: &str) -> Option<[u8; N]> {
+    if s.len() != N * 2
+        || !s
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, pair) in s.as_bytes().chunks_exact(2).enumerate() {
+        fn nibble(c: u8) -> u8 {
+            match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => unreachable!("caller validated lowercase hex"),
+            }
+        }
+        out[i] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod registration_encoding_tests {
+    use super::parse_lower_hex;
+
+    #[test]
+    fn exact_lowercase_hex_is_required() {
+        assert_eq!(parse_lower_hex::<2>("00af"), Some([0x00, 0xaf]));
+        assert_eq!(parse_lower_hex::<2>("00AF"), None);
+        assert_eq!(parse_lower_hex::<2>("00ag"), None);
+        assert_eq!(parse_lower_hex::<2>("00"), None);
+    }
 }

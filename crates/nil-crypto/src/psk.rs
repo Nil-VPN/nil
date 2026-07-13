@@ -98,8 +98,10 @@ impl PqInitiator {
         let (mc_pk, mc_sk) = keypair_boxed(&mut OsRng);
         let mlkem_ek_bytes = mlkem_ek.to_bytes().as_slice().to_vec();
         let mceliece_pk_bytes = mc_pk.as_array().to_vec();
-        let offer =
-            PqOffer { mlkem_ek: mlkem_ek_bytes.clone(), mceliece_pk: mceliece_pk_bytes.clone() };
+        let offer = PqOffer {
+            mlkem_ek: mlkem_ek_bytes.clone(),
+            mceliece_pk: mceliece_pk_bytes.clone(),
+        };
         (
             Self {
                 mlkem_dk,
@@ -183,7 +185,12 @@ fn combine(ss_mlkem: &[u8], ss_mceliece: &[u8; 32], transcript: &PqTranscript) -
     // Length-prefixed, fixed-order hash of both public keys and both ciphertexts.
     let mut th = Sha256::new();
     th.update(PSK_TRANSCRIPT_LABEL);
-    for part in [transcript.mlkem_ek, transcript.mlkem_ct, transcript.mceliece_pk, transcript.mceliece_ct] {
+    for part in [
+        transcript.mlkem_ek,
+        transcript.mlkem_ct,
+        transcript.mceliece_pk,
+        transcript.mceliece_ct,
+    ] {
         th.update((part.len() as u32).to_be_bytes());
         th.update(part);
     }
@@ -195,7 +202,8 @@ fn combine(ss_mlkem: &[u8], ss_mceliece: &[u8; 32], transcript: &PqTranscript) -
 
     let hk = Hkdf::<Sha256>::new(Some(PSK_SALT), ikm.as_ref());
     let mut out = Zeroizing::new([0u8; 32]);
-    hk.expand(&info, out.as_mut_slice()).expect("32 bytes is within HKDF's output limit");
+    hk.expand(&info, out.as_mut_slice())
+        .expect("32 bytes is within HKDF's output limit");
     Psk(out)
 }
 
@@ -209,8 +217,9 @@ fn mceliece_pk_from_bytes(b: &[u8]) -> Result<PublicKey<'static>, PskError> {
 }
 
 fn mceliece_ct_from_bytes(b: &[u8]) -> Result<McCiphertext, PskError> {
-    let arr: [u8; CRYPTO_CIPHERTEXTBYTES] =
-        b.try_into().map_err(|_| PskError::BadCiphertext("mceliece ciphertext length"))?;
+    let arr: [u8; CRYPTO_CIPHERTEXTBYTES] = b
+        .try_into()
+        .map_err(|_| PskError::BadCiphertext("mceliece ciphertext length"))?;
     Ok(McCiphertext::from(arr))
 }
 
@@ -224,7 +233,11 @@ mod tests {
     fn hybrid_psk_round_trip_and_tamper() {
         let (initiator, offer) = PqInitiator::generate();
         assert_eq!(offer.mlkem_ek.len(), MLKEM_EK_LEN, "ML-KEM-1024 ek size");
-        assert_eq!(offer.mceliece_pk.len(), MCELIECE_PK_LEN, "McEliece 460896 pubkey size (~512 KiB)");
+        assert_eq!(
+            offer.mceliece_pk.len(),
+            MCELIECE_PK_LEN,
+            "McEliece 460896 pubkey size (~512 KiB)"
+        );
 
         let (cts, node_psk) = responder_encapsulate(&offer).expect("node encapsulates");
         assert_eq!(cts.mlkem_ct.len(), MLKEM_CT_LEN);
@@ -232,14 +245,24 @@ mod tests {
 
         // Matching ciphertexts → both sides derive the identical PSK.
         let client_psk = initiator.finish(&cts).expect("client derives PSK");
-        assert_eq!(client_psk.as_bytes(), node_psk.as_bytes(), "client and node derive the same PSK");
+        assert_eq!(
+            client_psk.as_bytes(),
+            node_psk.as_bytes(),
+            "client and node derive the same PSK"
+        );
 
         // ML-KEM decapsulation is implicit-reject: a corrupt ciphertext doesn't error, it
         // yields a *different* shared secret — so the two sides simply disagree on the PSK.
         let mut tampered = cts;
         tampered.mlkem_ct[0] ^= 0xFF;
-        let other = initiator.finish(&tampered).expect("decapsulation still returns a key");
-        assert_ne!(other.as_bytes(), node_psk.as_bytes(), "corrupted ciphertext → PSKs differ");
+        let other = initiator
+            .finish(&tampered)
+            .expect("decapsulation still returns a key");
+        assert_ne!(
+            other.as_bytes(),
+            node_psk.as_bytes(),
+            "corrupted ciphertext → PSKs differ"
+        );
     }
 
     /// A fixed transcript for the KAT / binding tests (tiny stand-in byte strings).
@@ -267,13 +290,31 @@ mod tests {
     fn combine_binds_the_kem_transcript() {
         // Identical shared secrets but a different ciphertext in the transcript → a different PSK.
         // This is the ML-KEM-non-binding mitigation: the PSK commits to the exact ct/pk.
-        let base = combine(&[0x01u8; 32], &[0x02u8; 32], &kat_transcript()).as_bytes().to_vec();
-        let altered_ct = PqTranscript { mlkem_ct: &[0x99u8; 4], ..kat_transcript() };
-        let altered = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_ct).as_bytes().to_vec();
-        assert_ne!(base, altered, "PSK must commit to the KEM transcript (ciphertext)");
-        let altered_pk = PqTranscript { mceliece_pk: &[0x88u8; 4], ..kat_transcript() };
-        let altered2 = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_pk).as_bytes().to_vec();
-        assert_ne!(base, altered2, "PSK must commit to the KEM transcript (public key)");
+        let base = combine(&[0x01u8; 32], &[0x02u8; 32], &kat_transcript())
+            .as_bytes()
+            .to_vec();
+        let altered_ct = PqTranscript {
+            mlkem_ct: &[0x99u8; 4],
+            ..kat_transcript()
+        };
+        let altered = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_ct)
+            .as_bytes()
+            .to_vec();
+        assert_ne!(
+            base, altered,
+            "PSK must commit to the KEM transcript (ciphertext)"
+        );
+        let altered_pk = PqTranscript {
+            mceliece_pk: &[0x88u8; 4],
+            ..kat_transcript()
+        };
+        let altered2 = combine(&[0x01u8; 32], &[0x02u8; 32], &altered_pk)
+            .as_bytes()
+            .to_vec();
+        assert_ne!(
+            base, altered2,
+            "PSK must commit to the KEM transcript (public key)"
+        );
     }
 
     #[test]
@@ -282,14 +323,23 @@ mod tests {
         // handshakes produce different offers. No long-term PQ key exists to seize.
         let (_i1, o1) = PqInitiator::generate();
         let (_i2, o2) = PqInitiator::generate();
-        assert_ne!(o1.mlkem_ek, o2.mlkem_ek, "fresh ML-KEM keypair per handshake");
-        assert_ne!(o1.mceliece_pk, o2.mceliece_pk, "fresh McEliece keypair per handshake");
+        assert_ne!(
+            o1.mlkem_ek, o2.mlkem_ek,
+            "fresh ML-KEM keypair per handshake"
+        );
+        assert_ne!(
+            o1.mceliece_pk, o2.mceliece_pk,
+            "fresh McEliece keypair per handshake"
+        );
     }
 
     #[test]
     fn wrong_length_inputs_are_rejected() {
         // Hand-built bad offer (no keygen): a too-short ML-KEM ek must be rejected.
-        let bad = PqOffer { mlkem_ek: vec![0u8; 10], mceliece_pk: vec![0u8; MCELIECE_PK_LEN] };
+        let bad = PqOffer {
+            mlkem_ek: vec![0u8; 10],
+            mceliece_pk: vec![0u8; MCELIECE_PK_LEN],
+        };
         assert!(responder_encapsulate(&bad).is_err());
     }
 }

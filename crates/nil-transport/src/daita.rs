@@ -67,7 +67,11 @@ impl<R: RngCore> DaitaDriver<R> {
     /// its blocking fraction is zero, since this driver does not enact blocking yet.
     pub fn new(machines: Vec<Machine>, now: Instant, rng: R) -> Result<Self, maybenot::Error> {
         let framework = Framework::new(machines, 1.0, 0.0, now, rng)?;
-        Ok(Self { framework, pending: Vec::new(), pad_len: 1200 })
+        Ok(Self {
+            framework,
+            pending: Vec::new(),
+            pad_len: 1200,
+        })
     }
 
     /// Feed real packet events (e.g. [`TriggerEvent::NormalSent`] on a data-plane send,
@@ -83,7 +87,9 @@ impl<R: RngCore> DaitaDriver<R> {
             .framework
             .trigger_events(events, now)
             .filter_map(|action| match action {
-                TriggerAction::SendPadding { timeout, machine, .. } => {
+                TriggerAction::SendPadding {
+                    timeout, machine, ..
+                } => {
                     // Saturate rather than panic if now + timeout overflows the Instant domain.
                     Some((now.checked_add(*timeout).unwrap_or(now), *machine))
                 }
@@ -116,7 +122,10 @@ impl<R: RngCore> DaitaDriver<R> {
         });
         let mut sends = Vec::with_capacity(due.len());
         for machine in due {
-            sends.push(PaddingSend { machine: machine.into_raw(), len: self.pad_len });
+            sends.push(PaddingSend {
+                machine: machine.into_raw(),
+                len: self.pad_len,
+            });
             // The padding is now queued: tell the framework, so a machine can advance / repeat.
             self.drive(&[TriggerEvent::PaddingSent { machine }], now);
         }
@@ -139,7 +148,11 @@ mod tests {
 
     /// A constant (deterministic) distribution — maybenot samples a constant when `low == high`.
     fn constant(v: f64) -> Dist {
-        Dist { dist: DistType::Uniform { low: v, high: v }, start: 0.0, max: 0.0 }
+        Dist {
+            dist: DistType::Uniform { low: v, high: v },
+            start: 0.0,
+            max: 0.0,
+        }
     }
 
     /// Machine: on the first `NormalSent`, move to a terminal state that pads once, 10 ms later.
@@ -176,7 +189,10 @@ mod tests {
         // A real packet went out ⇒ the machine schedules exactly one future padding.
         d.on_events(&[TriggerEvent::NormalSent], t0);
         let deadline = d.next_deadline().expect("a padding action is scheduled");
-        assert!(deadline > t0, "padding is scheduled in the future, not immediately");
+        assert!(
+            deadline > t0,
+            "padding is scheduled in the future, not immediately"
+        );
 
         // Not due yet ⇒ no send.
         assert!(d.poll(t0).is_empty());
@@ -188,7 +204,10 @@ mod tests {
         assert!(sends[0].len > 0);
 
         // Single-fire machine: nothing pending afterwards, and later polls stay empty.
-        assert!(d.next_deadline().is_none(), "no further padding after the single fire");
+        assert!(
+            d.next_deadline().is_none(),
+            "no further padding after the single fire"
+        );
         assert!(d.poll(deadline + Duration::from_secs(1)).is_empty());
     }
 

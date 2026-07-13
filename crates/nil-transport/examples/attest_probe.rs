@@ -70,7 +70,9 @@ fn main() {
         expected: Some(AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(measurement),
+            tls_spki_sha256: None,
             min_tcb_sevsnp: None,
+            tdx_policy: None,
             transparency_log_key: None,
         }),
         grant: None,

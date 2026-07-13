@@ -105,7 +105,6 @@ impl AddressPool {
             self.in_use.remove(&addr);
         }
     }
-
 }
 
 #[cfg(test)]
@@ -151,17 +150,16 @@ mod tests {
         // Release one; the next assign succeeds and reuses a freed address.
         p.release(&[2u8]);
         let reused = p.assign(b"new").expect("freed address reusable");
-        assert!(handed.contains(&reused), "reused a previously-freed address");
+        assert!(
+            handed.contains(&reused),
+            "reused a previously-freed address"
+        );
     }
 
     #[test]
     fn distinct_clients_never_share_a_live_address() {
-        let mut p = AddressPool::new(
-            Ipv4Addr::new(10, 0, 0, 0),
-            29,
-            Ipv4Addr::new(10, 0, 0, 1),
-        )
-        .unwrap();
+        let mut p =
+            AddressPool::new(Ipv4Addr::new(10, 0, 0, 0), 29, Ipv4Addr::new(10, 0, 0, 1)).unwrap();
         let mut seen = std::collections::HashSet::new();
         for i in 0..5u8 {
             let a = p.assign(&[i]).unwrap();
@@ -171,7 +169,11 @@ mod tests {
 
     #[test]
     fn rejects_prefixes_with_no_room() {
-        assert!(AddressPool::new(Ipv4Addr::new(10, 0, 0, 0), 31, Ipv4Addr::new(10, 0, 0, 0)).is_none());
-        assert!(AddressPool::new(Ipv4Addr::new(10, 0, 0, 0), 32, Ipv4Addr::new(10, 0, 0, 0)).is_none());
+        assert!(
+            AddressPool::new(Ipv4Addr::new(10, 0, 0, 0), 31, Ipv4Addr::new(10, 0, 0, 0)).is_none()
+        );
+        assert!(
+            AddressPool::new(Ipv4Addr::new(10, 0, 0, 0), 32, Ipv4Addr::new(10, 0, 0, 0)).is_none()
+        );
     }
 }

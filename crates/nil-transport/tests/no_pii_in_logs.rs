@@ -29,12 +29,30 @@ const SCANNED_DIRS: &[&str] = &[
 /// Substrings that, inside a log-macro invocation, indicate a user-linkable network value or a
 /// payment identifier that could link who-pays to what-flows (PD-4).
 const FORBIDDEN: &[&str] = &[
-    "%peer", "%from", "%addr", "%node_ip", "%src", "%dst", // formatted address fields
-    "node_ip", "client_ip", "peer_addr", "remote_addr", "src_addr", "dst_addr",
-    "socketaddr", ".host", ".port",
+    "%peer",
+    "%from",
+    "%addr",
+    "%node_ip",
+    "%src",
+    "%dst", // formatted address fields
+    "node_ip",
+    "client_ip",
+    "peer_addr",
+    "remote_addr",
+    "src_addr",
+    "dst_addr",
+    "socketaddr",
+    ".host",
+    ".port",
     // Payment identifiers (the card/Monero rails) — must never reach a log (PD-4).
-    "transaction_id", "txn_id", "payment_reference", "payment_id", "customer_id", "card_",
-    "refund_id", "checkout_id",
+    "transaction_id",
+    "txn_id",
+    "payment_reference",
+    "payment_id",
+    "customer_id",
+    "card_",
+    "refund_id",
+    "checkout_id",
 ];
 
 const LOG_MACROS: &[&str] = &["info!", "warn!", "error!", "debug!", "trace!"];
@@ -49,7 +67,9 @@ fn workspace_root() -> PathBuf {
 }
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -73,18 +93,25 @@ fn no_user_linkable_addresses_in_logs() {
     for dir in SCANNED_DIRS {
         rust_files(&root.join(dir), &mut files);
     }
-    assert!(!files.is_empty(), "guardrail scanned no files — check SCANNED_DIRS / workspace root");
+    assert!(
+        !files.is_empty(),
+        "guardrail scanned no files — check SCANNED_DIRS / workspace root"
+    );
 
     let mut violations = Vec::new();
 
     for file in &files {
-        let Ok(src) = fs::read_to_string(file) else { continue };
+        let Ok(src) = fs::read_to_string(file) else {
+            continue;
+        };
         let lines: Vec<&str> = src.lines().collect();
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
             // Find a log-macro opener on this line.
-            let opener = LOG_MACROS.iter().find_map(|m| line.find(m).map(|pos| (pos, *m)));
+            let opener = LOG_MACROS
+                .iter()
+                .find_map(|m| line.find(m).map(|pos| (pos, *m)));
             let Some((pos, _macro)) = opener else {
                 i += 1;
                 continue;

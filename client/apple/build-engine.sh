@@ -20,21 +20,56 @@ case "$PROFILE" in
   *) echo "usage: $0 [release|debug]" >&2; exit 2 ;;
 esac
 
+# Compile every native object for the exact oldest OS versions the bundle claims. Leaving these
+# implicit lets CMake/BoringSSL inherit the runner SDK version; the final link can then advertise
+# macOS 13 while containing objects that require a newer loader (NIL-030).
+MIN_MACOS_VERSION="13.0"
+MIN_IOS_VERSION="15.0"
+[[ "${MACOSX_DEPLOYMENT_TARGET:-$MIN_MACOS_VERSION}" == "$MIN_MACOS_VERSION" ]] \
+  || { echo "MACOSX_DEPLOYMENT_TARGET must remain $MIN_MACOS_VERSION for minimum-OS verification" >&2; exit 2; }
+[[ "${IPHONEOS_DEPLOYMENT_TARGET:-$MIN_IOS_VERSION}" == "$MIN_IOS_VERSION" ]] \
+  || { echo "IPHONEOS_DEPLOYMENT_TARGET must remain $MIN_IOS_VERSION for minimum-OS verification" >&2; exit 2; }
+export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION"
+export CMAKE_OSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION"
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # client/apple
 ROOT="$(cd "$HERE/../.." && pwd)"                       # repo root (the cargo workspace)
-TARGETDIR="$ROOT/target"
+# Keep Apple minimum-target native caches separate from generic Cargo output. CMake otherwise
+# reuses a previously configured BoringSSL tree even after deployment variables change, which can
+# silently preserve `minos` from a newer SDK.
+TARGETDIR="${NIL_APPLE_TARGET_DIR:-$ROOT/target/apple-minimum-os}"
 HEADERS="$ROOT/crates/nil-apple/include"
 OUT="$HERE/NilApple.xcframework"
+
+verify_archive_member_minos() {
+  local archive=$1 member=$2 expected_platform=$3 expected_minos=$4 scratch platform minos
+  scratch="$(mktemp -d)"
+  (
+    cd "$scratch"
+    ar -x "$archive" "$member"
+    [[ -f "$member" ]] || { echo "missing native archive member $member" >&2; exit 1; }
+    platform="$(xcrun vtool -show-build "$member" | awk '/platform/{print $2; exit}')"
+    minos="$(xcrun vtool -show-build "$member" | awk '/minos/{print $2; exit}')"
+    [[ "$platform" == "$expected_platform" && "$minos" == "$expected_minos" ]] || {
+      echo "native member $member targets ${platform:-unknown} ${minos:-unknown}; expected $expected_platform $expected_minos" >&2
+      exit 1
+    }
+  )
+}
 
 echo "== build-engine: nil-apple ($PROFILE) -> $OUT =="
 rustup target add aarch64-apple-darwin x86_64-apple-darwin >/dev/null 2>&1 || true
 
 cargo build -p nil-apple $PROFILE_FLAG --target aarch64-apple-darwin --target-dir "$TARGETDIR"
-cargo build -p nil-apple $PROFILE_FLAG --target x86_64-apple-darwin  --target-dir "$TARGETDIR"
+cargo build -p nil-apple $PROFILE_FLAG --target x86_64-apple-darwin --target-dir "$TARGETDIR"
 
 LIB_ARM="$TARGETDIR/aarch64-apple-darwin/$PROFILE/libnil_apple.a"
 LIB_X86="$TARGETDIR/x86_64-apple-darwin/$PROFILE/libnil_apple.a"
 [[ -f "$LIB_ARM" && -f "$LIB_X86" ]] || { echo "missing static lib(s): $LIB_ARM / $LIB_X86" >&2; exit 1; }
+verify_archive_member_minos "$LIB_ARM" bio_ssl.cc.o MACOS "$MIN_MACOS_VERSION"
+verify_archive_member_minos "$LIB_ARM" aesv8-armv8-apple.S.o MACOS "$MIN_MACOS_VERSION"
+verify_archive_member_minos "$LIB_X86" bio_ssl.cc.o MACOS "$MIN_MACOS_VERSION"
+verify_archive_member_minos "$LIB_X86" aesni-x86_64-apple.S.o MACOS "$MIN_MACOS_VERSION"
 
 FAT="$(mktemp -d)/libnil_apple-macos-universal.a"
 lipo -create "$LIB_ARM" "$LIB_X86" -output "$FAT"
@@ -48,12 +83,15 @@ XCARGS=(-library "$FAT" -headers "$HEADERS")
 # for `aarch64-apple-ios-sim` (its prebuilt asm is tagged `iOS`, not `iOS-simulator`), so we don't
 # ship a sim slice. BoringSSL/quiche for the iOS sysroot need the cmake-4 compat shim + a deploy target.
 if [[ "${NIL_APPLE_WITH_IOS:-}" == "1" ]]; then
-  export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-15.0}"
+  export IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS_VERSION"
+  export CMAKE_OSX_DEPLOYMENT_TARGET="$MIN_IOS_VERSION"
   export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
   rustup target add aarch64-apple-ios >/dev/null 2>&1 || true
   cargo build -p nil-apple $PROFILE_FLAG --target aarch64-apple-ios --target-dir "$TARGETDIR"
   LIB_IOS="$TARGETDIR/aarch64-apple-ios/$PROFILE/libnil_apple.a"
   [[ -f "$LIB_IOS" ]] || { echo "missing iOS static lib: $LIB_IOS" >&2; exit 1; }
+  verify_archive_member_minos "$LIB_IOS" bio_ssl.cc.o IOS "$MIN_IOS_VERSION"
+  verify_archive_member_minos "$LIB_IOS" aesv8-armv8-apple.S.o IOS "$MIN_IOS_VERSION"
   XCARGS+=(-library "$LIB_IOS" -headers "$HEADERS")
   echo "== build-engine: including iOS device slice (arm64) =="
 fi

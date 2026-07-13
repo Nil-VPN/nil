@@ -22,7 +22,8 @@ const DEFAULT_COORDINATOR_URL: &str = "https://ctrl.nilvpn.net";
 pub struct ClientConfig {
     /// Business plane (accounts + Privacy Pass issuer).
     pub portal_url: String,
-    /// Control plane (token redemption → attested path). Empty ⇒ no real path (loopback/dev).
+    /// Control plane (token redemption → attested path). Empty is accepted only by debug builds,
+    /// where it selects the explicitly labelled non-VPN loopback seam; release refuses to connect.
     pub coordinator_url: String,
     /// Operator Monero deposit address shown on the buy screen (display only; never a secret).
     pub monero_address: String,
@@ -33,9 +34,9 @@ pub struct ClientConfig {
     pub expected_tee: String,
     /// Fail-closed kill-switch (block all traffic if the tunnel drops). On by default.
     pub kill_switch: bool,
-    /// Advanced: a direct single node `host` (port via NW_NODE_PORT), bypassing the Coordinator.
-    /// Empty ⇒ use the Coordinator. Pair with `expected_measurement` (a direct node carries no
-    /// Coordinator-delivered pin, so it must be pinned here or the gate fails closed).
+    /// Debug-only: a direct single node `host` (port via NW_NODE_PORT), bypassing the Coordinator.
+    /// Release builds ignore/refuse this weaker path. Pair it with `expected_measurement` because a
+    /// direct node carries no Coordinator-delivered pin.
     pub node_host: String,
 }
 
@@ -109,9 +110,9 @@ impl ClientConfig {
 
     /// Apply to the process environment so `nil_datapath::launch` (which reads `NW_*`) and the
     /// Portal/token clients see it. Empty fields are REMOVED so the datapath treats them as unset
-    /// (e.g. no Coordinator ⇒ `is_configured()` false ⇒ loopback). Called at startup and on Settings
-    /// save. Edition 2021: `set_var`/`remove_var` are safe (single-writer here, guarded by the
-    /// `ConfigState` lock against concurrent saves).
+    /// (e.g. no Coordinator ⇒ debug loopback, while release fails closed). Called at startup and on
+    /// Settings save. Edition 2021: `set_var`/`remove_var` are safe (single-writer here, guarded by
+    /// the `ConfigState` lock against concurrent saves).
     pub fn apply_env(&self) {
         set_or_clear("PORTAL_URL", &self.portal_url);
         set_or_clear("NW_COORDINATOR_URL", &self.coordinator_url);
@@ -291,11 +292,16 @@ mod tests {
             path: path.clone(),
         };
         assert!(base.kill_switch, "precondition: default on");
-        state.update(|c| c.kill_switch = false).expect("update persists");
+        state
+            .update(|c| c.kill_switch = false)
+            .expect("update persists");
 
         let live = state.get();
         assert!(!live.kill_switch, "targeted field changed");
-        assert_eq!(live.coordinator_url, base.coordinator_url, "other fields preserved");
+        assert_eq!(
+            live.coordinator_url, base.coordinator_url,
+            "other fields preserved"
+        );
         // And it survives a reload from disk.
         let reloaded = ClientConfig::load(&path);
         assert!(!reloaded.kill_switch);

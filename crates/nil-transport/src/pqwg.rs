@@ -77,7 +77,14 @@ impl PqWgCore {
     /// Build a tunnel end: our static secret, the peer's static public, and the hybrid PSK
     /// (mixed into the Noise IKpsk2 handshake). `index` disambiguates concurrent sessions.
     pub fn new(my_secret: StaticSecret, peer_public: PublicKey, psk: &Psk, index: u32) -> Self {
-        let tunn = Tunn::new(my_secret, peer_public, Some(*psk.as_bytes()), Some(25), index, None);
+        let tunn = Tunn::new(
+            my_secret,
+            peer_public,
+            Some(*psk.as_bytes()),
+            Some(25),
+            index,
+            None,
+        );
         Self { tunn }
     }
 
@@ -106,7 +113,9 @@ impl PqWgCore {
         let mut dst = vec![0u8; 65535];
         match self.tunn.decapsulate(None, datagram, &mut dst) {
             TunnResult::WriteToNetwork(p) => WgStep::Network(p.to_vec()),
-            TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => WgStep::Ip(p.to_vec()),
+            TunnResult::WriteToTunnelV4(p, _) | TunnResult::WriteToTunnelV6(p, _) => {
+                WgStep::Ip(p.to_vec())
+            }
             TunnResult::Done => WgStep::Done,
             TunnResult::Err(e) => WgStep::Err(e),
         }
@@ -202,7 +211,11 @@ pub struct PqWgTransport {
 
 impl PqWgTransport {
     pub fn new(inner: Arc<MasqueTransport>) -> Self {
-        Self { inner, sessions: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            inner,
+            sessions: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn state(&self, session: &Session) -> Result<Arc<PqWgSession>> {
@@ -217,7 +230,9 @@ impl PqWgTransport {
     /// Usable inner-TUN MTU: the MASQUE tunnel MTU minus WireGuard's 32-byte transport overhead.
     pub fn tunnel_mtu(&self, session: &Session) -> Option<usize> {
         let s = self.state(session).ok()?;
-        self.inner.tunnel_mtu(&s.inner_session).map(|m| m.saturating_sub(32))
+        self.inner
+            .tunnel_mtu(&s.inner_session)
+            .map(|m| m.saturating_sub(32))
     }
 }
 
@@ -237,31 +252,48 @@ impl PqWgTransport {
         // ships its WG static public key + both KEM public keys; the node returns the two KEM
         // ciphertexts; both derive the same PSK (which never crosses the wire).
         let (initiator, offer) = PqInitiator::generate();
-        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
-        let offer_msg =
-            encode_parts(&[client_kp.public.as_bytes(), &offer.mlkem_ek, &offer.mceliece_pk]);
+        let client_kp =
+            WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let offer_msg = encode_parts(&[
+            client_kp.public.as_bytes(),
+            &offer.mlkem_ek,
+            &offer.mceliece_pk,
+        ]);
         self.inner.control_send(&inner_session, offer_msg).await?;
 
-        let cts_msg = tokio::time::timeout(PQWG_HANDSHAKE_TIMEOUT, self.inner.control_recv(&inner_session))
-            .await
-            .map_err(|_| Error::Transport("PQ handshake timed out".into()))??;
-        let parts = decode_parts(&cts_msg).ok_or_else(|| Error::Transport("malformed PQ ciphertexts".into()))?;
+        let cts_msg = tokio::time::timeout(
+            PQWG_HANDSHAKE_TIMEOUT,
+            self.inner.control_recv(&inner_session),
+        )
+        .await
+        .map_err(|_| Error::Transport("PQ handshake timed out".into()))??;
+        let parts = decode_parts(&cts_msg)
+            .ok_or_else(|| Error::Transport("malformed PQ ciphertexts".into()))?;
         if parts.len() != 2 {
             return Err(Error::Transport("PQ ciphertexts: expected 2 parts".into()));
         }
-        let cts = PqCiphertexts { mlkem_ct: parts[0].clone(), mceliece_ct: parts[1].clone() };
-        let psk = initiator.finish(&cts).map_err(|e| Error::Transport(format!("PQ decapsulate: {e}")))?;
+        let cts = PqCiphertexts {
+            mlkem_ct: parts[0].clone(),
+            mceliece_ct: parts[1].clone(),
+        };
+        let psk = initiator
+            .finish(&cts)
+            .map_err(|e| Error::Transport(format!("PQ decapsulate: {e}")))?;
 
         // WireGuard Noise handshake (IKpsk2, the PSK mixed in) over the datagram channel.
         let mut core = PqWgCore::new(client_kp.secret, PublicKey::from(node_wg_pub), &psk, 1);
-        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        let init = core
+            .handshake_init()
+            .map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         self.inner.send(&inner_session, IpPacket::new(init)).await?;
         let resp = tokio::time::timeout(PQWG_HANDSHAKE_TIMEOUT, self.inner.recv(&inner_session))
             .await
             .map_err(|_| Error::Transport("wg handshake timed out".into()))??;
         match core.decapsulate(resp.as_bytes()) {
             WgStep::Network(keepalive) => {
-                self.inner.send(&inner_session, IpPacket::new(keepalive)).await?;
+                self.inner
+                    .send(&inner_session, IpPacket::new(keepalive))
+                    .await?;
             }
             other => return Err(Error::Transport(format!("wg handshake failed: {other:?}"))),
         }
@@ -271,7 +303,14 @@ impl PqWgTransport {
         let (to_tx, to_rx) = mpsc::channel(PUMP_QUEUE);
         let (from_tx, from_rx) = mpsc::channel(PUMP_QUEUE);
         let shutdown = CancellationToken::new();
-        let driver = tokio::spawn(pump(core, self.inner.clone(), inner_session, to_rx, from_tx, shutdown.clone()));
+        let driver = tokio::spawn(pump(
+            core,
+            self.inner.clone(),
+            inner_session,
+            to_rx,
+            from_tx,
+            shutdown.clone(),
+        ));
 
         let id = SessionId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let sess = Arc::new(PqWgSession {
@@ -286,16 +325,19 @@ impl PqWgTransport {
             .map_err(|_| Error::Transport("pqwg session map poisoned".into()))?
             .insert(id, sess);
         // On the wire this is MASQUE/QUIC — the WireGuard layer is hidden inside the datagrams.
-        Ok(Session { id, kind: TransportKind::Masque })
+        Ok(Session {
+            id,
+            kind: TransportKind::Masque,
+        })
     }
 }
 
 #[async_trait]
 impl Transport for PqWgTransport {
     async fn connect(&self, target: NodeEndpoint, creds: Grant) -> Result<Session> {
-        let node_wg_pub = target
-            .wg_pub
-            .ok_or_else(|| Error::Transport("PqWg: endpoint carries no node WireGuard key".into()))?;
+        let node_wg_pub = target.wg_pub.ok_or_else(|| {
+            Error::Transport("PqWg: endpoint carries no node WireGuard key".into())
+        })?;
 
         // 1. Outer MASQUE tunnel (attestation appraised inside).
         let inner_session = self.inner.connect(target, creds).await?;
@@ -418,9 +460,8 @@ mod tests {
         // version/IHL, DSCP, total len(28), id, flags/frag, ttl, proto=UDP(17), checksum(0),
         // src 10.74.0.2, dst 10.74.0.1, then an 8-byte UDP header + 0 payload.
         let mut p = vec![
-            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00,
-            10, 74, 0, 2, 10, 74, 0, 1,
-            0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00,
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 10, 74, 0, 2,
+            10, 74, 0, 1, 0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00,
         ];
         // fix length already 28; leave checksum 0 (boringtun doesn't validate L3 checksum).
         p.truncate(28);
@@ -449,7 +490,11 @@ mod tests {
         let (initiator, offer) = PqInitiator::generate();
         let (cts, node_psk) = responder_encapsulate(&offer).expect("node encapsulate");
         let client_psk = initiator.finish(&cts).expect("client finish");
-        assert_eq!(client_psk.as_bytes(), node_psk.as_bytes(), "both sides derive the same PQ PSK");
+        assert_eq!(
+            client_psk.as_bytes(),
+            node_psk.as_bytes(),
+            "both sides derive the same PQ PSK"
+        );
 
         // 2. WG static keypairs + two cores fed the same PQ PSK.
         let client_kp = WgKeypair::generate().unwrap();

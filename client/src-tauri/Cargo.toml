@@ -23,6 +23,11 @@ macos-system-extension = []
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Parse issuer DER with the exact token implementation used at runtime. A syntactically valid but
+# unusable key must fail the release build, not produce a client that can never mint a token.
+nil-crypto = { workspace = true }
 
 [dependencies]
 # Tauri stack (kept at the template's versions; not centralized in the workspace).
@@ -31,7 +36,7 @@ tauri-plugin-opener = "2"
 
 # Shared NIL crates — the client reuses the exact same code as the services, so the
 # client and node can never drift on the wire format (architecture spec §3).
-# Base (mobile-safe): just the Transport trait + loopback. The heavy MASQUE/QUIC transports
+# Base (mobile-safe): the Transport trait plus the debug-only loopback implementation. The heavy MASQUE/QUIC transports
 # and the OS datapath are pulled in only on desktop (see the [target.…] section below), so the
 # iOS/Android cross-compile stays light — mobile uses a NEPacketTunnelProvider/VpnService
 # datapath built separately.
@@ -52,6 +57,42 @@ tracing = { workspace = true }   # structured logs (no node address — privacy)
 # HTTP to the Portal. rustls (not OpenSSL) to match the project's TLS standard.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 getrandom = { workspace = true }   # fresh random token-message nonce (client-side blinding)
+zeroize = { workspace = true }
+sha2 = { workspace = true }
+libc = { workspace = true }
+# The vault ciphertext is file-backed, while its 256-bit key lives in the OS credential service.
+# AES-GCM authenticates both ciphertext and the fixed vault domain/version AAD.
+aes-gcm = "0.10"
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+# Non-synchronizable, ThisDeviceOnly master key. The encrypted vault itself stays in app-local data.
+security-framework = { version = "3.7", features = ["OSX_10_15"] }
+security-framework-sys = "2.17"
+objc2-foundation = { version = "0.3.2", features = [
+  "NSError",
+  "NSValue",
+  "NSString",
+  "NSURL",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Compact binary transport for the private Rust↔Keystore mobile plugin bridge.
+base64 = "0.22"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Current-user DPAPI protects the complete vault payload; no exportable application key exists.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security_Cryptography",
+  "Win32_Storage_FileSystem",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Secret Service stores only the random vault key. No mock/plaintext backend is enabled.
+keyring = { version = "3.6.3", default-features = false, features = [
+  "sync-secret-service",
+  "crypto-rust",
+] }
 
 # Desktop only: the real MASQUE/PQ-WireGuard transports + the OS datapath (TUN, routing,
 # fail-closed kill-switch) and the shared `launch` builder the engine uses to bring up a real

@@ -7,12 +7,22 @@ rust-version.workspace = true
 description = "NIL VPN Data plane node: MASQUE/CONNECT-IP server + exit. Runs in a TEE; keeps NO disk logs."
 
 [features]
+# A normal nil-node build is a production-posture hardware-attested node. Local/synthetic harnesses
+# must opt out explicitly with `--no-default-features` and select their development capability.
+default = ["hw-attest"]
 # Synthetic RA-TLS report (test/dev) so the Docker harness can attest without TEE hardware.
 # A real deployment fetches a hardware SEV-SNP/TDX report instead; never ship this.
 synthetic-attest = ["nil-attest/synthetic"]
 # Production: fetch a real SEV-SNP/TDX report from the kernel (Linux configfs-TSM). No extra
 # deps (plain std fs). Compile-checked in CI; only EXERCISED on real TEE hardware.
 hw-attest = []
+# Development-only fallback responders. These transports do not yet carry the full per-connection
+# grant + hardware-attestation gate, so the feature is incompatible with `hw-attest` and with any
+# build that has debug assertions disabled.
+dev-fallbacks = [
+    "nil-transport/dev-fallbacks",
+    "dep:tokio-tungstenite", "dep:tokio-rustls", "dep:rustls", "dep:futures-util",
+]
 # DEV/STAGING ONLY: compile in PII-free data-plane diagnostic counters (per-role forwarding
 # packet/byte counts) to localize where traffic dies in the onion. NEVER shipped to production —
 # `attest.rs` `compile_error!`s on `dev-trace + hw-attest`, and prod images build `hw-attest` only.
@@ -20,25 +30,27 @@ dev-trace = ["nil-transport/dev-trace"]
 
 [dependencies]
 nil-core = { workspace = true }
-nil-transport = { workspace = true, features = ["pqwg", "wstunnel", "reality"] }  # connectip + PQ-WireGuard responder + shared wstunnel path derivation + reality VLESS auth/record codec
+nil-transport = { workspace = true, features = ["pqwg"] }  # production: attested MASQUE + inner PQ-WireGuard only
 nil-attest = { workspace = true }      # shared RA-TLS binding/codec (anti-drift with the client)
 nil-crypto = { workspace = true }      # PQ hybrid PSK responder (KEM encapsulate)
 boringtun = { workspace = true }        # WireGuard static keys (x25519)
 sha2 = { workspace = true }             # HMAC for stateless QUIC Retry address-validation tokens
 subtle = { workspace = true }           # constant-time byte comparison (grant nonce, auth path)
+zeroize = { workspace = true }          # erase loaded/generated TLS private-key PEM buffers
 quiche = { workspace = true }
 tun-rs = { workspace = true }
 rcgen = { workspace = true }
 getrandom = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+libc = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # wstunnel responder (WireGuard over WebSocket-over-TLS)
-tokio-tungstenite = { workspace = true }
-tokio-rustls = { workspace = true }
-rustls = { workspace = true }
-futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 
 # UDP GSO (generic segmentation offload) for the egress hot path — batch many equal-size QUIC
 # packets to one peer into a single sendmsg (a big per-node throughput win, Tailscale-proven). Linux

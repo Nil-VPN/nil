@@ -38,7 +38,12 @@ impl Pkcs11Signer {
     /// Open `module_path`, use the first token-bearing slot (or `slot_id` if given), and cache the
     /// public key DER for the keypair labelled `key_label`. The keypair must already exist (provision
     /// it once with [`Pkcs11Signer::provision`] or the HSM's own tooling).
-    pub fn open(module_path: &str, slot_id: Option<u64>, pin: &str, key_label: &str) -> Result<Self> {
+    pub fn open(
+        module_path: &str,
+        slot_id: Option<u64>,
+        pin: &str,
+        key_label: &str,
+    ) -> Result<Self> {
         let ctx = init_module(module_path)?;
         let slot = pick_slot(&ctx, slot_id)?;
         let pin = AuthPin::new(pin.into());
@@ -47,14 +52,25 @@ impl Pkcs11Signer {
         let pubh = find_one(&session, ObjectClass::PUBLIC_KEY, &label)
             .context("locating the issuer PUBLIC key in the HSM")?;
         let public_der = spki_from_handle(&session, pubh)?;
-        Ok(Self { ctx, slot, pin, label, public_der })
+        Ok(Self {
+            ctx,
+            slot,
+            pin,
+            label,
+            public_der,
+        })
     }
 
     /// One-time provisioning: generate a token-resident RSA-2048 keypair labelled `key_label`
     /// (private key non-extractable + sign-capable). Used by the SoftHSM test harness and by an
     /// operator bootstrapping a real HSM. Idempotency is the caller's concern (generating twice
     /// yields two same-labelled keys — `open` then fails closed on the ambiguity).
-    pub fn provision(module_path: &str, slot_id: Option<u64>, pin: &str, key_label: &str) -> Result<()> {
+    pub fn provision(
+        module_path: &str,
+        slot_id: Option<u64>,
+        pin: &str,
+        key_label: &str,
+    ) -> Result<()> {
         let ctx = init_module(module_path)?;
         let slot = pick_slot(&ctx, slot_id)?;
         let pin = AuthPin::new(pin.into());
@@ -108,11 +124,11 @@ impl TokenSigner for Pkcs11Signer {
 pub fn provision_from_env() -> Result<()> {
     let module = std::env::var("NW_TOKEN_HSM_MODULE")
         .map_err(|_| anyhow!("NW_TOKEN_HSM_MODULE is not set"))?;
-    let pin = std::env::var("NW_TOKEN_HSM_PIN").map_err(|_| anyhow!("NW_TOKEN_HSM_PIN is not set"))?;
+    let pin = crate::load_hsm_pin(!cfg!(debug_assertions))?;
     let label =
         std::env::var("NW_TOKEN_HSM_KEY_LABEL").unwrap_or_else(|_| "nil-issuer".to_string());
-    let slot = std::env::var("NW_TOKEN_HSM_SLOT").ok().and_then(|s| s.parse::<u64>().ok());
-    Pkcs11Signer::provision(&module, slot, &pin, &label)?;
+    let slot = crate::hsm_slot_from_env(!cfg!(debug_assertions))?;
+    Pkcs11Signer::provision(&module, slot, pin.as_str(), &label)?;
     tracing::info!(
         "provisioned HSM issuer keypair (label={label}); restart WITHOUT NW_TOKEN_HSM_PROVISION to \
          serve — the NW_TOKEN_PUBKEY to pin is logged on a normal start"
@@ -130,19 +146,28 @@ fn init_module(module_path: &str) -> Result<Pkcs11> {
 
 /// The token-bearing slot: `slot_id` if given, else the first slot that has a token.
 fn pick_slot(ctx: &Pkcs11, slot_id: Option<u64>) -> Result<Slot> {
-    let slots = ctx.get_slots_with_token().context("enumerating PKCS#11 slots")?;
+    let slots = ctx
+        .get_slots_with_token()
+        .context("enumerating PKCS#11 slots")?;
     match slot_id {
         Some(id) => slots
             .into_iter()
             .find(|s| s.id() == id)
             .ok_or_else(|| anyhow!("no PKCS#11 token in slot {id}")),
-        None => slots.into_iter().next().ok_or_else(|| anyhow!("no PKCS#11 token in any slot")),
+        None => slots
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no PKCS#11 token in any slot")),
     }
 }
 
 fn login(ctx: &Pkcs11, slot: Slot, pin: &AuthPin) -> Result<Session> {
-    let session = ctx.open_rw_session(slot).context("opening a PKCS#11 session")?;
-    session.login(UserType::User, Some(pin)).context("PKCS#11 login (USER)")?;
+    let session = ctx
+        .open_rw_session(slot)
+        .context("opening a PKCS#11 session")?;
+    session
+        .login(UserType::User, Some(pin))
+        .context("PKCS#11 login (USER)")?;
     Ok(session)
 }
 
@@ -150,11 +175,17 @@ fn login(ctx: &Pkcs11, slot: Slot, pin: &AuthPin) -> Result<Session> {
 /// issuer key must never be silently resolved).
 fn find_one(session: &Session, class: ObjectClass, label: &[u8]) -> Result<ObjectHandle> {
     let tmpl = [Attribute::Class(class), Attribute::Label(label.to_vec())];
-    let mut found = session.find_objects(&tmpl).context("PKCS#11 find_objects")?;
+    let mut found = session
+        .find_objects(&tmpl)
+        .context("PKCS#11 find_objects")?;
     match found.len() {
         1 => Ok(found.remove(0)),
-        0 => Err(anyhow!("no PKCS#11 object with the requested class + label")),
-        n => Err(anyhow!("{n} PKCS#11 objects share the issuer key label — ambiguous, refusing")),
+        0 => Err(anyhow!(
+            "no PKCS#11 object with the requested class + label"
+        )),
+        n => Err(anyhow!(
+            "{n} PKCS#11 objects share the issuer key label — ambiguous, refusing"
+        )),
     }
 }
 
@@ -165,7 +196,10 @@ fn spki_from_handle(session: &Session, pubh: ObjectHandle) -> Result<Vec<u8>> {
     use rsa::BigUint;
 
     let attrs = session
-        .get_attributes(pubh, &[AttributeType::Modulus, AttributeType::PublicExponent])
+        .get_attributes(
+            pubh,
+            &[AttributeType::Modulus, AttributeType::PublicExponent],
+        )
         .context("reading HSM public-key modulus/exponent")?;
     let mut modulus = None;
     let mut exponent = None;
@@ -180,7 +214,11 @@ fn spki_from_handle(session: &Session, pubh: ObjectHandle) -> Result<Vec<u8>> {
     let e = exponent.ok_or_else(|| anyhow!("HSM public key exposed no public exponent"))?;
     let key = rsa::RsaPublicKey::new(BigUint::from_bytes_be(&n), BigUint::from_bytes_be(&e))
         .context("reconstructing the RSA public key from HSM attributes")?;
-    Ok(key.to_public_key_der().context("encoding SubjectPublicKeyInfo")?.as_ref().to_vec())
+    Ok(key
+        .to_public_key_der()
+        .context("encoding SubjectPublicKeyInfo")?
+        .as_ref()
+        .to_vec())
 }
 
 #[cfg(test)]
@@ -196,13 +234,17 @@ mod tests {
     #[test]
     fn hsm_blind_sign_round_trips_a_token() {
         let Ok(module) = std::env::var("NW_TOKEN_HSM_MODULE") else {
-            eprintln!("no NW_TOKEN_HSM_MODULE set — skipping HSM round-trip (see deploy/verify-hsm.sh)");
+            eprintln!(
+                "no NW_TOKEN_HSM_MODULE set — skipping HSM round-trip (see deploy/verify-hsm.sh)"
+            );
             return;
         };
         let pin = std::env::var("NW_TOKEN_HSM_PIN").expect("NW_TOKEN_HSM_PIN");
-        let label =
-            std::env::var("NW_TOKEN_HSM_KEY_LABEL").unwrap_or_else(|_| "nil-issuer-test".to_string());
-        let slot = std::env::var("NW_TOKEN_HSM_SLOT").ok().and_then(|s| s.parse::<u64>().ok());
+        let label = std::env::var("NW_TOKEN_HSM_KEY_LABEL")
+            .unwrap_or_else(|_| "nil-issuer-test".to_string());
+        let slot = std::env::var("NW_TOKEN_HSM_SLOT")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
 
         Pkcs11Signer::provision(&module, slot, &pin, &label).expect("provision issuer keypair");
         let signer = Pkcs11Signer::open(&module, slot, &pin, &label).expect("open HSM signer");
@@ -210,11 +252,20 @@ mod tests {
         let pub_der = signer.public_der().expect("public der from HSM");
         let msg = vec![0x42u8; 32];
         let req = nil_crypto::token::blind(&pub_der, &msg).expect("client blind");
-        let blind_sig = signer.blind_sign(&req.blind_msg).expect("HSM blind_sign (raw RSA)");
-        let token = nil_crypto::token::finalize(&pub_der, &req, &blind_sig).expect("client finalize");
+        let blind_sig = signer
+            .blind_sign(&req.blind_msg)
+            .expect("HSM blind_sign (raw RSA)");
+        let token =
+            nil_crypto::token::finalize(&pub_der, &req, &blind_sig).expect("client finalize");
 
         let verifier = nil_crypto::token::Verifier::from_public_der(&pub_der).expect("verifier");
-        assert!(verifier.verify(&token, &msg), "HSM-signed token must verify");
-        assert!(!verifier.verify(&token, b"a different message"), "must not verify for another msg");
+        assert!(
+            verifier.verify(&token, &msg),
+            "HSM-signed token must verify"
+        );
+        assert!(
+            !verifier.verify(&token, b"a different message"),
+            "must not verify for another msg"
+        );
     }
 }

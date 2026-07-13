@@ -41,13 +41,19 @@ impl ClientPqWg {
     pub fn on_control_bytes(&mut self, node_secret: &StaticSecret, bytes: &[u8]) {
         self.ctrl_in.extend_from_slice(bytes);
         while self.ctrl_in.len() >= 4 {
-            let len =
-                u32::from_be_bytes([self.ctrl_in[0], self.ctrl_in[1], self.ctrl_in[2], self.ctrl_in[3]]) as usize;
+            let len = u32::from_be_bytes([
+                self.ctrl_in[0],
+                self.ctrl_in[1],
+                self.ctrl_in[2],
+                self.ctrl_in[3],
+            ]) as usize;
             if len > MAX_CTRL_FRAME {
                 // A length prefix above any legitimate offer is hostile/corrupt. Without this cap a
                 // `0xFFFFFFFF` prefix makes the loop wait for ~4 GiB and `ctrl_in` grows unbounded as
                 // more bytes arrive — a single-client OOM DoS. Abandon reassembly (no PII logged).
-                tracing::warn!("PQ-WG control frame length exceeds cap — dropping reassembly buffer");
+                tracing::warn!(
+                    "PQ-WG control frame length exceeds cap — dropping reassembly buffer"
+                );
                 self.ctrl_in.clear();
                 break;
             }
@@ -70,12 +76,20 @@ impl ClientPqWg {
             return None;
         }
         let client_wg_pub: [u8; 32] = parts[0].as_slice().try_into().ok()?;
-        let offer = PqOffer { mlkem_ek: parts[1].clone(), mceliece_pk: parts[2].clone() };
+        let offer = PqOffer {
+            mlkem_ek: parts[1].clone(),
+            mceliece_pk: parts[2].clone(),
+        };
         let (cts, psk) = responder_encapsulate(&offer)
             .map_err(|e| tracing::warn!("PQ responder_encapsulate: {e}"))
             .ok()?;
         // Node is the WireGuard responder: our static secret + the client's static public.
-        self.tunn = Some(PqWgCore::new(node_secret.clone(), PublicKey::from(client_wg_pub), &psk, 2));
+        self.tunn = Some(PqWgCore::new(
+            node_secret.clone(),
+            PublicKey::from(client_wg_pub),
+            &psk,
+            2,
+        ));
         tracing::info!("PQ-WireGuard responder: hybrid PSK derived, Tunn built");
         Some(encode_parts(&[&cts.mlkem_ct, &cts.mceliece_ct]))
     }
@@ -92,7 +106,10 @@ mod tests {
         let secret = StaticSecret::from([7u8; 32]);
         let mut pq = ClientPqWg::default();
         pq.on_control_bytes(&secret, &[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert!(pq.ctrl_in.is_empty(), "an oversized frame header must drop the reassembly buffer");
+        assert!(
+            pq.ctrl_in.is_empty(),
+            "an oversized frame header must drop the reassembly buffer"
+        );
         // A subsequent byte flood (whose leading 4 bytes also exceed the cap) stays bounded.
         pq.on_control_bytes(&secret, &vec![0xABu8; 100_000]);
         assert!(
@@ -100,6 +117,9 @@ mod tests {
             "ctrl_in must stay bounded under a flood (was {})",
             pq.ctrl_in.len()
         );
-        assert!(pq.tunn.is_none(), "no responder is built from garbage control bytes");
+        assert!(
+            pq.tunn.is_none(),
+            "no responder is built from garbage control bytes"
+        );
     }
 }

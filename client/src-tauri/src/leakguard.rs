@@ -8,8 +8,8 @@
 //! down atomically with it; this hook stays a no-op rather than installing a second, divergent
 //! firewall policy that could fight the datapath's.
 //!
-//! On the loopback mock (or before a real tunnel exists) there is nothing to leak — no route is
-//! changed — so arming here would be theatre.
+//! On the debug-only loopback seam (or before a real tunnel exists) there is nothing to leak — no
+//! route is changed — so arming here would be theatre. Release builds contain no loopback engine.
 
 /// Arm leak protection. The datapath kill-switch is the real guard (armed by `engine.connect`);
 /// this is a deliberate no-op so the two don't install conflicting firewall policies.

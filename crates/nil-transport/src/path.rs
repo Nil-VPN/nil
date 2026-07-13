@@ -199,7 +199,11 @@ impl Transport for PathTransport {
             // (Attestation is appraised inside connect/connect_nested before either returns.)
             let masque = match &carrier {
                 None => self.inner.connect(hop.clone(), grant).await,
-                Some((ct, cs)) => self.inner.connect_nested(hop.clone(), grant, ct.clone(), *cs).await,
+                Some((ct, cs)) => {
+                    self.inner
+                        .connect_nested(hop.clone(), grant, ct.clone(), *cs)
+                        .await
+                }
             };
             let masque = match masque {
                 Ok(s) => s,
@@ -231,7 +235,9 @@ impl Transport for PathTransport {
 
         // The last hop is the exit — the session the datapath drives. (hops is non-empty: the path
         // has >= 1 hop and every iteration pushes exactly one handle.)
-        let exit = *hops.last().expect("non-empty path established at least one hop");
+        let exit = *hops
+            .last()
+            .expect("non-empty path established at least one hop");
         let pq_hops = hops.iter().filter(|h| h.is_pq()).count();
         // Register the path for teardown. If a registration lock is poisoned, tear the freshly-dialed
         // hops down BEFORE returning — otherwise every hop's QUIC session leaks (stays open on each
@@ -392,17 +398,36 @@ mod tests {
         );
         assert_eq!(t.hop_count(), 3);
         assert_eq!(t.entry().expect("entry hop").host, "entry");
-        assert_eq!(t.kind(), TransportKind::Masque, "every hop is MASQUE on the wire");
+        assert_eq!(
+            t.kind(),
+            TransportKind::Masque,
+            "every hop is MASQUE on the wire"
+        );
 
-        let base = Grant { token: vec![9, 9, 9], nonce: [0u8; 32] };
+        let base = Grant {
+            token: vec![9, 9, 9],
+            nonce: [0u8; 32],
+        };
         // Each hop with no pinned grant gets a fresh per-hop grant; nonces must all differ.
         let g_entry = PathTransport::grant_for(&t.hops[0], &base).expect("entry grant");
         let g_middle = PathTransport::grant_for(&t.hops[1], &base).expect("middle grant");
         let g_exit = PathTransport::grant_for(&t.hops[2], &base).expect("exit grant");
-        assert_ne!(g_entry.nonce, g_middle.nonce, "entry and middle nonces independent");
-        assert_ne!(g_middle.nonce, g_exit.nonce, "middle and exit nonces independent");
-        assert_ne!(g_entry.nonce, g_exit.nonce, "entry and exit nonces independent");
-        assert_eq!(g_entry.token, base.token, "the payment token carries through every hop");
+        assert_ne!(
+            g_entry.nonce, g_middle.nonce,
+            "entry and middle nonces independent"
+        );
+        assert_ne!(
+            g_middle.nonce, g_exit.nonce,
+            "middle and exit nonces independent"
+        );
+        assert_ne!(
+            g_entry.nonce, g_exit.nonce,
+            "entry and exit nonces independent"
+        );
+        assert_eq!(
+            g_entry.token, base.token,
+            "the payment token carries through every hop"
+        );
     }
 
     #[test]
@@ -452,7 +477,10 @@ mod tests {
             vec![ep("entry"), ep_pq("exit", [3u8; 32])],
         );
         t.pq_exits.lock().expect("pq set").insert(SessionId(7));
-        assert!(t.is_pq_exit(SessionId(7)).expect("pq id"), "recorded id is a PQ exit");
+        assert!(
+            t.is_pq_exit(SessionId(7)).expect("pq id"),
+            "recorded id is a PQ exit"
+        );
         assert!(
             !t.is_pq_exit(SessionId(8)).expect("plain id"),
             "an unrecorded id is a plain MASQUE exit"
@@ -466,11 +494,23 @@ mod tests {
         // (so both legs they terminate are PQ); the middle has none (plain nested MASQUE).
         let t = PathTransport::new(
             Arc::new(MasqueTransport::new()),
-            vec![ep_pq("entry", [1u8; 32]), ep("middle"), ep_pq("exit", [9u8; 32])],
+            vec![
+                ep_pq("entry", [1u8; 32]),
+                ep("middle"),
+                ep_pq("exit", [9u8; 32]),
+            ],
         );
-        assert_eq!(t.hops[0].wg_pub, Some([1u8; 32]), "entry hop carries its PQ key");
+        assert_eq!(
+            t.hops[0].wg_pub,
+            Some([1u8; 32]),
+            "entry hop carries its PQ key"
+        );
         assert_eq!(t.hops[1].wg_pub, None, "middle hop is plain nested MASQUE");
-        assert_eq!(t.hops[2].wg_pub, Some([9u8; 32]), "exit hop carries its PQ key");
+        assert_eq!(
+            t.hops[2].wg_pub,
+            Some([9u8; 32]),
+            "exit hop carries its PQ key"
+        );
         // On the wire the onion is still MASQUE/QUIC regardless of the inner PQ-WireGuard layer.
         assert_eq!(t.kind(), TransportKind::Masque);
         assert_eq!(t.fingerprint_profile(), Profile::HttpsQuic);
@@ -481,7 +521,10 @@ mod tests {
         // teardown + the exit-dispatch decision both key off these: a Pq hop closes via pqwg (which
         // also closes its inner MASQUE session) and is the dispatch target only when it is the exit;
         // a Plain hop closes via inner. Lock the accessor semantics the connect/close paths rely on.
-        let s = Session { id: SessionId(42), kind: TransportKind::Masque };
+        let s = Session {
+            id: SessionId(42),
+            kind: TransportKind::Masque,
+        };
         assert_eq!(HopHandle::Pq(s).session().id, SessionId(42));
         assert_eq!(HopHandle::Plain(s).session().id, SessionId(42));
         assert!(HopHandle::Pq(s).is_pq(), "a PQ hop reports PQ");

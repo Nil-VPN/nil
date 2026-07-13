@@ -73,7 +73,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use boringtun::x25519::PublicKey;
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -153,11 +155,20 @@ pub struct RealityTransport {
 
 impl RealityTransport {
     pub fn new(node_wg_pub: [u8; 32], host: Option<String>, port: Option<u16>) -> Self {
-        Self::with_config(RealityConfig { node_wg_pub, host, port, sni: None })
+        Self::with_config(RealityConfig {
+            node_wg_pub,
+            host,
+            port,
+            sni: None,
+        })
     }
 
     pub fn with_config(cfg: RealityConfig) -> Self {
-        Self { cfg: Arc::new(cfg), sessions: Mutex::new(HashMap::new()), next_id: AtomicU64::new(0) }
+        Self {
+            cfg: Arc::new(cfg),
+            sessions: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(0),
+        }
     }
 
     fn state(&self, session: &Session) -> Result<Arc<RealitySession>> {
@@ -207,8 +218,15 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         use rustls::SignatureScheme::*;
         vec![
-            ECDSA_NISTP256_SHA256, ECDSA_NISTP384_SHA384, ED25519, RSA_PSS_SHA256, RSA_PSS_SHA384,
-            RSA_PSS_SHA512, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512,
+            ECDSA_NISTP256_SHA256,
+            ECDSA_NISTP384_SHA384,
+            ED25519,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            RSA_PKCS1_SHA256,
+            RSA_PKCS1_SHA384,
+            RSA_PKCS1_SHA512,
         ]
     }
 }
@@ -232,7 +250,11 @@ impl Transport for RealityTransport {
     async fn connect(&self, target: NodeEndpoint, _creds: Grant) -> Result<Session> {
         let host = self.cfg.host.clone().unwrap_or_else(|| target.host.clone());
         let port = self.cfg.port.unwrap_or(target.port);
-        let sni = self.cfg.sni.clone().unwrap_or_else(|| REALITY_DEFAULT_SNI.to_string());
+        let sni = self
+            .cfg
+            .sni
+            .clone()
+            .unwrap_or_else(|| REALITY_DEFAULT_SNI.to_string());
 
         // TCP → TLS. The SNI is the (cosmetic) borrowed foreign-site name, not the node's identity.
         let tcp = TcpStream::connect((host.as_str(), port))
@@ -252,14 +274,18 @@ impl Transport for RealityTransport {
         // (derived from its pinned key) before it will serve a tunnel; a prober without the key
         // can't produce it. Then the inner WireGuard handshake, one datagram per record.
         let auth_id = derive_auth_id(&self.cfg.node_wg_pub);
-        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let client_kp =
+            WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
         let mut hello = Vec::with_capacity(REALITY_AUTH_ID_LEN + 32);
         hello.extend_from_slice(&auth_id);
         hello.extend_from_slice(client_kp.public.as_bytes());
         write_record(&mut tls, &hello).await?;
 
-        let mut core = PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
-        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        let mut core =
+            PqWgCore::without_psk(client_kp.secret, PublicKey::from(self.cfg.node_wg_pub), 1);
+        let init = core
+            .handshake_init()
+            .map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         write_record(&mut tls, &init).await?;
 
         // Await the handshake response, then send the completing keepalive.
@@ -268,7 +294,11 @@ impl Transport for RealityTransport {
             .map_err(|_| Error::Transport("reality handshake timed out".into()))??;
         match core.decapsulate(&resp) {
             WgStep::Network(keepalive) => write_record(&mut tls, &keepalive).await?,
-            other => return Err(Error::Transport(format!("reality handshake failed: {other:?}"))),
+            other => {
+                return Err(Error::Transport(format!(
+                    "reality handshake failed: {other:?}"
+                )))
+            }
         }
         // Honest posture (surface the limit where the rung is actually used, not only in the docs):
         // the outer TLS is a genuine self-signed handshake with a rustls (not browser) ClientHello,
@@ -297,7 +327,10 @@ impl Transport for RealityTransport {
             .lock()
             .map_err(|_| Error::Transport("reality session map poisoned".into()))?
             .insert(id, sess);
-        Ok(Session { id, kind: TransportKind::Reality })
+        Ok(Session {
+            id,
+            kind: TransportKind::Reality,
+        })
     }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
@@ -359,9 +392,15 @@ where
         return Err(Error::Transport("reality record exceeds max size".into()));
     }
     let len = (data.len() as u16).to_be_bytes();
-    w.write_all(&len).await.map_err(|e| Error::Transport(format!("reality write len: {e}")))?;
-    w.write_all(data).await.map_err(|e| Error::Transport(format!("reality write body: {e}")))?;
-    w.flush().await.map_err(|e| Error::Transport(format!("reality flush: {e}")))
+    w.write_all(&len)
+        .await
+        .map_err(|e| Error::Transport(format!("reality write len: {e}")))?;
+    w.write_all(data)
+        .await
+        .map_err(|e| Error::Transport(format!("reality write body: {e}")))?;
+    w.flush()
+        .await
+        .map_err(|e| Error::Transport(format!("reality flush: {e}")))
 }
 
 /// Read one length-delimited record. EOF before/while reading a record is reported as
@@ -449,8 +488,16 @@ mod tests {
     fn auth_id_is_deterministic_and_key_bound() {
         let a = [7u8; 32];
         let b = [9u8; 32];
-        assert_eq!(derive_auth_id(&a), derive_auth_id(&a), "same key derives the same auth id");
-        assert_ne!(derive_auth_id(&a), derive_auth_id(&b), "different keys derive different auth ids");
+        assert_eq!(
+            derive_auth_id(&a),
+            derive_auth_id(&a),
+            "same key derives the same auth id"
+        );
+        assert_ne!(
+            derive_auth_id(&a),
+            derive_auth_id(&b),
+            "different keys derive different auth ids"
+        );
         assert_eq!(derive_auth_id(&a).len(), REALITY_AUTH_ID_LEN);
     }
 
@@ -477,6 +524,9 @@ mod tests {
     async fn read_record_reports_closed_on_eof() {
         let (client, mut server) = tokio::io::duplex(16);
         drop(client); // EOF immediately
-        assert!(matches!(read_record_from(&mut server).await, Err(Error::Closed)));
+        assert!(matches!(
+            read_record_from(&mut server).await,
+            Err(Error::Closed)
+        ));
     }
 }

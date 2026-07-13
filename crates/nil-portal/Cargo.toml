@@ -17,7 +17,8 @@ postgres = ["dep:tokio-postgres"]
 card-payments = ["dep:hmac", "dep:subtle"]
 # HSM/KMS-backed issuer key via PKCS#11 (SoftHSM in test/CI, a real HSM in prod): the RSA private
 # key never leaves the device — the Portal blind-signs by asking the HSM to do a raw RSA op
-# (CKM_RSA_X_509), closing the plaintext-key-on-disk risk. Off by default (in-memory Issuer).
+# (CKM_RSA_X_509), closing the plaintext-key-on-disk risk. Off by default for debug workspace
+# builds; the production image enables it and optimized binaries refuse the software issuer.
 hsm = ["dep:cryptoki", "dep:rsa"]
 
 [dependencies]
@@ -36,6 +37,9 @@ sha2 = { workspace = true }        # hash the payment<->account binding (subscri
 async-trait = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+libc = { workspace = true }
 # Talk to the self-hosted monero-wallet-rpc. rustls (not OpenSSL) to match the project's TLS.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 # Clustered account store (PgStore), behind the `postgres` feature.

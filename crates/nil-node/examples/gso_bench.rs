@@ -31,7 +31,8 @@ fn main() {
     const TOTAL: usize = 2_000_000; // total packets per mode
 
     let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-    rx.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+    rx.set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .unwrap();
     // Big receive buffer so the receiver rarely drops; we want to measure the SENDER.
     let dest = rx.local_addr().unwrap();
     let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -105,5 +106,7 @@ fn main() {
     println!("per-packet send_to : {a:>12.0} pkt/s  ({:.2?})", per_packet);
     println!("GSO sendmsg batches: {b:>12.0} pkt/s  ({:.2?})", gso);
     println!("SPEEDUP (GSO / per-packet): {:.2}x", b / a);
-    println!("(absolute pps is runner-dependent; the ratio isolates the syscall reduction GSO buys.)");
+    println!(
+        "(absolute pps is runner-dependent; the ratio isolates the syscall reduction GSO buys.)"
+    );
 }

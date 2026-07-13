@@ -27,7 +27,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boringtun::x25519::PublicKey;
 use futures_util::{SinkExt, StreamExt};
-use nil_core::{Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind};
+use nil_core::{
+    Error, Grant, IpPacket, NodeEndpoint, Profile, Result, Session, SessionId, TransportKind,
+};
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
@@ -100,7 +102,11 @@ pub struct WstunnelTransport {
 impl WstunnelTransport {
     pub fn new(node_wg_pub: [u8; 32], host: Option<String>, port: Option<u16>) -> Self {
         Self {
-            cfg: Arc::new(WstunnelConfig { node_wg_pub, host, port }),
+            cfg: Arc::new(WstunnelConfig {
+                node_wg_pub,
+                host,
+                port,
+            }),
             sessions: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
         }
@@ -152,8 +158,15 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         use rustls::SignatureScheme::*;
         vec![
-            ECDSA_NISTP256_SHA256, ECDSA_NISTP384_SHA384, ED25519, RSA_PSS_SHA256, RSA_PSS_SHA384,
-            RSA_PSS_SHA512, RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512,
+            ECDSA_NISTP256_SHA256,
+            ECDSA_NISTP384_SHA384,
+            ED25519,
+            RSA_PSS_SHA256,
+            RSA_PSS_SHA384,
+            RSA_PSS_SHA512,
+            RSA_PKCS1_SHA256,
+            RSA_PKCS1_SHA384,
+            RSA_PKCS1_SHA512,
         ]
     }
 }
@@ -188,14 +201,19 @@ impl Transport for WstunnelTransport {
                 .map_err(|e| Error::Transport(format!("wstunnel connect failed: {e}")))?;
 
         // Frame 1: our WG static pubkey.
-        let client_kp = WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
+        let client_kp =
+            WgKeypair::generate().map_err(|e| Error::Transport(format!("wg keygen: {e}")))?;
         ws_send(&mut ws, client_kp.public.as_bytes().to_vec()).await?;
 
         // Frame 2: the PQ hybrid-PSK offer (ML-KEM-1024 ek + Classic McEliece pk, ~512 KiB). The
         // reliable WS channel carries it (unlike the raw-UDP AmneziaWG rung). The node replies with
         // the two KEM ciphertexts; both sides derive the same PSK, which never crosses the wire.
         let (initiator, offer) = PqInitiator::generate();
-        ws_send(&mut ws, encode_parts(&[&offer.mlkem_ek, &offer.mceliece_pk])).await?;
+        ws_send(
+            &mut ws,
+            encode_parts(&[&offer.mlkem_ek, &offer.mceliece_pk]),
+        )
+        .await?;
         let cts_msg = tokio::time::timeout(WS_PQ_HANDSHAKE_TIMEOUT, ws_recv_binary(&mut ws))
             .await
             .map_err(|_| Error::Transport("wstunnel PQ handshake timed out".into()))??;
@@ -221,7 +239,9 @@ impl Transport for WstunnelTransport {
             &psk,
             1,
         );
-        let init = core.handshake_init().map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
+        let init = core
+            .handshake_init()
+            .map_err(|e| Error::Transport(format!("wg init: {e:?}")))?;
         ws_send(&mut ws, init).await?;
 
         // Await the handshake response, then send the completing keepalive.
@@ -230,7 +250,11 @@ impl Transport for WstunnelTransport {
             .map_err(|_| Error::Transport("wstunnel handshake timed out".into()))??;
         match core.decapsulate(&resp) {
             WgStep::Network(keepalive) => ws_send(&mut ws, keepalive).await?,
-            other => return Err(Error::Transport(format!("wstunnel handshake failed: {other:?}"))),
+            other => {
+                return Err(Error::Transport(format!(
+                    "wstunnel handshake failed: {other:?}"
+                )))
+            }
         }
         tracing::info!("wstunnel tunnel established (PQ-WireGuard over WebSocket-over-TLS)");
 
@@ -250,7 +274,10 @@ impl Transport for WstunnelTransport {
             .lock()
             .map_err(|_| Error::Transport("wstunnel session map poisoned".into()))?
             .insert(id, sess);
-        Ok(Session { id, kind: TransportKind::Wstunnel })
+        Ok(Session {
+            id,
+            kind: TransportKind::Wstunnel,
+        })
     }
 
     async fn send(&self, session: &Session, packet: IpPacket) -> Result<()> {
@@ -296,9 +323,8 @@ impl Transport for WstunnelTransport {
 }
 
 /// A WebSocket stream over either plain TCP or TLS (tungstenite's MaybeTlsStream).
-type Ws = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type Ws =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn ws_send(ws: &mut Ws, data: Vec<u8>) -> Result<()> {
     ws.send(Message::Binary(data))

@@ -1,26 +1,100 @@
+#[path = "trust_bundle.rs"]
+mod trust_bundle;
+
 fn main() {
+    embed_release_trust_bundle();
+
     // Declare the app-embedded mobile VPN plugin (`nil-vpn`, the Kotlin `NilVpnPlugin` registered
-    // at runtime via `register_android_plugin`). This generates its ACL permissions so the mobile
-    // capability can grant `nil-vpn:default`, letting the WebView invoke `startVPN`/`stopVPN`.
-    // The plugin has no Rust-side commands — its commands live in Kotlin/Swift — so we inline its
-    // command list here for the ACL. `default_permission(AllowAllCommands)` makes `nil-vpn:default`
-    // cover both commands (start + stop). Desktop builds ignore the mobile-scoped capability.
-    let attributes = tauri_build::Attributes::new().plugin(
-        "nil-vpn",
-        tauri_build::InlinedPlugin::new()
-            // camelCase with title-case acronyms (Vpn, not VPN): Tauri's mobile plugin dispatch
-            // lowercases a trailing all-caps acronym (startVPN → startVpn) when matching the Kotlin
-            // @Command, so the command names MUST be the already-lowercased form or dispatch fails
-            // at runtime with "No command … found" (the @Command methods match these verbatim).
-            .commands(&["startVpn", "stopVpn", "statusVpn", "prepareVpn", "openVpnSettings"])
-            .default_permission(tauri_build::DefaultPermissionRule::AllowAllCommands),
-    );
+    // at runtime via `register_android_plugin`). Its Kotlin/Swift commands are declared for mobile
+    // dispatch, but deliberately receive NO default WebView permission: Rust retains the private
+    // PluginHandle and enforces consent, ID-bound completion, and status itself. In particular,
+    // bearer grants never cross JavaScript.
+    let attributes = tauri_build::Attributes::new()
+        .plugin(
+            "nil-vpn",
+            tauri_build::InlinedPlugin::new()
+                // camelCase with title-case acronyms (Vpn, not VPN): Tauri's mobile plugin dispatch
+                // lowercases a trailing all-caps acronym (startVPN → startVpn) when matching the Kotlin
+                // @Command, so the command names MUST be the already-lowercased form or dispatch fails
+                // at runtime with "No command … found" (the @Command methods match these verbatim).
+                .commands(&[
+                    "startVpn",
+                    "stopVpn",
+                    "statusVpn",
+                    "prepareVpn",
+                    "openVpnSettings",
+                ]),
+        )
+        // Private Android secure-vault bridge. Intentionally NO default permission: JavaScript has
+        // no ACL route to raw vault plaintext; only the Rust-held PluginHandle invokes it.
+        .plugin(
+            "nil-secure-store",
+            tauri_build::InlinedPlugin::new().commands(&["seal", "open", "destroyKey"]),
+        );
     tauri_build::try_build(attributes).expect("failed to run tauri-build");
 
     sync_android_sources();
+    sync_android_secure_store_resources();
     sync_android_build_wiring();
     patch_android_manifest();
+    patch_android_backup_posture();
     sync_apple_sources();
+}
+
+/// Validate and embed the independently published client trust roots.
+///
+/// A release-profile build without these roots would silently restore trust in values served by
+/// the Portal/Coordinator. Refuse that artifact at build time. Debug builds retain the local-dev
+/// behavior, but if a developer supplies a bundle it is held to the same validation rules.
+fn embed_release_trust_bundle() {
+    const INPUT: &str = "NIL_TRUST_BUNDLE_JSON";
+    const EMBEDDED: &str = "NIL_EMBEDDED_TRUST_BUNDLE_JSON";
+
+    println!("cargo:rerun-if-env-changed={INPUT}");
+    println!("cargo:rerun-if-changed=trust_bundle.rs");
+
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    // Cargo currently reports the inherited base (`release`) in PROFILE for a named custom
+    // profile. OUT_DIR retains the actual profile directory (`target/e2e/build/.../out`), so use
+    // that exact component as the fallback discriminator rather than broadly exempting optimized
+    // builds or trusting a user-controlled runtime flag.
+    let e2e_profile = profile == "e2e"
+        || std::env::var_os("OUT_DIR").is_some_and(|out_dir| {
+            std::path::Path::new(&out_dir)
+                .ancestors()
+                .nth(3)
+                .and_then(std::path::Path::file_name)
+                .is_some_and(|name| name == "e2e")
+        });
+    // `e2e` is the one reviewed local-integration profile: it is optimized but deliberately keeps
+    // debug assertions so loopback + dynamic local Portal keys remain available. Every other
+    // optimized/custom profile is treated like release and must embed reviewed production roots.
+    let release_profile = !e2e_profile
+        && (profile == "release" || std::env::var("DEBUG").is_ok_and(|debug| debug == "false"));
+    let supplied = std::env::var(INPUT)
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let Some(raw) = supplied else {
+        if release_profile {
+            panic!(
+                "release client builds require {INPUT}; provide the reviewed trust-bundle v1 JSON"
+            );
+        }
+        // Give `option_env!` one stable value in debug builds and do not inherit a runtime env var.
+        println!("cargo:rustc-env={EMBEDDED}=");
+        return;
+    };
+
+    let validated = trust_bundle::validate_trust_bundle_json(&raw)
+        .unwrap_or_else(|error| panic!("{INPUT} is invalid: {error}"));
+    nil_crypto::token::Verifier::from_public_ders(&validated.issuer_public_keys_der)
+        .unwrap_or_else(|error| {
+            panic!("{INPUT} contains an unusable token issuer DER key: {error}")
+        });
+
+    // `canonical_json` is one line, so it is safe as a Cargo directive value and produces the same
+    // embedded bytes regardless of whitespace in the repository variable.
+    println!("cargo:rustc-env={EMBEDDED}={}", validated.canonical_json);
 }
 
 /// Mirror the canonical Android/Kotlin VPN sources (`crates/nil-android/android/*.kt`) into the
@@ -65,10 +139,16 @@ fn sync_android_sources() {
         // Only mirror regular files. A symlink in the (developer-committed) source tree is never a
         // legitimate .kt source; following one could copy unintended content into the build, so skip
         // it rather than follow it (defense-in-depth).
-        if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(true) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
             continue;
         }
-        let Some(name) = path.file_name() else { continue };
+        let Some(name) = path.file_name() else {
+            continue;
+        };
         // Re-run this build script whenever a canonical Kotlin source changes, so the gen copy is
         // refreshed on the next build instead of being skipped by cargo's freshness cache.
         println!("cargo:rerun-if-changed={}", path.display());
@@ -79,6 +159,32 @@ fn sync_android_sources() {
                 "cargo:warning=failed to sync canonical Android source {} into gen/: {e}",
                 name.to_string_lossy()
             );
+        }
+    }
+}
+
+/// Copy the canonical no-backup rules into the generated Android project. Credentials are already
+/// encrypted, but cloud/device-transfer backups would separate the vault from its non-exportable
+/// Keystore key and can preserve pre-migration plaintext files. The whole app-private tree is
+/// therefore excluded and `allowBackup=false` is injected below.
+fn sync_android_secure_store_resources() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let src = manifest.join("../../crates/nil-android/android/res/xml");
+    let dst = manifest.join("gen/android/app/src/main/res/xml");
+    if !src.is_dir() || !manifest.join("gen/android/app/src/main/res").is_dir() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&dst) {
+        println!("cargo:warning=cannot create generated Android xml resource dir: {e}");
+        return;
+    }
+    for name in ["nil_backup_rules.xml", "nil_backup_rules_legacy.xml"] {
+        let source = src.join(name);
+        println!("cargo:rerun-if-changed={}", source.display());
+        if let Err(e) = std::fs::copy(&source, dst.join(name)) {
+            println!("cargo:warning=failed to sync Android backup rule {name}: {e}");
         }
     }
 }
@@ -123,7 +229,9 @@ fn sync_android_build_wiring() {
             if !contents.contains("nil-android.gradle.kts") {
                 let appended = format!("{contents}\n{apply_line}\n");
                 if let Err(e) = std::fs::write(&build_gradle, appended) {
-                    println!("cargo:warning=failed to add nil-android apply() to build.gradle.kts: {e}");
+                    println!(
+                        "cargo:warning=failed to add nil-android apply() to build.gradle.kts: {e}"
+                    );
                 }
             }
         }
@@ -194,7 +302,28 @@ fn patch_android_manifest() {
         }
     };
     if contents.contains("com.nilvpn.NilVpnService") {
-        return; // Already patched.
+        // A generated tree may already contain the old exported activity from an earlier build.
+        // Harden it in place instead of returning early, otherwise the secure source constant or
+        // separate-process privacy boundary would never reach a stale manifest.
+        let old = "android:name=\"com.nilvpn.VpnConsentActivity\"\n            android:theme=\"@android:style/Theme.Translucent.NoTitleBar\"\n            android:exported=\"true\"";
+        let new = "android:name=\"com.nilvpn.VpnConsentActivity\"\n            android:theme=\"@android:style/Theme.Translucent.NoTitleBar\"\n            android:exported=\"false\"";
+        let mut hardened = contents.replace(old, new);
+        let service_name = "android:name=\"com.nilvpn.NilVpnService\"";
+        if !hardened.contains("android:process=\":vpn\"") {
+            hardened = hardened.replace(
+                service_name,
+                concat!(
+                    "android:name=\"com.nilvpn.NilVpnService\"\n",
+                    "            android:process=\":vpn\"",
+                ),
+            );
+        }
+        if hardened != contents {
+            if let Err(e) = std::fs::write(&path, hardened) {
+                println!("cargo:warning=failed to harden existing VPN manifest: {e}");
+            }
+        }
+        return;
     }
 
     // Foreground-service + notification permissions the VpnService needs (INTERNET is already in the
@@ -203,12 +332,12 @@ fn patch_android_manifest() {
     // The VPN consent activity + the datapath VpnService. Inserted just before </application>.
     const APP_CHILDREN: &str = concat!(
         "\n        <!-- VPN consent handshake: VpnService.prepare() + system dialog, then starts the service.\n",
-        "             exported so the app's Connect action (and the e2e harness) can launch it; carries only\n",
+        "             non-exported so only the NIL app can launch it; debug e2e uses a separate test manifest.\n",
         "             a node endpoint, never identity. Invisible (translucent) — it just routes consent. -->\n",
         "        <activity\n",
         "            android:name=\"com.nilvpn.VpnConsentActivity\"\n",
         "            android:theme=\"@android:style/Theme.Translucent.NoTitleBar\"\n",
-        "            android:exported=\"true\" />\n\n",
+        "            android:exported=\"false\" />\n\n",
         "        <!-- NIL VPN datapath: the MASQUE tunnel runs in this VpnService (nil-android JNI engine).\n",
         "             android:process=\":vpn\" puts it in a SEPARATE process that loads only libnil_android\n",
         "             (no WebView, no reqwest, no token/identity code — PD-3: no identity in the data plane).\n",
@@ -241,7 +370,9 @@ fn patch_android_manifest() {
             format!("{head}{PERMS}{tail}")
         }
         None => {
-            println!("cargo:warning=AndroidManifest.xml has no <manifest> tag; VPN posture not injected");
+            println!(
+                "cargo:warning=AndroidManifest.xml has no <manifest> tag; VPN posture not injected"
+            );
             return;
         }
     };
@@ -251,12 +382,44 @@ fn patch_android_manifest() {
             format!("{head}{APP_CHILDREN}    {tail}")
         }
         None => {
-            println!("cargo:warning=AndroidManifest.xml has no </application>; VPN posture not injected");
+            println!(
+                "cargo:warning=AndroidManifest.xml has no </application>; VPN posture not injected"
+            );
             return;
         }
     };
     if let Err(e) = std::fs::write(&path, patched) {
         println!("cargo:warning=failed to write patched AndroidManifest.xml: {e}");
+    }
+}
+
+/// Disable Android backup/restore and point both old and new platform APIs at explicit exclusion
+/// rules. This is separate from `patch_android_manifest` so it also hardens already-generated trees
+/// that contain the VPN service marker and take that function's idempotent early return.
+fn patch_android_backup_posture() {
+    let manifest = std::path::PathBuf::from(
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR set by cargo"),
+    );
+    let path = manifest.join("gen/android/app/src/main/AndroidManifest.xml");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if contents.contains("android:allowBackup=") {
+        return;
+    }
+    let Some(start) = contents.find("<application") else {
+        println!("cargo:warning=AndroidManifest.xml has no <application> tag; backup not disabled");
+        return;
+    };
+    let insertion = start + "<application".len();
+    let (head, tail) = contents.split_at(insertion);
+    let attributes = concat!(
+        "\n        android:allowBackup=\"false\"",
+        "\n        android:fullBackupContent=\"@xml/nil_backup_rules_legacy\"",
+        "\n        android:dataExtractionRules=\"@xml/nil_backup_rules\"",
+    );
+    if let Err(e) = std::fs::write(&path, format!("{head}{attributes}{tail}")) {
+        println!("cargo:warning=failed to disable Android backup: {e}");
     }
 }
 
@@ -290,10 +453,16 @@ fn sync_apple_sources() {
         }
         // A symlink in the committed source tree is never a legitimate .swift source — skip, don't
         // follow it (defense-in-depth, mirrors the Android sync).
-        if path.symlink_metadata().map(|m| m.file_type().is_symlink()).unwrap_or(true) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
             continue;
         }
-        let Some(name) = path.file_name() else { continue };
+        let Some(name) = path.file_name() else {
+            continue;
+        };
         println!("cargo:rerun-if-changed={}", path.display());
         let target = dst.join(name);
         if target.exists() {

@@ -50,7 +50,12 @@ pub struct Diag {
 
 impl Diag {
     pub fn new(role: NodeRole) -> Self {
-        Self { role, c: Counts::default(), last: None, dirty: false }
+        Self {
+            role,
+            c: Counts::default(),
+            last: None,
+            dirty: false,
+        }
     }
 
     pub fn record_from_client(&mut self, pkts: usize, bytes: usize) {

@@ -7,18 +7,19 @@ rust-version.workspace = true
 description = "NIL VPN crypto core: anonymous account derivation (PQ PSK + RA-TLS in later phases)."
 
 [dependencies]
+bip39 = { workspace = true, features = ["zeroize"] }
 sha2 = { workspace = true }
 hkdf = { workspace = true }
 rand_core = { workspace = true }
+getrandom = { workspace = true }
 zeroize = { workspace = true }
-subtle = { workspace = true }
 data-encoding = { workspace = true }
 thiserror = { workspace = true }
 # PQ hybrid PSK (Phase 2): ML-KEM-1024 (FS) + Classic McEliece 460896 (auth) → 32-byte WG PSK.
 ml-kem = { workspace = true, features = ["getrandom"] }   # getrandom: system-RNG keygen/encaps
 classic-mceliece-rust = { workspace = true }
-# Privacy Pass unlinkable blind tokens (Phase 3): issuer signs with the private key, verifier
-# checks with only the public key — the blinding makes redemption unlinkable to issuance.
+# Privacy Pass blind bearer tokens (Phase 3): issuer signs with the private key, verifier checks
+# with only the public key — blinding removes a direct cryptographic issuance/redemption join.
 blind-rsa-signatures = { workspace = true }
 # Account auth key (ADR-0007): an Ed25519 keypair derived from the account secret. The client
 # signs a Portal challenge; the Portal stores only the public half. `zeroize` clears the signing

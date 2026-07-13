@@ -1,28 +1,31 @@
 //! Anonymous account derivation (architecture spec §7.5, ADR-0001).
 //!
-//! The recovery **phrase** is the root of the account. Everything else — the 256-bit
-//! secret, the account number — is derived deterministically from it, so an account is
-//! fully recoverable from the phrase alone. The one-time recovery code is an
-//! independent second factor.
+//! The recovery **phrase** is the root of the account. Everything else — a domain-separated
+//! 32-byte secret and the account number — is derived deterministically from it, so an account is
+//! fully recoverable from the phrase alone. The v2 phrase is a standard 12-word BIP39 English
+//! mnemonic with 128 bits of entropy and a checksum; derivation expands representation size, not
+//! the phrase's entropy.
 
 mod auth;
 mod derive;
 mod encoding;
 mod phrase;
-mod recovery;
-mod words;
 
-pub use auth::{verify_auth_signature, AuthKeypair, AUTH_PUBKEY_LEN, AUTH_SIG_LEN};
+pub use auth::{
+    verify_auth_signature, verify_registration_signature, AuthKeypair, AUTH_PUBKEY_LEN,
+    AUTH_SIG_LEN,
+};
 pub use phrase::Phrase;
-pub use recovery::RecoveryCode;
 
 use rand_core::{CryptoRng, RngCore};
 
 use crate::error::CryptoError;
 
-/// Number of words in a recovery phrase. The single knob if the entropy/word-count
-/// trade-off is ever revisited (see ADR-0001).
-pub const PHRASE_WORDS: usize = 7;
+/// Version of the account derivation and registration-proof scheme.
+pub const ACCOUNT_SCHEME_VERSION: u8 = 2;
+
+/// Number of words in a v2 BIP39 recovery phrase (128-bit entropy plus checksum).
+pub const PHRASE_WORDS: usize = 12;
 
 /// An account's identity-free identifier: `SHA-256(secret)`. The canonical value is
 /// the raw 32 bytes (the Portal's lookup key); [`AccountNumber::display`] is cosmetic.
@@ -43,14 +46,12 @@ impl AccountNumber {
     }
 }
 
-/// Everything produced when creating a fresh anonymous account. The Portal keeps only
-/// `account_number` (= `H(secret)`), `recovery_code_hash`, and `auth_public_key`; the phrase and
-/// code are returned to the user and never stored.
+/// Everything produced when creating a fresh anonymous account. The client keeps the
+/// phrase; a Portal registration needs only `account_number`, `auth_public_key`, and a
+/// proof of possession produced by [`AuthKeypair::sign_registration`].
 pub struct DerivedAccount {
     pub account_number: AccountNumber,
     pub recovery_phrase: Phrase,
-    pub recovery_code: RecoveryCode,
-    pub recovery_code_hash: [u8; 32],
     /// Public half of the account's Ed25519 auth key (derived from the phrase). Stored by the
     /// Portal to verify a signed challenge later (ADR-0007). Anonymous — carries no identity.
     pub auth_public_key: [u8; AUTH_PUBKEY_LEN],
@@ -66,13 +67,9 @@ pub fn create_account<R: RngCore + CryptoRng>(rng: &mut R) -> DerivedAccount {
         canonical: derive::account_hash(&secret),
     };
     let auth_public_key = AuthKeypair::from_entropy(&entropy).public_key_bytes();
-    let recovery_code = RecoveryCode::random(rng);
-    let recovery_code_hash = recovery_code.hash();
     DerivedAccount {
         account_number,
         recovery_phrase,
-        recovery_code,
-        recovery_code_hash,
         auth_public_key,
     }
     // `entropy` and `secret` are zeroized as they drop here.
@@ -92,11 +89,6 @@ pub fn account_number_from_phrase(phrase: &Phrase) -> Result<AccountNumber, Cryp
     })
 }
 
-/// Constant-time check of a submitted recovery code against a stored hash.
-pub fn verify_recovery_code(submitted: &RecoveryCode, stored_hash: &[u8; 32]) -> bool {
-    recovery::verify(submitted, stored_hash)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -108,10 +100,10 @@ mod tests {
     }
 
     #[test]
-    fn create_yields_seven_valid_words() {
+    fn create_yields_twelve_valid_words() {
         let acct = create_account(&mut seeded());
-        assert_eq!(acct.recovery_phrase.words().len(), 7);
-        // Every word must round-trip back to entropy (i.e. be a valid wordlist word).
+        assert_eq!(acct.recovery_phrase.words().len(), PHRASE_WORDS);
+        // Every word and the BIP39 checksum must round-trip back to entropy.
         assert!(acct.recovery_phrase.to_entropy().is_ok());
     }
 
@@ -121,7 +113,6 @@ mod tests {
         let b = create_account(&mut seeded());
         assert_eq!(a.account_number, b.account_number);
         assert_eq!(a.recovery_phrase.to_vec(), b.recovery_phrase.to_vec());
-        assert_eq!(a.recovery_code_hash, b.recovery_code_hash);
     }
 
     #[test]
@@ -129,15 +120,6 @@ mod tests {
         let acct = create_account(&mut seeded());
         let recovered = account_number_from_phrase(&acct.recovery_phrase).expect("valid phrase");
         assert_eq!(recovered, acct.account_number);
-    }
-
-    #[test]
-    fn recovery_code_verifies_round_trip() {
-        let acct = create_account(&mut seeded());
-        let resubmitted = RecoveryCode::parse(&acct.recovery_code.display());
-        assert!(verify_recovery_code(&resubmitted, &acct.recovery_code_hash));
-        let wrong = RecoveryCode::parse("WRONGCODE");
-        assert!(!verify_recovery_code(&wrong, &acct.recovery_code_hash));
     }
 
     #[test]

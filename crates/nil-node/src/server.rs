@@ -5,7 +5,7 @@
 //! (see `crate::pool` + `client_routes`). No identifying state is persisted.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,10 +15,12 @@ use tun_rs::AsyncDevice;
 use boringtun::x25519::StaticSecret;
 use nil_transport::connectip;
 use nil_transport::pqwg::{WgKeypair, WgStep};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::cert::DevCert;
+use crate::cert::NodeCert;
 use crate::config::NodeConfig;
+use crate::grant_replay::{GrantReplayCache, ReplayError};
 use crate::pqwg::ClientPqWg;
 
 // Must match the client's `nil_transport::masque` value: the negotiated datagram size is the
@@ -26,6 +28,9 @@ use crate::pqwg::ClientPqWg;
 // hop and starve the trust-split onion's innermost QUIC of its 1200 B floor. 1420 keeps the wire
 // packet (+28 B IPv4/UDP) under 1500.
 const MAX_UDP_PAYLOAD: usize = 1420;
+/// Hard cap on decoded HTTP/3 request fields. CONNECT-IP needs only a few small pseudo-headers, a
+/// 64-byte nonce hex value, and one bounded NWG2 token.
+const MAX_FIELD_SECTION_SIZE: u64 = 8 * 1024;
 
 /// When a client has NO pool-assigned inner address (ADDRESS_ASSIGN fallback — pool exhausted, at
 /// most one such client routes at a time), cap how many distinct inner source IPs it may register.
@@ -34,12 +39,37 @@ const MAX_UDP_PAYLOAD: usize = 1420;
 /// assigned address are bound to exactly that one IP (see `learn_client_route`).
 const MAX_LEARNED_ROUTES_PER_CLIENT: usize = 4;
 
+/// Packet destinations admitted after CONNECT-IP authorization. Only an exit may inject arbitrary
+/// inner IP into its TUN; entry/middle connections carry one Coordinator-signed exact next hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketPolicy {
+    Exit,
+    Relay(SocketAddrV4),
+}
+
+impl PacketPolicy {
+    /// Apply the signed relay boundary to a fully decapsulated inner packet. Intermediate traffic
+    /// must be one complete, unfragmented IPv4 UDP datagram to the exact signed address and port.
+    /// This prevents direct-to-exit, reordered-path, IPv6, and arbitrary UDP/443 relay attempts.
+    fn admits(self, packet: &[u8]) -> bool {
+        match self {
+            Self::Exit => true,
+            Self::Relay(endpoint) => relay_packet_targets(packet, endpoint),
+        }
+    }
+}
+
 struct Client {
     conn: quiche::Connection,
+    /// IP proven reachable by the stateless Retry exchange. The server disables QUIC active
+    /// migration and retains this address for predecessor-bound NWG2 authorization.
+    peer_ip: IpAddr,
     h3: Option<quiche::h3::Connection>,
     ci_stream: Option<u64>,
     flow_id: u64,
     tunnel_up: bool,
+    /// Signed NWG2 onward-routing policy retained for the lifetime of this CONNECT-IP tunnel.
+    packet_policy: Option<PacketPolicy>,
     /// Inner IPv4 this client was assigned from the pool (RFC 9484 ADDRESS_ASSIGN subset), once the
     /// CONNECT-IP tunnel came up. Released back to the pool on disconnect.
     assigned_ip: Option<std::net::Ipv4Addr>,
@@ -47,7 +77,11 @@ struct Client {
     pqwg: Option<ClientPqWg>,
 }
 
-pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> anyhow::Result<()> {
+pub async fn run(cfg: &NodeConfig, cert: &NodeCert, tun: Arc<AsyncDevice>) -> anyhow::Result<()> {
+    // Capture this before accepting traffic. The replay cache rejects grants minted before this
+    // process started, so restarting cannot broadly erase the single-use history.
+    let process_started_at = nil_core::grant::now_unix_secs_for_expiry();
+    let mut grant_replays = GrantReplayCache::new(process_started_at, cfg.grant_replay_capacity);
     let socket = UdpSocket::bind(cfg.bind).await?;
     let local = socket.local_addr()?;
     tracing::info!(%local, "MASQUE/CONNECT-IP server listening");
@@ -55,6 +89,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
     let mut config = build_server_config(cert)?;
     let mut h3_config = quiche::h3::Config::new()?;
     h3_config.enable_extended_connect(true);
+    h3_config.set_max_field_section_size(MAX_FIELD_SECTION_SIZE);
 
     // PQ-WireGuard responder (architecture spec §4.2): when enabled, generate the node's
     // WireGuard static key and run an inner Noise tunnel keyed by the PQ hybrid PSK.
@@ -104,7 +139,17 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             r = socket.recv_from(&mut buf) => {
                 match r {
                     Ok((len, from)) => {
-                        match handle_packet(&mut clients, &mut buf[..len], from, local, &mut config, pqwg_enabled, &retry_key) {
+                        match handle_packet(
+                            &mut clients,
+                            &mut buf[..len],
+                            from,
+                            local,
+                            &mut config,
+                            pqwg_enabled,
+                            &retry_key,
+                            cfg.max_connections,
+                            cfg.max_connections_per_ip,
+                        ) {
                             Ok(Some(reply)) => {
                                 // A stateless Retry / version-negotiation packet: send it and keep
                                 // NO connection state (the client re-Initials with the token).
@@ -174,8 +219,16 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                 node_wg.as_ref(),
                 &mut pool,
                 &mut client_routes,
+                &mut grant_replays,
             );
             if client.h3.is_none() {
+                continue;
+            }
+            // Never admit client datagrams before an authorized CONNECT-IP stream exists.
+            // H3 transport setup alone is not an authorization event: an unauthenticated peer can
+            // otherwise inject raw IP into the exit TUN before authorize_connect() runs.
+            if !client.tunnel_up {
+                while client.conn.dgram_recv(&mut buf).is_ok() {}
                 continue;
             }
             // Gather datagrams first so the conn borrow is released before WG decapsulation.
@@ -189,11 +242,17 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
             // The client's pool-assigned inner address (Copy); route learning is bound to it so a
             // tunnel cannot register arbitrary/unbounded inner sources.
             let assigned = client.assigned_ip;
+            let packet_policy = client.packet_policy;
             for dg in raw {
                 // Cover-traffic padding (context id 1) and malformed datagrams are dropped here —
                 // padding must never reach the exit TUN (it carries no inner packet).
                 let payload = match connectip::decode_datagram(&dg) {
-                    Ok((_fid, connectip::DatagramPayload::Ip(ip))) => ip,
+                    Ok((fid, connectip::DatagramPayload::Ip(ip)))
+                        if accepts_client_datagrams(client.tunnel_up, fid, client.flow_id) =>
+                    {
+                        ip
+                    }
+                    Ok((_fid, connectip::DatagramPayload::Ip(_))) => continue,
                     Ok((_fid, connectip::DatagramPayload::Padding)) => continue,
                     Err(_) => continue,
                 };
@@ -204,7 +263,14 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                         loop {
                             match tunn.decapsulate(&input) {
                                 WgStep::Ip(ip) => {
-                                    if learn_client_route(&mut client_routes, client_id, assigned, &ip) {
+                                    if packet_policy.is_some_and(|policy| policy.admits(&ip))
+                                        && learn_client_route(
+                                            &mut client_routes,
+                                            client_id,
+                                            assigned,
+                                            &ip,
+                                        )
+                                    {
                                         to_tun.push(ip);
                                     }
                                     break;
@@ -229,7 +295,9 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
                             continue;
                         }
                         // Plain MASQUE node: the datagram is a raw IP packet.
-                        if learn_client_route(&mut client_routes, client_id, assigned, payload) {
+                        if packet_policy.is_some_and(|policy| policy.admits(payload))
+                            && learn_client_route(&mut client_routes, client_id, assigned, payload)
+                        {
                             to_tun.push(payload.to_vec());
                         }
                     }
@@ -275,6 +343,7 @@ pub async fn run(cfg: &NodeConfig, cert: &DevCert, tun: Arc<AsyncDevice>) -> any
 /// Process one inbound UDP datagram. Returns `Some(reply)` when the node must answer with a
 /// stateless packet (QUIC version negotiation or a Retry for source-address validation) and keep
 /// NO connection state; `None` when the packet was fed to an existing/new connection (or dropped).
+#[allow(clippy::too_many_arguments)]
 fn handle_packet(
     clients: &mut HashMap<Vec<u8>, Client>,
     pkt: &mut [u8],
@@ -283,12 +352,18 @@ fn handle_packet(
     config: &mut quiche::Config,
     pqwg_enabled: bool,
     retry_key: &crate::retry::RetryKey,
+    max_connections: usize,
+    max_connections_per_ip: usize,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let hdr = quiche::Header::from_slice(pkt, quiche::MAX_CONN_ID_LEN)?;
     let key = hdr.dcid.to_vec();
 
     let info = quiche::RecvInfo { from, to: local };
     if let Some(client) = clients.get_mut(&key) {
+        if client.peer_ip != from.ip() {
+            tracing::debug!("dropping QUIC packet whose source IP differs from validated peer");
+            return Ok(None);
+        }
         let _ = client.conn.recv(pkt, info);
         return Ok(None);
     }
@@ -317,7 +392,14 @@ fn handle_packet(
         let new_scid = quiche::ConnectionId::from_ref(&new_scid);
         let new_token = retry_key.mint(&from, &hdr.dcid);
         let mut out = vec![0u8; MAX_UDP_PAYLOAD];
-        let len = quiche::retry(&hdr.scid, &hdr.dcid, &new_scid, &new_token, hdr.version, &mut out)?;
+        let len = quiche::retry(
+            &hdr.scid,
+            &hdr.dcid,
+            &new_scid,
+            &new_token,
+            hdr.version,
+            &mut out,
+        )?;
         out.truncate(len);
         // No source address logged (PD-3): the data plane retains no source IP.
         tracing::debug!("QUIC Retry issued (source-address validation)");
@@ -343,16 +425,32 @@ fn handle_packet(
     // token) is the original pre-Retry DCID, which quiche needs to complete the handshake transcript.
     let scid_cid = quiche::ConnectionId::from_ref(&hdr.dcid);
     let odcid_cid = quiche::ConnectionId::from_ref(&odcid);
+    let same_source = clients
+        .values()
+        .filter(|client| client.peer_ip == from.ip())
+        .take(max_connections_per_ip)
+        .count();
+    if !connection_capacity_available(
+        clients.len(),
+        same_source,
+        max_connections,
+        max_connections_per_ip,
+    ) {
+        tracing::debug!("dropping new QUIC connection at capacity");
+        return Ok(None);
+    }
     let conn = quiche::accept(&scid_cid, Some(&odcid_cid), local, from, config)?;
-    // No source address logged: nil-node is the data plane (SOUL §3 / PD-3 — no source-IP retention).
-    tracing::info!("new QUIC connection accepted (source-validated)");
+    // Deliberately emit no per-connection success event: even without source addresses, timestamped
+    // accepts would turn the default node log into a session-volume timeline (PD-2/PD-3).
 
     let mut client = Client {
         conn,
+        peer_ip: from.ip(),
         h3: None,
         ci_stream: None,
         flow_id: 0,
         tunnel_up: false,
+        packet_policy: None,
         assigned_ip: None,
         pqwg: if pqwg_enabled {
             Some(ClientPqWg::default())
@@ -367,6 +465,17 @@ fn handle_packet(
     Ok(None)
 }
 
+/// Admit only within both process-wide and Retry-validated source-address ceilings. Kept pure so
+/// boundary behavior is regression-tested without constructing heavyweight QUIC connections.
+fn connection_capacity_available(
+    total: usize,
+    same_source: usize,
+    max_total: usize,
+    max_per_source: usize,
+) -> bool {
+    total < max_total && same_source < max_per_source
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive_h3(
     client: &mut Client,
@@ -377,6 +486,7 @@ fn drive_h3(
     node_secret: Option<&StaticSecret>,
     pool: &mut crate::pool::AddressPool,
     routes: &mut HashMap<IpAddr, Vec<u8>>,
+    grant_replays: &mut GrantReplayCache,
 ) {
     if client.h3.is_none() && client.conn.is_established() {
         match quiche::h3::Connection::with_transport(&mut client.conn, h3_config) {
@@ -394,15 +504,32 @@ fn drive_h3(
             Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
                 let method = header_value(&list, b":method");
                 let protocol = header_value(&list, b":protocol");
-                if method.as_deref() == Some(&b"CONNECT"[..])
-                    && protocol.as_deref() == Some(&b"connect-ip"[..])
-                {
-                    if let Err(reason) = authorize_connect(&list, cfg) {
-                        tracing::warn!(reason, "CONNECT-IP refused before tunnel setup");
-                        let resp = [quiche::h3::Header::new(b":status", b"403")];
+                if method == Some(&b"CONNECT"[..]) && protocol == Some(&b"connect-ip"[..]) {
+                    // One source-validated QUIC connection carries at most one CONNECT-IP tunnel.
+                    // A second stream must not replace the signed route policy or reinterpret two
+                    // one-use grants as multiplexed authorization on one transport connection.
+                    if client.ci_stream.is_some() {
+                        let resp = [quiche::h3::Header::new(b":status", b"409")];
                         let _ = h3.send_response(&mut client.conn, stream_id, &resp, true);
                         continue;
                     }
+                    let packet_policy = match authorize_connect(
+                        &list,
+                        cfg,
+                        node_spki,
+                        client.peer_ip,
+                        grant_replays,
+                    ) {
+                        Ok(policy) => policy,
+                        Err(reason) => {
+                            // No peer/path fields and no default-level per-session event: a normal
+                            // node log must not reconstruct a connection timeline.
+                            tracing::debug!(reason, "CONNECT-IP authorization refused");
+                            let resp = [quiche::h3::Header::new(b":status", b"403")];
+                            let _ = h3.send_response(&mut client.conn, stream_id, &resp, true);
+                            continue;
+                        }
+                    };
                     // ADDRESS_ASSIGN (RFC 9484 subset): allocate a UNIQUE inner IPv4 for this
                     // client from the pool. Idempotent per connection. If the pool is exhausted the
                     // response omits the header — the client then keeps its configured address
@@ -410,11 +537,14 @@ fn drive_h3(
                     // never hand two clients the same live address.
                     let assigned = pool.assign(client_id);
                     if assigned.is_none() {
-                        tracing::warn!("address pool exhausted; client keeps its configured address");
+                        tracing::warn!(
+                            "address pool exhausted; client keeps its configured address"
+                        );
                     }
                     // Build the 200 response (capsule-protocol + optional ADDRESS_ASSIGN + optional
                     // RA-TLS report bound to our TLS key + the client's nonce). Pure + unit-tested.
-                    let resp = build_connect_ok_response(&list, assigned, node_spki, cfg.attest.as_ref());
+                    let resp =
+                        build_connect_ok_response(&list, assigned, node_spki, cfg.attest.as_ref());
                     if h3
                         .send_response(&mut client.conn, stream_id, &resp, false)
                         .is_ok()
@@ -422,6 +552,7 @@ fn drive_h3(
                         client.ci_stream = Some(stream_id);
                         client.flow_id = stream_id / 4;
                         client.tunnel_up = true;
+                        client.packet_policy = Some(packet_policy);
                         // Record + pre-register the assigned address so replies route to this
                         // client even before its first outbound packet, and so the route is bound
                         // to this connection authoritatively (not just learned-on-first-packet).
@@ -429,7 +560,6 @@ fn drive_h3(
                             client.assigned_ip = Some(ip);
                             routes.insert(IpAddr::V4(ip), client_id.to_vec());
                         }
-                        tracing::info!(stream_id, flow_id = stream_id / 4, "CONNECT-IP tunnel up");
                     } else if let Some(ip) = assigned {
                         // The 200 didn't go out — don't keep the address reserved for a tunnel that
                         // never came up.
@@ -456,6 +586,7 @@ fn drive_h3(
             Ok((sid, quiche::h3::Event::Finished)) | Ok((sid, quiche::h3::Event::Reset(_))) => {
                 if Some(sid) == client.ci_stream {
                     client.tunnel_up = false;
+                    client.packet_policy = None;
                 }
             }
             Ok(_) => {}
@@ -547,7 +678,10 @@ async fn send_batch(socket: &UdpSocket, batch: &[u8], seg: usize, dest: SocketAd
         let _ = socket.send_to(batch, dest).await;
         return;
     }
-    if crate::gso::send_segmented(socket, batch, seg, dest).await.is_ok() {
+    if crate::gso::send_segmented(socket, batch, seg, dest)
+        .await
+        .is_ok()
+    {
         return;
     }
     let mut off = 0;
@@ -560,7 +694,7 @@ async fn send_batch(socket: &UdpSocket, batch: &[u8], seg: usize, dest: SocketAd
     }
 }
 
-fn build_server_config(cert: &DevCert) -> anyhow::Result<quiche::Config> {
+fn build_server_config(cert: &NodeCert) -> anyhow::Result<quiche::Config> {
     let cert_path = cert
         .cert_path
         .to_str()
@@ -576,21 +710,43 @@ fn build_server_config(cert: &DevCert) -> anyhow::Result<quiche::Config> {
     config.set_max_idle_timeout(30_000);
     config.set_max_recv_udp_payload_size(MAX_UDP_PAYLOAD);
     config.set_max_send_udp_payload_size(MAX_UDP_PAYLOAD);
-    config.set_initial_max_data(10_000_000);
-    config.set_initial_max_stream_data_bidi_local(1_000_000);
-    config.set_initial_max_stream_data_bidi_remote(1_000_000);
-    config.set_initial_max_stream_data_uni(1_000_000);
-    config.set_initial_max_streams_bidi(100);
-    config.set_initial_max_streams_uni(100);
+    // This endpoint accepts one small CONNECT request and a bounded PQ control exchange. QUIC
+    // DATAGRAM traffic is not charged to stream flow-control, so multi-megabyte windows and one
+    // hundred public streams only enlarged unauthenticated memory exposure.
+    config.set_initial_max_data(512 * 1024);
+    config.set_initial_max_stream_data_bidi_local(64 * 1024);
+    config.set_initial_max_stream_data_bidi_remote(64 * 1024);
+    config.set_initial_max_stream_data_uni(64 * 1024);
+    config.set_initial_max_streams_bidi(4);
+    config.set_initial_max_streams_uni(8);
+    config.set_disable_active_migration(true);
     config.enable_dgram(true, 65536, 65536);
     Ok(config)
 }
 
-fn header_value(list: &[quiche::h3::Header], name: &[u8]) -> Option<Vec<u8>> {
+fn header_value<'a>(list: &'a [quiche::h3::Header], name: &[u8]) -> Option<&'a [u8]> {
     use quiche::h3::NameValue;
-    list.iter()
-        .find(|h| h.name() == name)
-        .map(|h| h.value().to_vec())
+    list.iter().find(|h| h.name() == name).map(|h| h.value())
+}
+
+/// Borrow one security-sensitive header and reject ambiguous duplicate encodings.
+fn unique_header_value<'a>(
+    list: &'a [quiche::h3::Header],
+    name: &[u8],
+) -> Result<Option<&'a [u8]>, &'static str> {
+    use quiche::h3::NameValue;
+    let mut matches = list.iter().filter(|header| header.name() == name);
+    let value = matches.next().map(|header| header.value());
+    if matches.next().is_some() {
+        return Err("duplicate authorization header");
+    }
+    Ok(value)
+}
+
+fn is_lower_hex(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
 }
 
 /// Build the `200` CONNECT-IP response header set: `:status 200` + `capsule-protocol: ?1`, plus
@@ -617,9 +773,15 @@ fn build_connect_ok_response(
     // RA-TLS: bind a report to our TLS key + the client's nonce so the client can appraise us
     // before sending traffic (spec §5). Absent/malformed nonce, or no report provider → no header,
     // and the client (which pins a measurement) then fails closed.
-    if let Some(nonce_hex) = header_value(request_headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
+    if let Some(nonce_hex) =
+        unique_header_value(request_headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
+            .ok()
+            .flatten()
     {
-        if let Some(nb) = connectip::from_hex(&nonce_hex) {
+        if nonce_hex.len() == 64 && is_lower_hex(nonce_hex) {
+            let Some(nb) = connectip::from_hex(nonce_hex) else {
+                return resp;
+            };
             if let Ok(nonce) = <[u8; 32]>::try_from(nb.as_slice()) {
                 if let Some(report) = crate::attest::report_hex(node_spki, attest, &nonce) {
                     resp.push(quiche::h3::Header::new(
@@ -633,45 +795,135 @@ fn build_connect_ok_response(
     resp
 }
 
-fn authorize_connect(headers: &[quiche::h3::Header], cfg: &NodeConfig) -> Result<(), &'static str> {
-    let nonce_hex = header_value(headers, connectip::ATTEST_NONCE_HEADER.as_bytes())
+fn authorize_connect(
+    headers: &[quiche::h3::Header],
+    cfg: &NodeConfig,
+    node_spki: &[u8],
+    peer_ip: IpAddr,
+    grant_replays: &mut GrantReplayCache,
+) -> Result<PacketPolicy, &'static str> {
+    let nonce_hex = unique_header_value(headers, connectip::ATTEST_NONCE_HEADER.as_bytes())?
         .ok_or("missing attestation nonce")?;
-    let nonce_bytes = connectip::from_hex(&nonce_hex).ok_or("malformed attestation nonce")?;
+    if nonce_hex.len() != 64 || !is_lower_hex(nonce_hex) {
+        return Err("malformed attestation nonce");
+    }
+    let nonce_bytes = connectip::from_hex(nonce_hex).ok_or("malformed attestation nonce")?;
     let nonce =
         <[u8; 32]>::try_from(nonce_bytes.as_slice()).map_err(|_| "malformed attestation nonce")?;
 
-    let Some(key) = cfg.grant_key.as_ref() else {
-        if cfg.allow_ungranted {
-            tracing::warn!("accepting grantless CONNECT-IP because NW_ALLOW_UNGRANTED=1");
-            return Ok(());
+    let Some(verifier) = cfg.grant_verifier.as_ref() else {
+        #[cfg(debug_assertions)]
+        {
+            if cfg.allow_ungranted {
+                if cfg.role != crate::config::NodeRole::Exit {
+                    return Err("ungranted intermediate has no exact next-hop policy");
+                }
+                tracing::warn!("accepting grantless CONNECT-IP in development mode");
+                return Ok(PacketPolicy::Exit);
+            }
         }
+        #[cfg(not(debug_assertions))]
+        let _ = cfg.allow_ungranted;
         return Err("grant verifier not configured");
     };
     let attest = cfg
         .attest
         .as_ref()
         .ok_or("attested node identity not configured")?;
-    let binding = nil_core::grant::binding_for(attest.tee, &attest.measurement);
-    let grant_hex = header_value(headers, connectip::TUNNEL_GRANT_HEADER.as_bytes())
+    let realm = cfg
+        .grant_realm
+        .as_deref()
+        .ok_or("grant realm not configured")?;
+    let node_id = cfg.node_id.as_deref().ok_or("node id not configured")?;
+    // Derive the audience from the actual live certificate, never from environment/config. A
+    // cloned VM can self-assert the same node_id and measurement, but its TLS key hashes
+    // differently and therefore cannot satisfy the victim node's Coordinator-signed NWG2 grant.
+    let tls_spki_sha256: [u8; 32] = Sha256::digest(node_spki).into();
+    let node_identity = nil_core::grant::GrantNodeIdentity::new(
+        realm,
+        node_id,
+        cfg.role.grant_role(),
+        nil_core::grant::GrantTransport::Masque,
+        attest.tee,
+        attest.measurement,
+        tls_spki_sha256,
+    )
+    .map_err(|_| "invalid node grant identity")?;
+    let grant_hex = unique_header_value(headers, connectip::TUNNEL_GRANT_HEADER.as_bytes())?
         .ok_or("missing tunnel grant")?;
-    let grant = connectip::from_hex(&grant_hex).ok_or("malformed tunnel grant")?;
+    if grant_hex.is_empty()
+        || grant_hex.len() > nil_core::grant::MAX_GRANT_TOKEN_LEN * 2
+        || grant_hex.len() % 2 != 0
+        || !is_lower_hex(grant_hex)
+    {
+        return Err("malformed tunnel grant");
+    }
+    let grant = connectip::from_hex(grant_hex).ok_or("malformed tunnel grant")?;
     // Fail CLOSED on a broken clock: `now_unix_secs_for_expiry` returns u64::MAX on a clock error,
     // so an expired grant is rejected rather than accepted (a plain `now = 0` would make `exp < now`
     // always false → every expired grant accepted, defeating the TTL).
-    let verified = nil_core::grant::verify(
-        &grant,
-        key,
-        &binding,
-        nil_core::grant::now_unix_secs_for_expiry(),
-    )
-    .map_err(|_| "invalid tunnel grant")?;
-    // Constant-time, for uniformity with the rest of the auth path (the grant HMAC and the
-    // attestation report_data/measurement are already compared constant-time). The nonce isn't a
-    // secret a holder can't already see, so this is hygiene/consistency rather than a live oracle.
+    let now = nil_core::grant::now_unix_secs_for_expiry();
+    let verified = verifier
+        .verify_for_node(&grant, &node_identity, now)
+        .map_err(|_| "invalid tunnel grant")?;
+    if verified
+        .audience
+        .previous_hop()
+        .is_some_and(|expected| peer_ip != IpAddr::V4(expected))
+    {
+        return Err("tunnel grant predecessor mismatch");
+    }
+    // Constant-time for consistency with the attestation report_data/measurement comparisons. The
+    // nonce isn't a secret a holder cannot already see, so this is hygiene rather than a live
+    // oracle. Binding it here prevents replaying a valid grant onto a different QUIC connection.
     if !bool::from(verified.nonce.ct_eq(&nonce)) {
         return Err("tunnel grant nonce mismatch");
     }
-    Ok(())
+    grant_replays
+        .consume(&verified, now)
+        .map_err(|error| match error {
+            ReplayError::Replayed => "tunnel grant already used",
+            ReplayError::PredatesProcess => "tunnel grant predates node process",
+            ReplayError::Capacity => "tunnel grant replay cache full",
+            ReplayError::Expired => "invalid tunnel grant",
+        })?;
+    match verified.audience.next_hop() {
+        Some(endpoint) => Ok(PacketPolicy::Relay(endpoint)),
+        None => Ok(PacketPolicy::Exit),
+    }
+}
+
+/// Parse only the IPv4/UDP fields required by the relay boundary, with strict length and fragment
+/// checks. No allocation and no address resolution occurs on this attacker-controlled path.
+fn relay_packet_targets(packet: &[u8], endpoint: SocketAddrV4) -> bool {
+    if packet.len() < 28 || packet[0] >> 4 != 4 {
+        return false;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20
+        || ihl
+            .checked_add(8)
+            .map_or(true, |minimum| minimum > packet.len())
+    {
+        return false;
+    }
+    let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+    if total_len != packet.len() || total_len < ihl + 8 {
+        return false;
+    }
+    // Reject reserved flag, MF, and every nonzero fragment offset. DF (0x4000) is permitted.
+    let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
+    if flags_and_offset & 0xbfff != 0 || packet[9] != 17 {
+        return false;
+    }
+    if packet[16..20] != endpoint.ip().octets() {
+        return false;
+    }
+    let udp_len = usize::from(u16::from_be_bytes([packet[ihl + 4], packet[ihl + 5]]));
+    if udp_len < 8 || ihl.checked_add(udp_len) != Some(total_len) {
+        return false;
+    }
+    u16::from_be_bytes([packet[ihl + 2], packet[ihl + 3]]) == endpoint.port()
 }
 
 /// Route a client's inner IP packet to the TUN, learning its inner source address on first sight.
@@ -694,7 +946,7 @@ fn learn_client_route(
     };
     match routes.get(&src) {
         Some(owner) if owner.as_slice() != client_id => {
-            tracing::warn!("dropping packet from duplicate tunnel source address");
+            tracing::debug!("dropping packet from duplicate tunnel source address");
             false
         }
         Some(_) => true,
@@ -712,8 +964,10 @@ fn learn_client_route(
             }
             // Fallback (no assigned address): bound how many distinct sources this client can learn.
             None => {
-                let learned =
-                    routes.values().filter(|id| id.as_slice() == client_id).count();
+                let learned = routes
+                    .values()
+                    .filter(|id| id.as_slice() == client_id)
+                    .count();
                 if learned >= MAX_LEARNED_ROUTES_PER_CLIENT {
                     tracing::debug!("dropping client packet: per-client learned-route cap reached");
                     return false;
@@ -723,6 +977,10 @@ fn learn_client_route(
             }
         },
     }
+}
+
+fn accepts_client_datagrams(tunnel_up: bool, flow_id: u64, authorized_flow_id: u64) -> bool {
+    tunnel_up && flow_id == authorized_flow_id
 }
 
 fn packet_src_ip(packet: &[u8]) -> Option<IpAddr> {
@@ -758,8 +1016,26 @@ fn packet_ip(packet: &[u8], source: bool) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nil_core::grant::{
+        GrantAudience, GrantRole, GrantSigningKey, GrantTransport, GrantVerifier,
+    };
+    use nil_core::Tee;
     use quiche::h3::{Header, NameValue};
     use std::net::Ipv4Addr;
+    use std::time::Duration;
+
+    const TEST_REALM: &str = "prod-us-east";
+    const TEST_NODE_ID: &str = "exit-1";
+    const TEST_MEASUREMENT: [u8; 48] = [0xabu8; 48];
+    const TEST_NODE_SPKI: &[u8] = b"test-node-stable-tls-subject-public-key-info";
+
+    fn test_next_hop() -> SocketAddrV4 {
+        "192.0.2.80:443".parse().unwrap()
+    }
+
+    fn test_previous_hop() -> Ipv4Addr {
+        Ipv4Addr::new(198, 51, 100, 20)
+    }
 
     /// Find a response header value by (lowercase) name.
     fn find<'a>(resp: &'a [Header], name: &[u8]) -> Option<&'a [u8]> {
@@ -778,11 +1054,116 @@ mod tests {
         ]
     }
 
+    fn audience(
+        realm: &str,
+        node_id: &str,
+        role: GrantRole,
+        transport: GrantTransport,
+        tee: Tee,
+        measurement: [u8; 48],
+    ) -> GrantAudience {
+        GrantAudience::new(
+            realm,
+            node_id,
+            role,
+            transport,
+            tee,
+            measurement,
+            Sha256::digest(TEST_NODE_SPKI).into(),
+            match role {
+                GrantRole::Entry => None,
+                GrantRole::Middle | GrantRole::Exit => Some(test_previous_hop()),
+            },
+            match role {
+                GrantRole::Entry | GrantRole::Middle => Some(test_next_hop()),
+                GrantRole::Exit => None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn request_with_grant(
+        signing_key: &GrantSigningKey,
+        grant_audience: &GrantAudience,
+        nonce: [u8; 32],
+    ) -> Vec<Header> {
+        let grant = nil_core::grant::mint(
+            signing_key,
+            grant_audience,
+            nonce,
+            Duration::from_secs(120),
+            nil_core::grant::now_unix_secs(),
+        )
+        .unwrap();
+        let mut headers = request_with_nonce(&nonce);
+        headers.push(Header::new(
+            connectip::TUNNEL_GRANT_HEADER.as_bytes(),
+            connectip::to_hex(&grant.token).as_bytes(),
+        ));
+        headers
+    }
+
+    fn configured_cfg(verifier: GrantVerifier) -> NodeConfig {
+        let mut cfg = test_cfg(false);
+        cfg.attest = Some(crate::attest::NodeAttest {
+            tee: Tee::SevSnp,
+            measurement: TEST_MEASUREMENT,
+        });
+        cfg.role = crate::config::NodeRole::Exit;
+        cfg.grant_verifier = Some(verifier);
+        cfg.grant_realm = Some(TEST_REALM.into());
+        cfg.node_id = Some(TEST_NODE_ID.into());
+        cfg
+    }
+
+    fn authorize(headers: &[Header], cfg: &NodeConfig) -> Result<PacketPolicy, &'static str> {
+        let started = nil_core::grant::now_unix_secs_for_expiry().saturating_sub(1);
+        let mut replays = GrantReplayCache::new(started, 128);
+        authorize_connect(
+            headers,
+            cfg,
+            TEST_NODE_SPKI,
+            IpAddr::V4(test_previous_hop()),
+            &mut replays,
+        )
+    }
+
+    fn expected_audience() -> GrantAudience {
+        audience(
+            TEST_REALM,
+            TEST_NODE_ID,
+            GrantRole::Exit,
+            GrantTransport::Masque,
+            Tee::SevSnp,
+            TEST_MEASUREMENT,
+        )
+    }
+
+    fn ipv4_udp_packet(destination: Ipv4Addr, port: u16, flags_and_offset: u16) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        let total_len = packet.len() as u16;
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+        packet[6..8].copy_from_slice(&flags_and_offset.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 74, 0, 2]);
+        packet[16..20].copy_from_slice(&destination.octets());
+        packet[20..22].copy_from_slice(&49152u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&port.to_be_bytes());
+        packet[24..26].copy_from_slice(&8u16.to_be_bytes());
+        packet
+    }
+
     #[test]
     fn ok_response_is_200_with_capsule_protocol() {
         // No assignment, no attest config → just the status + capsule-protocol line.
         let resp = build_connect_ok_response(&request_with_nonce(&[0u8; 32]), None, b"spki", None);
-        assert_eq!(find(&resp, b":status"), Some(&b"200"[..]), "CONNECT-IP accepted with 200");
+        assert_eq!(
+            find(&resp, b":status"),
+            Some(&b"200"[..]),
+            "CONNECT-IP accepted with 200"
+        );
         assert_eq!(
             find(&resp, b"capsule-protocol"),
             Some(&b"?1"[..]),
@@ -841,7 +1222,12 @@ mod tests {
         // dropped and never inserted — the table cannot grow past that one route.
         let assigned = Ipv4Addr::new(10, 74, 0, 9);
         let mut routes: HashMap<IpAddr, Vec<u8>> = HashMap::new();
-        assert!(learn_client_route(&mut routes, cid, Some(assigned), &v4([10, 74, 0, 9])));
+        assert!(learn_client_route(
+            &mut routes,
+            cid,
+            Some(assigned),
+            &v4([10, 74, 0, 9])
+        ));
         for i in 0..1000u16 {
             let src = [100, 0, (i >> 8) as u8, (i & 0xff) as u8];
             assert!(
@@ -851,8 +1237,15 @@ mod tests {
         }
         let mut v6src = [0u8; 16];
         v6src[0] = 0xfd;
-        assert!(!learn_client_route(&mut routes, cid, Some(assigned), &v6(v6src)), "spoofed v6 dropped");
-        assert_eq!(routes.len(), 1, "an assigned client is bound to exactly one route");
+        assert!(
+            !learn_client_route(&mut routes, cid, Some(assigned), &v6(v6src)),
+            "spoofed v6 dropped"
+        );
+        assert_eq!(
+            routes.len(),
+            1,
+            "an assigned client is bound to exactly one route"
+        );
 
         // Fallback (no assigned address): distinct learned sources are capped, so a single tunnel
         // streaming distinct inner sources cannot OOM the node.
@@ -864,8 +1257,37 @@ mod tests {
                 learned += 1;
             }
         }
-        assert_eq!(learned, MAX_LEARNED_ROUTES_PER_CLIENT, "fallback learning is capped");
-        assert_eq!(routes.len(), MAX_LEARNED_ROUTES_PER_CLIENT, "route table stays bounded");
+        assert_eq!(
+            learned, MAX_LEARNED_ROUTES_PER_CLIENT,
+            "fallback learning is capped"
+        );
+        assert_eq!(
+            routes.len(),
+            MAX_LEARNED_ROUTES_PER_CLIENT,
+            "route table stays bounded"
+        );
+    }
+
+    #[test]
+    fn datagrams_require_an_authorized_matching_flow() {
+        assert!(!accepts_client_datagrams(false, 7, 7));
+        assert!(!accepts_client_datagrams(true, 6, 7));
+        assert!(accepts_client_datagrams(true, 7, 7));
+    }
+
+    #[test]
+    fn connection_admission_enforces_global_and_per_source_caps() {
+        assert!(connection_capacity_available(0, 0, 1024, 32));
+        assert!(connection_capacity_available(31, 31, 1024, 32));
+        assert!(
+            !connection_capacity_available(32, 32, 1024, 32),
+            "one validated source cannot consume the whole global pool"
+        );
+        assert!(
+            connection_capacity_available(32, 1, 1024, 32),
+            "another source retains an independent admission budget"
+        );
+        assert!(!connection_capacity_available(1024, 0, 1024, 32));
     }
 
     /// Coverage for the QUIC source-address-validation (Retry) path of `handle_packet`, which had
@@ -881,7 +1303,7 @@ mod tests {
     /// `dataplane-e2e.yml`), which went red→green on the fix. Kept here for the Retry-path coverage.
     #[test]
     fn retry_handshake_establishes_through_source_validation() {
-        let cert = DevCert::generate(vec!["localhost".into()]).expect("dev cert");
+        let cert = NodeCert::generate(vec!["localhost".into()]).expect("dev cert");
         let mut server_config = build_server_config(&cert).expect("server config");
         let retry_key = crate::retry::RetryKey::generate().expect("retry key");
 
@@ -911,9 +1333,14 @@ mod tests {
         client_config.set_max_stream_window(16 * 1024 * 1024);
 
         let cscid = quiche::ConnectionId::from_ref(&[0x42u8; quiche::MAX_CONN_ID_LEN]);
-        let mut client =
-            quiche::connect(Some("localhost"), &cscid, client_addr, server_addr, &mut client_config)
-                .expect("client connect");
+        let mut client = quiche::connect(
+            Some("localhost"),
+            &cscid,
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("client connect");
 
         let mut clients: HashMap<Vec<u8>, Client> = HashMap::new();
         let mut out = [0u8; 2048];
@@ -927,14 +1354,29 @@ mod tests {
                 match client.send(&mut out) {
                     Ok((len, _)) => {
                         let mut pkt = out[..len].to_vec();
-                        if let Some(resp) =
-                            handle_packet(&mut clients, &mut pkt, client_addr, server_addr, &mut server_config, false, &retry_key)
-                                .expect("handle_packet")
+                        if let Some(resp) = handle_packet(
+                            &mut clients,
+                            &mut pkt,
+                            client_addr,
+                            server_addr,
+                            &mut server_config,
+                            false,
+                            &retry_key,
+                            1024,
+                            32,
+                        )
+                        .expect("handle_packet")
                         {
                             // A stateless reply (Retry / version negotiation) — feed it back.
                             saw_retry = true;
                             let mut rb = resp;
-                            let _ = client.recv(&mut rb, quiche::RecvInfo { from: server_addr, to: client_addr });
+                            let _ = client.recv(
+                                &mut rb,
+                                quiche::RecvInfo {
+                                    from: server_addr,
+                                    to: client_addr,
+                                },
+                            );
                         }
                     }
                     Err(quiche::Error::Done) => break,
@@ -946,7 +1388,13 @@ mod tests {
                 loop {
                     match c.conn.send(&mut out) {
                         Ok((len, _)) => {
-                            let _ = client.recv(&mut out[..len], quiche::RecvInfo { from: server_addr, to: client_addr });
+                            let _ = client.recv(
+                                &mut out[..len],
+                                quiche::RecvInfo {
+                                    from: server_addr,
+                                    to: client_addr,
+                                },
+                            );
                         }
                         Err(quiche::Error::Done) => break,
                         Err(e) => panic!("server send: {e}"),
@@ -958,7 +1406,10 @@ mod tests {
             }
         }
 
-        assert!(saw_retry, "the node must challenge the first Initial with a Retry");
+        assert!(
+            saw_retry,
+            "the node must challenge the first Initial with a Retry"
+        );
         assert!(
             client.is_established(),
             "client must complete the handshake through Retry — retry_source_connection_id must \
@@ -988,8 +1439,7 @@ mod tests {
             build_connect_ok_response(&request_with_nonce(&nonce), None, spki, Some(&attest));
         let report_hex = find(&resp, connectip::ATTEST_REPORT_HEADER.as_bytes())
             .expect("synthetic node returns an attestation report");
-        let evidence =
-            connectip::from_hex(report_hex).expect("report header is lowercase hex");
+        let evidence = connectip::from_hex(report_hex).expect("report header is lowercase hex");
 
         let policy = AppraisalPolicy::new(Tee::SevSnp, Measurement(measurement.to_vec()));
         // Accept: correct spki + correct nonce → appraisal succeeds.
@@ -1003,11 +1453,411 @@ mod tests {
             "the report must NOT appraise under a different connection nonce (freshness)"
         );
         // Reject: a different pinned measurement is refused.
-        let wrong_policy =
-            AppraisalPolicy::new(Tee::SevSnp, Measurement(vec![0x00u8; 48]));
+        let wrong_policy = AppraisalPolicy::new(Tee::SevSnp, Measurement(vec![0x00u8; 48]));
         assert!(
             appraise(&evidence, spki, &wrong_policy, &nonce).is_err(),
             "the report must NOT appraise against a different pinned measurement"
+        );
+    }
+
+    #[test]
+    fn authorize_accepts_nwg2_for_exact_node_audience_and_connection_nonce() {
+        let signer = GrantSigningKey::from_seed([0x11; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        let headers = request_with_grant(&signer, &expected_audience(), [0x42; 32]);
+        assert_eq!(authorize(&headers, &cfg), Ok(PacketPolicy::Exit));
+        let mut clone_replays = GrantReplayCache::new(
+            nil_core::grant::now_unix_secs_for_expiry().saturating_sub(1),
+            128,
+        );
+        assert_eq!(
+            authorize_connect(
+                &headers,
+                &cfg,
+                b"clone-cert-key-with-the-same-node-id-and-measurement",
+                IpAddr::V4(test_previous_hop()),
+                &mut clone_replays,
+            ),
+            Err("invalid tunnel grant"),
+            "a victim-node grant must not authorize a clone presenting another TLS key"
+        );
+    }
+
+    #[test]
+    fn intermediate_authorization_retains_the_signed_next_hop() {
+        let signer = GrantSigningKey::from_seed([0x12; 32]);
+        let mut cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        cfg.role = crate::config::NodeRole::Middle;
+        let relay_audience = audience(
+            TEST_REALM,
+            TEST_NODE_ID,
+            GrantRole::Middle,
+            GrantTransport::Masque,
+            Tee::SevSnp,
+            TEST_MEASUREMENT,
+        );
+        let headers = request_with_grant(&signer, &relay_audience, [0x43; 32]);
+        assert_eq!(
+            authorize(&headers, &cfg),
+            Ok(PacketPolicy::Relay(test_next_hop()))
+        );
+    }
+
+    #[test]
+    fn later_hop_grants_require_the_retry_validated_predecessor_ip() {
+        let signer = GrantSigningKey::from_seed([0x13; 32]);
+        let verifier = GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap();
+
+        for (role, expected_policy, nonce) in [
+            (
+                GrantRole::Middle,
+                PacketPolicy::Relay(test_next_hop()),
+                [0x51; 32],
+            ),
+            (GrantRole::Exit, PacketPolicy::Exit, [0x52; 32]),
+        ] {
+            let mut cfg = configured_cfg(verifier.clone());
+            cfg.role = match role {
+                GrantRole::Middle => crate::config::NodeRole::Middle,
+                GrantRole::Exit => crate::config::NodeRole::Exit,
+                GrantRole::Entry => unreachable!(),
+            };
+            let grant_audience = audience(
+                TEST_REALM,
+                TEST_NODE_ID,
+                role,
+                GrantTransport::Masque,
+                Tee::SevSnp,
+                TEST_MEASUREMENT,
+            );
+            let headers = request_with_grant(&signer, &grant_audience, nonce);
+            let started = nil_core::grant::now_unix_secs_for_expiry().saturating_sub(1);
+            let mut replays = GrantReplayCache::new(started, 128);
+
+            assert_eq!(
+                authorize_connect(
+                    &headers,
+                    &cfg,
+                    TEST_NODE_SPKI,
+                    IpAddr::V4(Ipv4Addr::new(192, 0, 2, 200)),
+                    &mut replays,
+                ),
+                Err("tunnel grant predecessor mismatch"),
+                "a client dialing a later hop directly must be rejected"
+            );
+            assert_eq!(
+                authorize_connect(
+                    &headers,
+                    &cfg,
+                    TEST_NODE_SPKI,
+                    IpAddr::V6("2001:db8::1".parse().unwrap()),
+                    &mut replays,
+                ),
+                Err("tunnel grant predecessor mismatch")
+            );
+            assert_eq!(
+                authorize_connect(
+                    &headers,
+                    &cfg,
+                    TEST_NODE_SPKI,
+                    IpAddr::V4(test_previous_hop()),
+                    &mut replays,
+                ),
+                Ok(expected_policy),
+                "a predecessor mismatch must not consume the valid one-use grant"
+            );
+        }
+    }
+
+    #[test]
+    fn intermediate_packet_gate_allows_only_exact_unfragmented_ipv4_udp_socket() {
+        let endpoint = test_next_hop();
+        let policy = PacketPolicy::Relay(endpoint);
+        assert!(policy.admits(&ipv4_udp_packet(*endpoint.ip(), endpoint.port(), 0)));
+        assert!(policy.admits(&ipv4_udp_packet(*endpoint.ip(), endpoint.port(), 0x4000))); // DF is not fragmentation.
+
+        assert!(!policy.admits(&ipv4_udp_packet(*endpoint.ip(), 8443, 0)));
+        assert!(!policy.admits(&ipv4_udp_packet(Ipv4Addr::new(203, 0, 113, 90), 443, 0))); // arbitrary UDP/443 / direct-to-exit attempt
+        assert!(!policy.admits(&ipv4_udp_packet(Ipv4Addr::new(198, 51, 100, 19), 443, 0))); // reordered middle hop
+
+        for fragment_bits in [0x2000, 0x0001, 0x2001, 0x8000] {
+            assert!(
+                !policy.admits(&ipv4_udp_packet(
+                    *endpoint.ip(),
+                    endpoint.port(),
+                    fragment_bits
+                )),
+                "fragment/reserved bits {fragment_bits:#06x} must fail closed"
+            );
+        }
+
+        let mut tcp = ipv4_udp_packet(*endpoint.ip(), endpoint.port(), 0);
+        tcp[9] = 6;
+        assert!(!policy.admits(&tcp));
+
+        let mut ipv6 = vec![0u8; 48];
+        ipv6[0] = 0x60;
+        ipv6[4..6].copy_from_slice(&8u16.to_be_bytes());
+        ipv6[6] = 17;
+        ipv6[40..42].copy_from_slice(&49152u16.to_be_bytes());
+        ipv6[42..44].copy_from_slice(&endpoint.port().to_be_bytes());
+        ipv6[44..46].copy_from_slice(&8u16.to_be_bytes());
+        assert!(!policy.admits(&ipv6));
+
+        let mut trailing = ipv4_udp_packet(*endpoint.ip(), endpoint.port(), 0);
+        trailing.push(0);
+        assert!(!policy.admits(&trailing));
+        assert!(PacketPolicy::Exit.admits(&ipv6));
+    }
+
+    #[test]
+    fn authorize_rejects_every_nwg2_audience_dimension_mismatch() {
+        let signer = GrantSigningKey::from_seed([0x22; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        let cases = [
+            (
+                "realm",
+                audience(
+                    "prod-eu-west",
+                    TEST_NODE_ID,
+                    GrantRole::Exit,
+                    GrantTransport::Masque,
+                    Tee::SevSnp,
+                    TEST_MEASUREMENT,
+                ),
+            ),
+            (
+                "node id",
+                audience(
+                    TEST_REALM,
+                    "exit-2",
+                    GrantRole::Exit,
+                    GrantTransport::Masque,
+                    Tee::SevSnp,
+                    TEST_MEASUREMENT,
+                ),
+            ),
+            (
+                "role",
+                audience(
+                    TEST_REALM,
+                    TEST_NODE_ID,
+                    GrantRole::Middle,
+                    GrantTransport::Masque,
+                    Tee::SevSnp,
+                    TEST_MEASUREMENT,
+                ),
+            ),
+            (
+                "transport",
+                audience(
+                    TEST_REALM,
+                    TEST_NODE_ID,
+                    GrantRole::Exit,
+                    GrantTransport::AmneziaWg,
+                    Tee::SevSnp,
+                    TEST_MEASUREMENT,
+                ),
+            ),
+            (
+                "tee",
+                audience(
+                    TEST_REALM,
+                    TEST_NODE_ID,
+                    GrantRole::Exit,
+                    GrantTransport::Masque,
+                    Tee::Tdx,
+                    TEST_MEASUREMENT,
+                ),
+            ),
+            (
+                "measurement",
+                audience(
+                    TEST_REALM,
+                    TEST_NODE_ID,
+                    GrantRole::Exit,
+                    GrantTransport::Masque,
+                    Tee::SevSnp,
+                    [0xcdu8; 48],
+                ),
+            ),
+        ];
+
+        for (dimension, wrong_audience) in cases {
+            let headers = request_with_grant(&signer, &wrong_audience, [0x43; 32]);
+            assert_eq!(
+                authorize(&headers, &cfg),
+                Err("invalid tunnel grant"),
+                "grant with wrong {dimension} must be rejected"
+            );
+        }
+
+        let clone_audience = GrantAudience::new(
+            TEST_REALM,
+            TEST_NODE_ID,
+            GrantRole::Exit,
+            GrantTransport::Masque,
+            Tee::SevSnp,
+            TEST_MEASUREMENT,
+            [0x99; 32],
+            Some(test_previous_hop()),
+            None,
+        )
+        .unwrap();
+        let clone_headers = request_with_grant(&signer, &clone_audience, [0x44; 32]);
+        assert_eq!(
+            authorize(&clone_headers, &cfg),
+            Err("invalid tunnel grant"),
+            "a clone with the same self-asserted node ID and measurement but another TLS key must be rejected"
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_untrusted_signer_and_revoked_rotation_key() {
+        let active = GrantSigningKey::from_seed([0x33; 32]);
+        let staged = GrantSigningKey::from_seed([0x44; 32]);
+        let nonce = [0x45; 32];
+        let headers = request_with_grant(&active, &expected_audience(), nonce);
+
+        let rotating =
+            GrantVerifier::new([active.public_key_bytes(), staged.public_key_bytes()]).unwrap();
+        assert_eq!(
+            authorize(&headers, &configured_cfg(rotating)),
+            Ok(PacketPolicy::Exit)
+        );
+
+        let after_revocation = GrantVerifier::from_public_key(staged.public_key_bytes()).unwrap();
+        assert_eq!(
+            authorize(&headers, &configured_cfg(after_revocation)),
+            Err("invalid tunnel grant"),
+            "removing a key from the verifier set revokes grants signed by it"
+        );
+
+        let unknown = GrantSigningKey::from_seed([0x55; 32]);
+        let unknown_headers = request_with_grant(&unknown, &expected_audience(), nonce);
+        let trusted = GrantVerifier::from_public_key(active.public_key_bytes()).unwrap();
+        assert_eq!(
+            authorize(&unknown_headers, &configured_cfg(trusted)),
+            Err("invalid tunnel grant"),
+            "a valid signature from an untrusted signer is not authority"
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_grant_bound_to_a_different_connection_nonce() {
+        let signer = GrantSigningKey::from_seed([0x66; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        let grant_nonce = [0x10; 32];
+        let mut headers = request_with_grant(&signer, &expected_audience(), grant_nonce);
+        let nonce_header = headers
+            .iter_mut()
+            .find(|header| header.name() == connectip::ATTEST_NONCE_HEADER.as_bytes())
+            .expect("nonce header");
+        *nonce_header = Header::new(
+            connectip::ATTEST_NONCE_HEADER.as_bytes(),
+            connectip::to_hex(&[0x20; 32]).as_bytes(),
+        );
+        assert_eq!(
+            authorize(&headers, &cfg),
+            Err("tunnel grant nonce mismatch")
+        );
+    }
+
+    #[test]
+    fn authorize_consumes_a_valid_grant_once() {
+        let signer = GrantSigningKey::from_seed([0x67; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        let headers = request_with_grant(&signer, &expected_audience(), [0x12; 32]);
+        let mut replays = GrantReplayCache::new(
+            nil_core::grant::now_unix_secs_for_expiry().saturating_sub(1),
+            128,
+        );
+        assert_eq!(
+            authorize_connect(
+                &headers,
+                &cfg,
+                TEST_NODE_SPKI,
+                IpAddr::V4(test_previous_hop()),
+                &mut replays,
+            ),
+            Ok(PacketPolicy::Exit)
+        );
+        assert_eq!(
+            authorize_connect(
+                &headers,
+                &cfg,
+                TEST_NODE_SPKI,
+                IpAddr::V4(test_previous_hop()),
+                &mut replays,
+            ),
+            Err("tunnel grant already used")
+        );
+    }
+
+    #[test]
+    fn authorize_rejects_duplicate_security_headers() {
+        let signer = GrantSigningKey::from_seed([0x68; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+        let mut duplicate_nonce = request_with_grant(&signer, &expected_audience(), [0x13; 32]);
+        duplicate_nonce.push(Header::new(
+            connectip::ATTEST_NONCE_HEADER.as_bytes(),
+            connectip::to_hex(&[0x13; 32]).as_bytes(),
+        ));
+        assert_eq!(
+            authorize(&duplicate_nonce, &cfg),
+            Err("duplicate authorization header")
+        );
+
+        let mut duplicate_grant = request_with_grant(&signer, &expected_audience(), [0x14; 32]);
+        let copied = duplicate_grant
+            .iter()
+            .find(|header| header.name() == connectip::TUNNEL_GRANT_HEADER.as_bytes())
+            .expect("grant header")
+            .value()
+            .to_vec();
+        duplicate_grant.push(Header::new(
+            connectip::TUNNEL_GRANT_HEADER.as_bytes(),
+            &copied,
+        ));
+        assert_eq!(
+            authorize(&duplicate_grant, &cfg),
+            Err("duplicate authorization header")
+        );
+    }
+
+    #[test]
+    fn authorize_bounds_and_canonicalizes_header_hex_before_decode() {
+        let signer = GrantSigningKey::from_seed([0x69; 32]);
+        let cfg =
+            configured_cfg(GrantVerifier::from_public_key(signer.public_key_bytes()).unwrap());
+
+        let mut oversized = request_with_nonce(&[0x15; 32]);
+        oversized.push(Header::new(
+            connectip::TUNNEL_GRANT_HEADER.as_bytes(),
+            &vec![b'a'; nil_core::grant::MAX_GRANT_TOKEN_LEN * 2 + 2],
+        ));
+        assert_eq!(authorize(&oversized, &cfg), Err("malformed tunnel grant"));
+
+        let mut uppercase_nonce = request_with_grant(&signer, &expected_audience(), [0xab; 32]);
+        let header = uppercase_nonce
+            .iter_mut()
+            .find(|header| header.name() == connectip::ATTEST_NONCE_HEADER.as_bytes())
+            .expect("nonce header");
+        *header = Header::new(
+            connectip::ATTEST_NONCE_HEADER.as_bytes(),
+            connectip::to_hex(&[0xab; 32])
+                .to_ascii_uppercase()
+                .as_bytes(),
+        );
+        assert_eq!(
+            authorize(&uppercase_nonce, &cfg),
+            Err("malformed attestation nonce")
         );
     }
 
@@ -1019,25 +1869,33 @@ mod tests {
             Header::new(b":method", b"CONNECT"),
             Header::new(b":protocol", b"connect-ip"),
         ];
+        assert_eq!(authorize(&headers, &cfg), Err("missing attestation nonce"));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn authorize_allows_ungranted_dev_node_with_nonce() {
+        // allow_ungranted + no grant verifier + a nonce header → accepted (local/dev bypass).
+        let cfg = test_cfg(true);
+        assert!(authorize(&request_with_nonce(&[1u8; 32]), &cfg).is_ok());
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn authorize_refuses_ungranted_mode_in_release_even_when_requested_programmatically() {
+        let cfg = test_cfg(true);
         assert_eq!(
-            authorize_connect(&headers, &cfg),
-            Err("missing attestation nonce")
+            authorize(&request_with_nonce(&[1u8; 32]), &cfg),
+            Err("grant verifier not configured")
         );
     }
 
     #[test]
-    fn authorize_allows_ungranted_dev_node_with_nonce() {
-        // allow_ungranted + no grant key + a nonce header → accepted (local/dev bypass).
-        let cfg = test_cfg(true);
-        assert!(authorize_connect(&request_with_nonce(&[1u8; 32]), &cfg).is_ok());
-    }
-
-    #[test]
     fn authorize_refuses_when_grant_verifier_unconfigured_and_not_dev() {
-        // Production posture: no grant key and NOT allow_ungranted → CONNECT-IP is refused.
+        // Production posture: no grant verifier and NOT allow_ungranted → CONNECT-IP is refused.
         let cfg = test_cfg(false);
         assert_eq!(
-            authorize_connect(&request_with_nonce(&[1u8; 32]), &cfg),
+            authorize(&request_with_nonce(&[1u8; 32]), &cfg),
             Err("grant verifier not configured")
         );
     }
@@ -1053,8 +1911,14 @@ mod tests {
             mtu: 1420,
             attest: None,
             role: crate::config::NodeRole::Exit,
-            grant_key: None,
+            grant_verifier: None,
+            grant_realm: None,
+            node_id: None,
+            tls_key_file: None,
             allow_ungranted,
+            max_connections: 1024,
+            max_connections_per_ip: 32,
+            grant_replay_capacity: 65_536,
         }
     }
 }

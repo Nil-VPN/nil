@@ -1,40 +1,36 @@
 # macOS — on-device verification (no-sudo System Extension epic, M2–M6)
 
-> **Build status — UPDATED 2026-06-28 on Xcode 26.6 / macOS 26.5 (Apple Silicon):**
-> **M2 (the SE compiles + links) is VERIFIED.** Building the scaffolding for real surfaced and fixed
-> three bugs it shipped with: (1) a build-graph cycle — the xcframework was both *linked by* and
-> *generated inside* the SE target; the engine is now built out-of-band by `client/apple/build-engine.sh`
-> and the target only links it; (2) `UInt`/`Int` FFI mismatches in the shared
-> `PacketTunnelProvider.swift` (would have broken iOS too); (3) a missing macOS entry point — a system
-> extension is a standalone executable and needs `_main`; added `PacketTunnelMain.swift` calling
-> `NEProvider.startSystemExtensionMode()`. Working local build (arm64, unsigned):
-> `./build-engine.sh debug && cd client/apple && xcodegen generate && xcodebuild -target PacketTunnel
-> -configuration Debug -destination 'platform=macOS,arch=arm64' ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build`
-> → a `Mach-O arm64` `.systemextension` with `_nil_start`/`_nil_stop`/`_nil_ingest_packets`/
-> `_nil_negotiated_mtu` linked in. (x86_64/universal hit an SDK build-sandbox quirk — local dev is
-> arm64-only; universal is a distribution follow-up.)
->
-> **M3 (activate + connect) is BLOCKED on the paid Apple Developer Program.** A signed build with a
-> free/personal team (`Apple Development`, here team MN9HR4P896) fails: `No profiles for
-> 'com.nilvpn.client.PacketTunnel' were found` — `-allowProvisioningUpdates` cannot create a profile
-> because personal teams **cannot provision the Network Extension / System Extension capabilities**.
-> Dev mode relaxes *notarization*, not *entitlement provisioning*, so the SE cannot be activated until
-> the App ID `com.nilvpn.client.PacketTunnel` carries the Network Extension capability under a paid
-> membership. **Next human step: enrol in the paid program, enable Network Extensions on the App ID,
-> then re-run the signed build + the activation steps below.**
+> **Current status (2026-07-12): compile/scaffold evidence only; no activation, live-tunnel, or
+> production validation.** The shared Apple native engine implements one hop as a debug/integration
+> harness. A packaged non-debug client returns `NativeMultiHopUnavailable` before removing a pass
+> from the encrypted vault or contacting the Coordinator. M2–M6 below are acceptance procedures,
+> not recorded passing results, and signing cannot bypass the current release-profile refusal.
 
-> **Status: authored, NOT verified.** The macOS System Extension wrapper around the shared
-> `NEPacketTunnelProvider` (`apple/PacketTunnelProvider.swift`) and its build/activation scaffolding
-> are integration code that **cannot be compiled or run here** — there is no Xcode, no dev-mode /
-> SIP-relaxed Mac, and no Apple Developer account on the host. Everything below must be done on a Mac
-> by a human. Two gates stand between here and a verified macOS client:
-> 1. **M2–M5** need a **dev-mode Mac** (`systemextensionsctl developer on`, which relaxes the
->    code-signing requirement for SE activation). SIP can stay enabled; dev mode is the only relaxation.
-> 2. **M6** (clean install on a stock SIP-enabled Mac with no dev mode) additionally needs a **paid
->    Apple Developer account** for a Developer ID cert, hardened runtime, and notarization.
->
-> Until a human walks this and records the result at the bottom, the README keeps the honest
-> "macOS unverified" caveat. A green CI build is **not** a substitute — none of this datapath runs here.
+## Historical local build note (2026-06-28; unarchived)
+
+An earlier developer report recorded an unsigned arm64 build on Apple Silicon with then-current
+Xcode/macOS. That exercise found and fixed a build-graph cycle, Swift `UInt`/`Int` FFI mismatches,
+and the missing macOS system-extension entry point (`PacketTunnelMain.swift` calling
+`NEProvider.startSystemExtensionMode()`). The report used:
+
+```sh
+./build-engine.sh debug
+cd client/apple
+xcodegen generate
+xcodebuild -target PacketTunnel -configuration Debug \
+  -destination 'platform=macOS,arch=arm64' ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
+```
+
+It stated that the resulting arm64 Mach-O linked the expected `_nil_*` symbols and that a universal
+build encountered an SDK build-sandbox issue. A later personal-team signing attempt reportedly
+could not provision the Network/System Extension capabilities. No build artifact, hash, full log,
+activation record, or live traffic evidence is retained here, so these are historical engineering
+observations rather than current release proof. Do not reuse personal team identifiers or signing
+details in tracked evidence.
+
+The current gates are native multi-hop, valid Apple signing/provisioning, extension activation, and
+the runtime/distribution checks below. Dev mode can relax parts of local activation/notarization
+handling, but it does not establish a production signing or security posture.
 
 The shared identifiers below are load-bearing and must agree across `project.yml`, both
 `.entitlements`, the `Info.plist`s, and the container-app code. Do not paraphrase them:
@@ -68,9 +64,9 @@ The SE links `NilApple.xcframework` + `NetworkExtension` / `Security` / `libc++`
    ```sh
    systemextensionsctl developer on
    ```
-   This lets an ad-hoc / development-signed SE activate without a notarized Developer ID build. It
-   does **not** require disabling SIP. M6 is the SIP-enabled, dev-mode-OFF path and is gated on real
-   certs instead (see M6).
+   This supports local development activation for a correctly entitled development build without
+   a notarized Developer ID artifact. It does not grant missing capabilities or provisioning and
+   does **not** require disabling SIP. M6 is the SIP-enabled, dev-mode-OFF path (see M6).
 5. **The app must live in `/Applications`.** Outside dev mode, macOS only activates a System
    Extension whose container app is in `/Applications` (not `~/Desktop`, not a `DerivedData` build
    dir). In dev mode it is more lenient, but build the habit now — copy the `.app` to `/Applications`
@@ -82,7 +78,7 @@ The SE links `NilApple.xcframework` + `NetworkExtension` / `Security` / `libc++`
 
 ---
 
-## M2 — generate the project and build the two targets
+## M2 — future build acceptance: generate the project and build both targets
 
 `project.yml` (committed) describes two targets — the **container app** (`com.nilvpn.client`) and
 the **System Extension appex** (`com.nilvpn.client.PacketTunnel`) — and references the two
@@ -100,6 +96,12 @@ xcodebuild -project NilVPN.xcodeproj \
 `Contents/Library/SystemExtensions/com.nilvpn.client.PacketTunnel.systemextension`, and the SE links
 the xcframework (verify with `otool -L .../com.nilvpn.client.PacketTunnel`).
 
+Before signing or device work, run `bash deploy/verify-macos-se-build.sh` from the repository root.
+It rebuilds the Apple engine in its deployment-target-specific cache, rejects representative native
+C++/assembly archive members that do not declare macOS 13.0, fails on newer-object linker warnings,
+and verifies the unsigned extension executable and plist both declare macOS 13.0. Passing this gate
+does not replace the macOS 13 runtime milestones below.
+
 **Entitlements to confirm now** (cheap to check, expensive to miss):
 - App **and** SE both carry
   `com.apple.developer.networking.networkextension = [packet-tunnel-provider-systemextension]`
@@ -113,7 +115,7 @@ both with the same identity/team), or a missing-entitlement error at activation 
 
 ---
 
-## M3 — activate the System Extension
+## M3 — future runtime acceptance: activate the System Extension
 
 `client/scripts/embed-systemextension.sh` (committed) does the post-build copy into `/Applications`
 and any re-sign, so activation isn't a manual drag:
@@ -147,21 +149,27 @@ script).
 
 ---
 
-## M4 — configure and connect
+## M4 — future runtime acceptance: configure and connect
 
 The container app, once the SE is approved, uses `NETunnelProviderManager` to install an
 `NETunnelProviderProtocol` with:
 - `providerBundleIdentifier = "com.nilvpn.client.PacketTunnel"`
-- `providerConfiguration` = exactly the keys the SE reads:
+- `providerConfiguration` = the current app contract keys:
   `nodeHost` (String), `nodePort` (Int), `serverName` (String), `measurementHex` (String),
-  `teeName` (String), `allowUnattested` (Bool), `grantHex` (String), `grantNonceHex` (String).
+  `tlsSpkiSha256Hex` (String), `transparencyLogKeyHex` (String), `teeName` (String), optional
+  `minTcbSevsnp` (dictionary with optional `fmc` and required `bootloader`, `tee`, `snp`, and
+  `microcode` byte values), `grantHex` (String), and `grantNonceHex` (String).
 
-The unlinkable Privacy Pass token is redeemed **in the container app**; only the resulting
-node endpoint + measurement + per-connection grant cross into the SE (PD-3). Subscribe to
-`NEVPNStatusDidChange` for status.
+The blind-signed Privacy Pass token is redeemed **in the container app**; the issuance transcript
+does not provide a direct cryptographic join to that bearer token, although timing and network
+correlation remain possible. Only the resulting node endpoint, trust inputs, and per-connection
+grant cross into the SE (PD-3). Subscribe to
+`NEVPNStatusDidChange` for status. The current packaged non-debug path never reaches redemption or
+this configuration step: its connection-profile guard returns before vault mutation or a
+Coordinator request. The flow below is therefore for a debug harness or a future multi-hop engine.
 
 ```
-Redeem token in app  ->  writes providerConfiguration  ->  saveToPreferences  ->  startVPNTunnel
+supported profile -> redeem in app -> write providerConfiguration -> saveToPreferences -> startVPNTunnel
 ```
 
 **Pass:** status walks `connecting → connected`; the menu/UI reflects it via
@@ -174,7 +182,7 @@ in `PacketTunnelProvider`), or it never leaves `connecting` (node unreachable / 
 
 ---
 
-## M5 — the pass/fail checks (this is the real verification)
+## M5 — future pass/fail checks (none recorded yet)
 
 Run all four. A run is only "passed" when all four hold and none produced a forbidden log line.
 
@@ -210,10 +218,11 @@ traffic leaks in the clear during the gap before the OS restarts or tears down t
 surfaces a disconnected/blocked state.
 **Fail:** traffic flows in the clear with your real IP while the provider is down.
 
-### 5.3 Memory under the NE budget
-macOS gives a Network Extension a hard memory ceiling (~50 MB; treat it as a hard wall — exceed it
-and the OS kills the SE, which then reads as a flapping/unstable tunnel). Profile the **SE process**,
-not the app:
+### 5.3 Memory stays within the platform budget
+
+Network Extensions run under OS memory limits that can vary by platform and release. Establish the
+applicable limit for the tested macOS version and keep a conservative margin; an OS memory kill
+looks like a flapping/unstable tunnel. Profile the **SE process**, not the app:
 ```
 Xcode → Product → Profile → Allocations / Activity Monitor instrument,
 attach to com.nilvpn.client.PacketTunnel, drive sustained traffic (e.g. a large download).
@@ -222,33 +231,38 @@ attach to com.nilvpn.client.PacketTunnel, drive sustained traffic (e.g. a large 
 does not grow unbounded over a multi-minute transfer (watch for a leak slope).
 **Fail:** steady climb toward the ceiling, or a `Jetsam`/memory-pressure kill in Console.
 
-### 5.4 Token is NOT consumed if the SE was never approved
-This is the privacy-economics check: a user who declines the System Settings approval must not have
-burned their Privacy Pass token.
-- Redeem a token in the app, then **decline / never approve** the SE in System Settings (or test on
-  a machine where activation is still `waiting for user`).
-- Attempt to connect; it will fail because the SE isn't active.
-**Pass:** the grant is **still spendable** afterward — the app did not redeem/consume the token
-until the SE actually came up and `startTunnel` ran. (Redeem-late, on `connected`, not on
-"user clicked Connect".)
-**Fail:** the token shows consumed/spent despite no tunnel ever forming. That wastes a user's
-unlinkable token on a failed activation — fix the redeem ordering.
+### 5.4 Unsupported profiles and incomplete activation fail before token use
+
+This check covers only failures that occur before `extension_connect` begins redemption:
+
+1. In a packaged non-debug build with the current one-hop engine, attempt a connection and confirm
+   `NativeMultiHopUnavailable` is returned.
+2. Separately, leave the System Extension unapproved (or activation waiting for the user) and
+   confirm the app's activation/permission preflight does not invoke `extension_connect`.
+3. For both cases, compare the encrypted-vault pass count before and after and confirm the
+   Coordinator received no redemption request.
+
+**Pass:** the pass count is unchanged and no redemption request is observed for either preflight
+failure. **Fail:** the app invokes redemption before it knows that the connection profile and OS
+activation state can proceed.
+
+Do not extend this claim to failures after redemption begins. On a supported debug/future profile,
+the app deliberately removes a single-use pass from the vault before posting it to the Coordinator;
+a later network, attestation, provider, or tunnel failure can consume that pass. The current code
+does not implement "redeem only after connected," and this record must not imply otherwise.
 
 ---
 
-## M6 — clean SIP-enabled Mac: signing + notarization (human-gated)
+## M6 — future clean-Mac acceptance: signing + notarization (human-gated)
 
-M2–M5 prove the datapath in **dev mode**. M6 proves it on a **stock Mac** (SIP on, dev mode OFF) —
-the state every real user is in. This is gated on a **paid Apple Developer account** and cannot be
-done with ad-hoc signing.
+After M2–M5 have actually passed and retained evidence exists, M6 repeats the work on a **stock
+Mac** (SIP on, dev mode OFF), the state expected for users. It requires appropriate paid-program
+credentials and cannot be completed with ad-hoc signing.
 
-Honest scoping of what Apple does and does not require:
-- The **`packet-tunnel-provider-systemextension` capability needs no special Apple approval / email
-  review** — unlike the iOS `packet-tunnel-provider` entitlement (which is org-gated, see
-  `DEVICE_VERIFY.md`). On macOS you can enable it in your provisioning profile yourself.
-- What you **do** need for a clean Mac: a **Developer ID Application** certificate, the **hardened
-  runtime** enabled on both the app and the SE, correct provisioning, and **notarization** —
-  otherwise a SIP-enabled Mac with dev mode off refuses to activate the SE.
+Apple account and entitlement policy can change. Confirm the current requirements in Apple's
+developer portal and documentation for the exact distribution channel. At minimum, this path
+expects a suitable **Developer ID Application** certificate, hardened runtime on the app and SE,
+correct entitlements/provisioning, and notarization for outside-App-Store distribution.
 
 Steps (human, on a Mac with the cert installed):
 ```sh
@@ -270,7 +284,8 @@ Then **turn dev mode OFF** (`systemextensionsctl developer off`), reboot, instal
 `/Applications`, and re-run **all of M3–M5** on that clean machine.
 
 **Pass:** the SE activates after the one-time System Settings approval with **no dev mode**, and
-M5.1–M5.4 all hold. Only then is macOS genuinely shippable.
+M5.1–M5.4 all hold. This establishes the distribution/runtime checks only; the product is not
+shippable until native multi-hop and the rest of the release checklist also pass.
 
 > Secrets reminder: notarization creds (Apple ID, app-specific password, API key) are human-held —
 > never commit them, never paste them into a tracked file or a log.
@@ -284,18 +299,19 @@ Everything above. Specifically, until a human runs this on real hardware we cann
 - the datapath carries real traffic with no v4/v6/DNS leak (M5.1);
 - the kill-switch holds on a provider crash (M5.2);
 - the SE lives within the NE memory budget under load (M5.3);
-- tokens survive a declined activation (M5.4);
+- unsupported-profile and incomplete-activation preflights leave passes untouched (M5.4);
 - a notarized build activates on a stock SIP-enabled Mac (M6).
 
-A green workspace CI build proves the Rust engine compiles for the macOS slices — nothing more. Do
-not let it masquerade as device verification.
+An Apple-target compile job, when it actually runs, establishes only that the selected source and
+toolchain compiled. It does not establish extension activation or device behavior.
 
 ## Record the result here
 
 Once a human completes a milestone on real hardware, append the date, the Mac/macOS/Xcode versions,
-dev-mode vs notarized, and the four M5 outcomes. **Only after M6 passes on a clean SIP-enabled Mac**
-may the README's "macOS unverified" caveat be dropped.
+dev-mode vs notarized, signed artifact hash, sanitized evidence location, and the four M5 outcomes.
+Do not describe macOS as release-validated until M6, native multi-hop, and the full release checklist
+have all passed.
 
-| Date | macOS / Xcode | Mode (dev / notarized) | M3 activate | M5.1 no-leak | M5.2 kill-switch | M5.3 memory | M5.4 token | Notes |
+| Date | macOS / Xcode | Mode (dev / notarized) | M3 activate | M5.1 no-leak | M5.2 kill-switch | M5.3 memory | M5.4 preflight/no-spend | Artifact/evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | _pending_ | | | | | | | | |

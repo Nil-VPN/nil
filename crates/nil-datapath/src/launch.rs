@@ -8,10 +8,10 @@
 //!   - otherwise → a single plain MASQUE hop.
 //!
 //! A Coordinator-redeemed path (`NW_COORDINATOR_URL`) takes priority and is the production
-//! multi-hop default (entry/middle/exit, exercised end-to-end by `deploy/verify-e2e.sh`); a single
-//! configured node is the explicit fallback and logs an honest "this is NOT trust-split" warning
-//! unless `NW_FORCE_SINGLE_HOP=1` acknowledges it (PD-8). Endpoint rotation and all-PQ-per-hop
-//! intermediate forwarding are tracked trust-split follow-ups (see `nil-transport::path`).
+//! multi-hop default (entry/middle/exit, exercised end-to-end by `deploy/verify-e2e.sh`). A single
+//! configured node is a debug-only fallback: release builds reject it regardless of
+//! `NW_FORCE_SINGLE_HOP` because one hop is not trust-split (PD-8). Endpoint rotation and
+//! all-PQ-per-hop intermediate forwarding are tracked follow-ups (see `nil-transport::path`).
 //!
 //! The datapath sizes the TUN from the tunnel's *negotiated* MTU, so the `mtu` here is only a
 //! ceiling.
@@ -21,13 +21,18 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use nil_core::{AttestExpectation, Measurement, NodeEndpoint, SevSnpTcbFloor, Tee, TransportKind};
+use nil_proto::path::TdxPolicy as WireTdxPolicy;
+#[cfg(feature = "dev-fallbacks")]
 use nil_transport::cascade::{Cascade, CascadeTransport, DnsLivenessProbe};
 use nil_transport::{
-    connectip, AmneziaWgTransport, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport,
-    Transport, WstunnelTransport,
+    connectip, MasqueConfig, MasqueTransport, PathTransport, PqWgTransport, Transport,
 };
+#[cfg(feature = "dev-fallbacks")]
+use nil_transport::{AmneziaWgTransport, WstunnelTransport};
 #[cfg(feature = "selector")]
-use nil_transport::{RealityConfig, RealityTransport, Selector, SelectorTransport, UdpReachabilityProbe};
+use nil_transport::{
+    RealityConfig, RealityTransport, Selector, SelectorTransport, UdpReachabilityProbe,
+};
 
 use crate::TunnelConfig;
 
@@ -38,8 +43,9 @@ fn env_or(key: &str, default: &str) -> String {
 /// The AmneziaWG cascade fallback rung, if `NW_CASCADE` is set. Reads the fallback node's WG
 /// pubkey (`NW_NODE_AMNEZIA_WG_PUB`, hex) and endpoint (`NW_NODE_AMNEZIA_HOST` /
 /// `NW_NODE_AMNEZIA_PORT`, defaulting to the primary host / 443).
+#[cfg(feature = "dev-fallbacks")]
 fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
-    if std::env::var("NW_CASCADE").is_err() {
+    if !nil_core::net::dev_env_flag("NW_CASCADE") {
         return Ok(None);
     }
     let Ok(h) = std::env::var("NW_NODE_AMNEZIA_WG_PUB") else {
@@ -66,8 +72,9 @@ fn amneziawg_fallback_from_env() -> Result<Option<AmneziaWgTransport>> {
 /// AND `NW_NODE_WSTUNNEL_WG_PUB` (hex) is given. Endpoint from `NW_NODE_WSTUNNEL_HOST` /
 /// `NW_NODE_WSTUNNEL_PORT` (defaulting to the primary host / 443). Optional: a deployment may run
 /// AmneziaWG, wstunnel, both, or neither as fallbacks.
+#[cfg(feature = "dev-fallbacks")]
 fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
-    if std::env::var("NW_CASCADE").is_err() {
+    if !nil_core::net::dev_env_flag("NW_CASCADE") {
         return Ok(None);
     }
     let Ok(h) = std::env::var("NW_NODE_WSTUNNEL_WG_PUB") else {
@@ -97,11 +104,7 @@ fn wstunnel_fallback_from_env() -> Result<Option<WstunnelTransport>> {
 type WgEndpoint = ([u8; 32], Option<String>, Option<u16>);
 
 #[cfg(feature = "selector")]
-fn parse_wg_endpoint(
-    pub_var: &str,
-    host_var: &str,
-    port_var: &str,
-) -> Result<Option<WgEndpoint>> {
+fn parse_wg_endpoint(pub_var: &str, host_var: &str, port_var: &str) -> Result<Option<WgEndpoint>> {
     let Ok(h) = std::env::var(pub_var) else {
         return Ok(None);
     };
@@ -135,7 +138,12 @@ fn reality_from_env() -> Result<Option<(RealityTransport, Option<String>)>> {
     let sni = std::env::var("NW_REALITY_SNI").ok();
     let except_host = host.clone();
     Ok(Some((
-        RealityTransport::with_config(RealityConfig { node_wg_pub: wg_pub, host, port, sni }),
+        RealityTransport::with_config(RealityConfig {
+            node_wg_pub: wg_pub,
+            host,
+            port,
+            sni,
+        }),
         except_host,
     )))
 }
@@ -154,6 +162,11 @@ pub fn is_configured() -> bool {
 /// Unset ⇒ `None` ⇒ the connection is unattested (a warning is logged by the transport).
 pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
     let Ok(hex) = std::env::var("NW_EXPECTED_MEASUREMENT") else {
+        if std::env::var_os("NW_TDX_POLICY_JSON").is_some() {
+            anyhow::bail!(
+                "NW_TDX_POLICY_JSON requires NW_EXPECTED_MEASUREMENT and NW_EXPECTED_TEE=tdx"
+            );
+        }
         return Ok(None);
     };
     let bytes = connectip::from_hex(hex.trim().as_bytes())
@@ -163,18 +176,66 @@ pub fn expected_from_env() -> Result<Option<AttestExpectation>> {
         "sev-snp" => Tee::SevSnp,
         other => anyhow::bail!("NW_EXPECTED_TEE must be sev-snp or tdx, got {other}"),
     };
+    let min_tcb_sevsnp = min_tcb_sevsnp_from_env()?;
+    if tee == Tee::Tdx && min_tcb_sevsnp.is_some() {
+        anyhow::bail!("NW_MIN_TCB_SEVSNP is invalid when NW_EXPECTED_TEE=tdx");
+    }
+    let tdx_policy = tdx_policy_from_env(tee)?;
     Ok(Some(AttestExpectation {
         tee,
         measurement: Measurement(bytes),
-        min_tcb_sevsnp: min_tcb_sevsnp_from_env()?,
+        tls_spki_sha256: tls_spki_sha256_from_env()?,
+        min_tcb_sevsnp,
+        tdx_policy,
         transparency_log_key: transparency_log_key_from_env()?,
     }))
+}
+
+/// A direct TDX node must carry the same complete, canonical workload policy as a
+/// Coordinator-published hop. The value is one JSON object matching `nil_proto::path::TdxPolicy`;
+/// splitting it across many environment variables would make partial configuration too easy.
+fn tdx_policy_from_env(tee: Tee) -> Result<Option<nil_core::TdxPolicy>> {
+    match (tee, std::env::var("NW_TDX_POLICY_JSON")) {
+        (Tee::Tdx, Ok(raw)) => {
+            let wire: WireTdxPolicy = serde_json::from_str(&raw)
+                .context("NW_TDX_POLICY_JSON must be a complete TDX policy JSON object")?;
+            crate::redeem::tdx_policy_from_wire(wire)
+                .context("NW_TDX_POLICY_JSON contains an invalid TDX policy")
+                .map(Some)
+        }
+        (Tee::Tdx, Err(std::env::VarError::NotPresent)) => anyhow::bail!(
+            "NW_EXPECTED_TEE=tdx requires a complete NW_TDX_POLICY_JSON; MRTD alone is insufficient"
+        ),
+        (Tee::Tdx, Err(std::env::VarError::NotUnicode(_))) => {
+            anyhow::bail!("NW_TDX_POLICY_JSON must be valid UTF-8 JSON")
+        }
+        (Tee::SevSnp, Ok(_)) => {
+            anyhow::bail!("NW_TDX_POLICY_JSON is invalid when NW_EXPECTED_TEE=sev-snp")
+        }
+        (Tee::SevSnp, Err(std::env::VarError::NotUnicode(_))) => {
+            anyhow::bail!("NW_TDX_POLICY_JSON must be valid UTF-8 JSON")
+        }
+        (Tee::SevSnp, Err(std::env::VarError::NotPresent)) => Ok(None),
+    }
+}
+
+/// Optional stable TLS identity pin for a direct debug node. Coordinator-redeemed production
+/// paths receive this per hop from the registry instead.
+fn tls_spki_sha256_from_env() -> Result<Option<[u8; 32]>> {
+    let Ok(hex) = std::env::var("NW_EXPECTED_TLS_SPKI_SHA256") else {
+        return Ok(None);
+    };
+    let bytes = connectip::from_hex(hex.trim().as_bytes())
+        .ok_or_else(|| anyhow::anyhow!("NW_EXPECTED_TLS_SPKI_SHA256 is not valid hex"))?;
+    Ok(Some(bytes.try_into().map_err(|_| {
+        anyhow::anyhow!("NW_EXPECTED_TLS_SPKI_SHA256 must be 32 bytes (64 hex chars)")
+    })?))
 }
 
 /// Parse an optional pinned transparency-log Ed25519 public key from `NW_TRANSPARENCY_LOG_KEY`
 /// (64 hex chars = 32 bytes). When set, the client requires the node's measurement to be proven
 /// present in that log via a stapled inclusion proof; unset ⇒ `None` ⇒ measurement pin alone gates.
-fn transparency_log_key_from_env() -> Result<Option<[u8; 32]>> {
+pub fn transparency_log_key_from_env() -> Result<Option<[u8; 32]>> {
     let Ok(hex) = std::env::var("NW_TRANSPARENCY_LOG_KEY") else {
         return Ok(None);
     };
@@ -197,10 +258,13 @@ fn min_tcb_sevsnp_from_env() -> Result<Option<SevSnpTcbFloor>> {
     };
     let parts: Vec<&str> = raw.trim().split('.').collect();
     let [bootloader, tee, snp, microcode] = parts.as_slice() else {
-        anyhow::bail!("NW_MIN_TCB_SEVSNP must be four dot-separated bytes bootloader.tee.snp.microcode");
+        anyhow::bail!(
+            "NW_MIN_TCB_SEVSNP must be four dot-separated bytes bootloader.tee.snp.microcode"
+        );
     };
     let byte = |s: &str, name: &str| -> Result<u8> {
-        s.parse::<u8>().with_context(|| format!("NW_MIN_TCB_SEVSNP {name} is not a 0-255 integer"))
+        s.parse::<u8>()
+            .with_context(|| format!("NW_MIN_TCB_SEVSNP {name} is not a 0-255 integer"))
     };
     Ok(Some(SevSnpTcbFloor {
         fmc: None,
@@ -360,10 +424,11 @@ fn params_from_env() -> Result<TunnelParams> {
         .collect::<Result<_>>()?;
     let kill_switch = env_or("NW_KILLSWITCH", "1") != "0";
     // Fail-closed by default: a MASQUE hop with no pinned measurement refuses to connect unless
-    // NW_ALLOW_UNATTESTED is explicitly TRUE (dev/loopback only). `env_flag` accepts only "1"/"true"
+    // NW_ALLOW_UNATTESTED is explicitly TRUE (dev/loopback only). `dev_env_flag` accepts only "1"/"true"
     // — so `NW_ALLOW_UNATTESTED=0` keeps the gate ON (not the `is_ok()` footgun where any value,
-    // including `0`, would loosen it). See `MasqueConfig::allow_unattested`.
-    let allow_unattested = nil_core::net::env_flag("NW_ALLOW_UNATTESTED");
+    // including `0`, would loosen it), and always returns false outside debug builds. See
+    // `MasqueConfig::allow_unattested`.
+    let allow_unattested = nil_core::net::dev_env_flag("NW_ALLOW_UNATTESTED");
     let expected = expected_from_env()?;
     let wg_pub = wg_pub_from_env()?;
     Ok(TunnelParams {
@@ -380,12 +445,42 @@ fn params_from_env() -> Result<TunnelParams> {
     })
 }
 
+/// Apply independently supplied release trust roots to a static (`NW_NODE_HOST` / `NW_PATH`)
+/// configuration. A static endpoint does not carry a Coordinator-provided measurement, so the
+/// operator must select one measurement with `NW_EXPECTED_MEASUREMENT`; that selection is accepted
+/// only when it belongs to `client_pins`. The embedded transparency-log key always replaces the
+/// process-environment value, preventing runtime configuration from broadening release trust.
+fn apply_direct_trust(
+    mut params: TunnelParams,
+    client_pins: &[Vec<u8>],
+    client_transparency_log_key: [u8; 32],
+) -> Result<TunnelParams> {
+    if client_pins.is_empty() {
+        anyhow::bail!("the embedded release trust bundle contains no effective node measurement");
+    }
+
+    let expected = params.expected.as_mut().ok_or_else(|| {
+        anyhow::anyhow!(
+            "a direct node/path requires NW_EXPECTED_MEASUREMENT to select an embedded release measurement"
+        )
+    })?;
+    if !client_pins.contains(&expected.measurement.0) {
+        anyhow::bail!("NW_EXPECTED_MEASUREMENT does not match the embedded release trust bundle");
+    }
+
+    expected.transparency_log_key = Some(client_transparency_log_key);
+    // An expectation is mandatory above, but also clear the development escape hatch so a later
+    // transport refactor cannot accidentally turn an appraisal error into an unattested session.
+    params.allow_unattested = false;
+    Ok(params)
+}
+
 /// Whether the resolved path is effectively single-hop: no path at all, or a path of fewer than
 /// two hops. A single-hop tunnel is **not** trust-split — the one node sees BOTH the client's IP
 /// and the destination, so this is a privacy property the operator/user must be told about (PD-8).
 /// Multi-hop nested-MASQUE trust-split (entry/middle/exit) is the production default and is
 /// exercised end-to-end by the Docker data-plane e2e harness (`deploy/verify-e2e.sh`); single-hop
-/// is only the explicit fallback.
+/// is available only to builds with debug assertions.
 fn is_single_hop(path: &Option<Vec<NodeEndpoint>>) -> bool {
     path.as_ref().map_or(true, |hops| hops.len() < 2)
 }
@@ -415,9 +510,11 @@ fn finish_selector(
     };
 
     // Fast path: AmneziaWG (UDP, speed-first) after the MASQUE/PQ-WG primary.
-    if let Some((wg, host, port)) =
-        parse_wg_endpoint("NW_NODE_AMNEZIA_WG_PUB", "NW_NODE_AMNEZIA_HOST", "NW_NODE_AMNEZIA_PORT")?
-    {
+    if let Some((wg, host, port)) = parse_wg_endpoint(
+        "NW_NODE_AMNEZIA_WG_PUB",
+        "NW_NODE_AMNEZIA_HOST",
+        "NW_NODE_AMNEZIA_PORT",
+    )? {
         note_except(&mut also_except, &host);
         fast.push(Arc::new(AmneziaWgTransport::new(wg, host, port)));
     }
@@ -429,9 +526,11 @@ fn finish_selector(
         resistant.push(Arc::new(reality));
         has_resistant = true;
     }
-    if let Some((wg, host, port)) =
-        parse_wg_endpoint("NW_NODE_WSTUNNEL_WG_PUB", "NW_NODE_WSTUNNEL_HOST", "NW_NODE_WSTUNNEL_PORT")?
-    {
+    if let Some((wg, host, port)) = parse_wg_endpoint(
+        "NW_NODE_WSTUNNEL_WG_PUB",
+        "NW_NODE_WSTUNNEL_HOST",
+        "NW_NODE_WSTUNNEL_PORT",
+    )? {
         note_except(&mut also_except, &host);
         resistant.push(Arc::new(WstunnelTransport::new(wg, host, port)));
         has_resistant = true;
@@ -481,26 +580,42 @@ fn assemble(
     p: TunnelParams,
     path: Option<Vec<NodeEndpoint>>,
 ) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
-    // Honest single-hop disclosure (PD-8): a single-hop tunnel is not trust-split — the one node
-    // sees both the client IP and the destination. Warn unless the operator has explicitly
-    // acknowledged it (NW_FORCE_SINGLE_HOP). `env_flag` accepts only "1"/"true". No PII in the log.
-    if is_single_hop(&path) && !nil_core::net::env_flag("NW_FORCE_SINGLE_HOP") {
-        // Tailor the remediation: if a Coordinator IS configured, "set NW_COORDINATOR_URL" is wrong
-        // advice (it returned a 1-hop path) — the fix is operator-side. Only suggest configuring a
-        // Coordinator when there isn't one.
-        if std::env::var("NW_COORDINATOR_URL").is_ok() {
-            tracing::warn!(
-                "single-hop path: this node sees BOTH your IP and your destination — NOT \
-                 trust-split. The Coordinator returned a single-hop path (multi-hop is the next \
-                 milestone). Set NW_FORCE_SINGLE_HOP=1 to acknowledge and silence this warning."
-            );
-        } else {
-            tracing::warn!(
-                "single-hop mode: this node sees BOTH your IP and your destination — NOT \
-                 trust-split. Set NW_COORDINATOR_URL for a multi-hop path, or NW_FORCE_SINGLE_HOP=1 \
-                 to acknowledge and silence this warning."
-            );
+    if is_single_hop(&path) {
+        // Trust-split is a release invariant, not an operator acknowledgement. Keeping this branch
+        // under `debug_assertions` ensures NW_FORCE_SINGLE_HOP cannot reactivate one-hop service in
+        // a production artifact even when the environment is compromised or misconfigured.
+        #[cfg(not(debug_assertions))]
+        anyhow::bail!(
+            "production builds require a trust-split path of at least two hops; \
+             NW_FORCE_SINGLE_HOP is a development-only override"
+        );
+
+        #[cfg(debug_assertions)]
+        if !nil_core::net::dev_env_flag("NW_FORCE_SINGLE_HOP") {
+            // Tailor the remediation: if a Coordinator IS configured, "set NW_COORDINATOR_URL" is
+            // wrong advice (it returned a 1-hop path) — the fix is operator-side. Only suggest
+            // configuring a Coordinator when there isn't one.
+            if std::env::var("NW_COORDINATOR_URL").is_ok() {
+                tracing::warn!(
+                    "single-hop path: this node sees BOTH your IP and your destination — NOT \
+                     trust-split. The Coordinator returned a single-hop path. \
+                     Set NW_FORCE_SINGLE_HOP=1 only in development to acknowledge this warning."
+                );
+            } else {
+                tracing::warn!(
+                    "single-hop mode: this node sees BOTH your IP and your destination — NOT \
+                     trust-split. Set NW_COORDINATOR_URL for a multi-hop path, or use \
+                     NW_FORCE_SINGLE_HOP=1 only in development to acknowledge this warning."
+                );
+            }
         }
+    }
+
+    #[cfg(not(feature = "dev-fallbacks"))]
+    if std::env::var_os("NW_CASCADE").is_some() || std::env::var_os("NW_SELECTOR").is_some() {
+        anyhow::bail!(
+            "NW_CASCADE/NW_SELECTOR requires a debug build with the explicit `dev-fallbacks` feature"
+        );
     }
     let (transport, routing_node, mtu): (Arc<dyn Transport>, NodeEndpoint, u16) = if let Some(
         hops,
@@ -557,42 +672,46 @@ fn assemble(
         // node — the multi-hop path branch above is unaffected. Behind the `selector` feature +
         // NW_SELECTOR so the static cascade stays the default (back-compat).
         #[cfg(feature = "selector")]
-        if nil_core::net::env_flag("NW_SELECTOR") {
+        if nil_core::net::dev_env_flag("NW_SELECTOR") {
             return finish_selector(p, node, primary, base_mtu);
         }
 
-        // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a cascade that steps down
-        // (timeout / dead-tunnel) and verifies each rung with a DNS liveness probe before
-        // committing. Each fallback rung is independently optional (a deployment may run
-        // either, both, or neither).
-        let mut rungs: Vec<Arc<dyn Transport>> = vec![primary];
-        if let Some(awg) = amneziawg_fallback_from_env()? {
-            rungs.push(Arc::new(awg));
-        }
-        if let Some(wst) = wstunnel_fallback_from_env()? {
-            rungs.push(Arc::new(wst));
-        }
-        if rungs.len() > 1 {
-            tracing::info!(
-                rungs = rungs.len(),
-                "obfuscation cascade enabled (MASQUE primary → {} fallback rung(s))",
-                rungs.len() - 1
-            );
-            let cascade =
-                Cascade::new(rungs).with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
-            (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
-        } else {
-            if std::env::var("NW_CASCADE").is_ok() {
-                anyhow::bail!(
+        #[cfg(feature = "dev-fallbacks")]
+        {
+            // With NW_CASCADE, wrap [primary, AmneziaWG?, wstunnel?] in a development-only
+            // cascade. These rungs are compiled out entirely unless `dev-fallbacks` is explicit.
+            let mut rungs: Vec<Arc<dyn Transport>> = vec![primary];
+            if let Some(awg) = amneziawg_fallback_from_env()? {
+                rungs.push(Arc::new(awg));
+            }
+            if let Some(wst) = wstunnel_fallback_from_env()? {
+                rungs.push(Arc::new(wst));
+            }
+            if rungs.len() > 1 {
+                tracing::info!(
+                    rungs = rungs.len(),
+                    "development obfuscation cascade enabled (MASQUE primary → {} fallback rung(s))",
+                    rungs.len() - 1
+                );
+                let cascade =
+                    Cascade::new(rungs).with_liveness_probe(Arc::new(DnsLivenessProbe::default()));
+                (Arc::new(CascadeTransport::new(cascade)), node, base_mtu)
+            } else {
+                if nil_core::net::dev_env_flag("NW_CASCADE") {
+                    anyhow::bail!(
                         "NW_CASCADE set but no fallback rung configured — set NW_NODE_AMNEZIA_WG_PUB and/or NW_NODE_WSTUNNEL_WG_PUB"
                     );
+                }
+                (
+                    rungs.into_iter().next().expect("primary rung"),
+                    node,
+                    base_mtu,
+                )
             }
-            (
-                rungs.into_iter().next().expect("primary rung"),
-                node,
-                base_mtu,
-            )
         }
+
+        #[cfg(not(feature = "dev-fallbacks"))]
+        (primary, node, base_mtu)
     };
 
     // When the cascade is on, each fallback node's traffic must also bypass the tunnel (else the
@@ -600,8 +719,10 @@ fn assemble(
     // kill-switch only opens the PRIMARY node on :443 — its custom port would be dropped). Only
     // except hosts that an ACTUALLY-ASSEMBLED fallback rung reaches (gated on the same key vars
     // that gate the rungs above), so NW_CASCADE alone never punches an all-ports kill-switch hole.
+    #[cfg(feature = "dev-fallbacks")]
     let mut also_except: Vec<String> = Vec::new();
-    if std::env::var("NW_CASCADE").is_ok() {
+    #[cfg(feature = "dev-fallbacks")]
+    if nil_core::net::dev_env_flag("NW_CASCADE") {
         let mut except_host = |env_key: &str| {
             let h = std::env::var(env_key).unwrap_or_else(|_| p.host.clone());
             if !also_except.contains(&h) {
@@ -615,6 +736,8 @@ fn assemble(
             except_host("NW_NODE_WSTUNNEL_HOST");
         }
     }
+    #[cfg(not(feature = "dev-fallbacks"))]
+    let also_except: Vec<String> = Vec::new();
 
     let cfg = TunnelConfig {
         node: routing_node,
@@ -640,7 +763,8 @@ pub async fn from_env() -> Result<(Arc<dyn Transport>, TunnelConfig)> {
         // faith — it is cross-checked against the client's own pin (NW_EXPECTED_MEASUREMENT /
         // NW_PINNED_MEASUREMENTS) inside `redeem_path`, which fails closed on a mismatch.
         let client_pins = pinned_measurements_from_env()?;
-        Some(crate::redeem::redeem_path_from_env(&url, &client_pins).await?)
+        let client_log_key = transparency_log_key_from_env()?;
+        Some(crate::redeem::redeem_path_from_env(&url, &client_pins, client_log_key).await?)
     } else {
         path_from_env(&p.expected)?
     };
@@ -656,12 +780,53 @@ pub async fn from_env_with_token(
     msg: &str,
     token: &str,
 ) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
-    let p = params_from_env()?;
     // Audit B1 cross-check (see `from_env`): the desktop engine reads its independent pin from the
     // same env vars and the redeem path refuses any hop whose Coordinator-provided measurement is
     // not in it.
     let client_pins = pinned_measurements_from_env()?;
-    let path = Some(crate::redeem::redeem_path(coord_url, msg, token, &client_pins).await?);
+    let client_log_key = transparency_log_key_from_env()?;
+    from_env_with_token_and_trust(coord_url, msg, token, &client_pins, client_log_key).await
+}
+
+/// Release-client variant of [`from_env_with_token`]. The caller supplies roots decoded from the
+/// bundle embedded in the client binary, so neither a process env value nor the Coordinator can
+/// broaden which guest measurements or transparency-log key the desktop app trusts.
+pub async fn from_env_with_token_and_trust(
+    coord_url: &str,
+    msg: &str,
+    token: &str,
+    client_pins: &[Vec<u8>],
+    client_transparency_log_key: Option<[u8; 32]>,
+) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    let p = params_from_env()?;
+    let path = Some(
+        crate::redeem::redeem_path(
+            coord_url,
+            msg,
+            token,
+            client_pins,
+            client_transparency_log_key,
+        )
+        .await?,
+    );
+    assemble(p, path)
+}
+
+/// Release-client launcher for a static node or `NW_PATH`. The caller supplies measurements and
+/// the transparency-log key decoded from the bundle embedded in the client binary. Environment or
+/// persisted settings may select one embedded measurement, but cannot introduce a new measurement,
+/// omit transparency-log verification, or enable the unattested development escape hatch.
+pub async fn from_env_with_direct_trust(
+    client_pins: &[Vec<u8>],
+    client_transparency_log_key: [u8; 32],
+) -> Result<(Arc<dyn Transport>, TunnelConfig)> {
+    if std::env::var("NW_COORDINATOR_URL").is_ok() {
+        anyhow::bail!(
+            "from_env_with_direct_trust cannot be used with NW_COORDINATOR_URL; redeem the path with Coordinator trust checks"
+        );
+    }
+    let p = apply_direct_trust(params_from_env()?, client_pins, client_transparency_log_key)?;
+    let path = path_from_env(&p.expected)?;
     assemble(p, path)
 }
 
@@ -684,14 +849,21 @@ mod tests {
             parse_nw_path_hop(&format!("exit.example:443@{key_hex}")).expect("host:port@key");
         assert_eq!(host, "exit.example");
         assert_eq!(port, 443);
-        assert_eq!(wg, Some([0xab; 32]), "an @wg_pub makes the hop a PQ-WireGuard carrier");
+        assert_eq!(
+            wg,
+            Some([0xab; 32]),
+            "an @wg_pub makes the hop a PQ-WireGuard carrier"
+        );
     }
 
     #[test]
     fn nw_path_hop_rejects_bad_key() {
         // Non-hex and wrong-length keys must fail (fail closed — never silently drop the key).
         assert!(parse_nw_path_hop("h:443@zz").is_err(), "non-hex key");
-        assert!(parse_nw_path_hop("h:443@abcd").is_err(), "wrong-length key (not 32 bytes)");
+        assert!(
+            parse_nw_path_hop("h:443@abcd").is_err(),
+            "wrong-length key (not 32 bytes)"
+        );
         assert!(parse_nw_path_hop("no-port").is_err(), "missing :port");
     }
 
@@ -699,7 +871,9 @@ mod tests {
         AttestExpectation {
             tee: Tee::SevSnp,
             measurement: Measurement(vec![byte; 48]),
+            tls_spki_sha256: None,
             min_tcb_sevsnp: None,
+            tdx_policy: None,
             transparency_log_key: None,
         }
     }
@@ -731,11 +905,15 @@ mod tests {
             "a 1-hop path is single-hop (one node sees IP + destination)"
         );
         assert!(
-            !is_single_hop(&Some(vec![NodeEndpoint::loopback(), NodeEndpoint::loopback()])),
+            !is_single_hop(&Some(vec![
+                NodeEndpoint::loopback(),
+                NodeEndpoint::loopback()
+            ])),
             "a 2-hop path is trust-split (no honest-disclosure warning)"
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn single_hop_plain_masque_carries_the_pin_and_default_mtu() {
         let mut p = base_params();
@@ -754,6 +932,7 @@ mod tests {
         assert!(cfg.kill_switch);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn single_hop_with_wg_pub_selects_pqwg_and_shrinks_mtu() {
         let mut p = base_params();
@@ -765,6 +944,17 @@ mod tests {
         assert_eq!(cfg.node.wg_pub, Some([7u8; 32]));
         assert_eq!(cfg.node.expected, Some(measurement(0xcd)));
         assert_eq!(cfg.mtu, 1232);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn release_assembly_rejects_single_hop_even_when_the_override_would_be_requested() {
+        let mut p = base_params();
+        p.expected = Some(measurement(0xab));
+        assert!(
+            assemble(p, None).is_err(),
+            "a release artifact must not assemble a one-hop path"
+        );
     }
 
     #[test]
@@ -805,19 +995,62 @@ mod tests {
         // single-node WG key (it runs plain nested MASQUE) and still route via the entry hop.
         let mut p = base_params();
         p.wg_pub = Some([9u8; 32]);
-        let hops = vec![NodeEndpoint {
-            host: "entry.example".to_string(),
-            port: 443,
-            kind: TransportKind::Masque,
-            wg_pub: None,
-            expected: Some(measurement(0x33)),
-            grant: None,
-        }];
+        let hops = vec![
+            NodeEndpoint {
+                host: "entry.example".to_string(),
+                port: 443,
+                kind: TransportKind::Masque,
+                wg_pub: None,
+                expected: Some(measurement(0x33)),
+                grant: None,
+            },
+            NodeEndpoint {
+                host: "exit.example".to_string(),
+                port: 443,
+                kind: TransportKind::Masque,
+                wg_pub: None,
+                expected: Some(measurement(0x44)),
+                grant: None,
+            },
+        ];
         let (_t, cfg) = assemble(p, Some(hops)).expect("assemble path with stray wg_pub");
         assert_eq!(cfg.node.host, "entry.example");
         // The routing node is the entry hop verbatim — the stray single-node wg_pub does not leak
         // into it (the entry hop carried `None`).
         assert_eq!(cfg.node.wg_pub, None);
         assert_eq!(cfg.mtu, 1280);
+    }
+
+    #[test]
+    fn direct_release_trust_requires_an_explicit_embedded_measurement() {
+        let err = apply_direct_trust(base_params(), &[vec![0xab; 48]], [0xcd; 32])
+            .err()
+            .expect("an unpinned direct node must fail closed");
+        assert!(err.to_string().contains("requires NW_EXPECTED_MEASUREMENT"));
+
+        let mut p = base_params();
+        p.expected = Some(measurement(0xee));
+        let err = apply_direct_trust(p, &[vec![0xab; 48]], [0xcd; 32])
+            .err()
+            .expect("a runtime-only measurement must not broaden embedded trust");
+        assert!(err
+            .to_string()
+            .contains("does not match the embedded release trust bundle"));
+    }
+
+    #[test]
+    fn direct_release_trust_forces_the_embedded_log_key_and_attestation_gate() {
+        let mut p = base_params();
+        let mut expected = measurement(0xab);
+        expected.transparency_log_key = Some([0x11; 32]);
+        p.expected = Some(expected);
+        p.allow_unattested = true;
+
+        let p = apply_direct_trust(p, &[vec![0xab; 48], vec![0xbc; 48]], [0xcd; 32])
+            .expect("the selected measurement belongs to the embedded set");
+        let expected = p.expected.expect("release expectation");
+        assert_eq!(expected.measurement, Measurement(vec![0xab; 48]));
+        assert_eq!(expected.transparency_log_key, Some([0xcd; 32]));
+        assert!(!p.allow_unattested);
     }
 }

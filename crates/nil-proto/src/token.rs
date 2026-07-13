@@ -4,6 +4,93 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One authenticated subscription-mint request can refill this many anonymous tokens. The bound
+/// keeps request buffering and issuer work predictable while amortizing account authentication.
+pub const MAX_MINT_BATCH_SIZE: usize = 16;
+
+/// RSA-2048 blinded messages and blind signatures are exactly 256 bytes / 512 lowercase-hex
+/// characters on this protocol version.
+pub const BLIND_TOKEN_HEX_LEN: usize = 512;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchSizeError {
+    actual: usize,
+}
+
+impl BatchSizeError {
+    pub fn actual(self) -> usize {
+        self.actual
+    }
+}
+
+impl std::fmt::Display for BatchSizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "batch must contain 1..={MAX_MINT_BATCH_SIZE} items, got {}",
+            self.actual
+        )
+    }
+}
+
+impl std::error::Error for BatchSizeError {}
+
+macro_rules! bounded_batch {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[serde(transparent)]
+        pub struct $name(Vec<String>);
+
+        impl $name {
+            pub fn as_slice(&self) -> &[String] {
+                &self.0
+            }
+
+            pub fn iter(&self) -> impl ExactSizeIterator<Item = &String> {
+                self.0.iter()
+            }
+
+            pub fn len(&self) -> usize {
+                self.0.len()
+            }
+
+            pub fn is_empty(&self) -> bool {
+                self.0.is_empty()
+            }
+
+            pub fn into_vec(self) -> Vec<String> {
+                self.0
+            }
+        }
+
+        impl TryFrom<Vec<String>> for $name {
+            type Error = BatchSizeError;
+
+            fn try_from(values: Vec<String>) -> Result<Self, Self::Error> {
+                if values.is_empty() || values.len() > MAX_MINT_BATCH_SIZE {
+                    return Err(BatchSizeError {
+                        actual: values.len(),
+                    });
+                }
+                Ok(Self(values))
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let values = Vec::<String>::deserialize(deserializer)?;
+                Self::try_from(values).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+bounded_batch!(BlindMessageBatch);
+bounded_batch!(BlindSignatureBatch);
+
 /// `POST /v1/billing/checkout` (Portal) response: the server-minted payment reference the buyer
 /// uses as their Monero payment id and then passes as `payment_id` to `/v1/tokens/issue`. It is a
 /// 256-bit CSPRNG value (lowercase hex), unguessable so it cannot be front-run. It indexes a
@@ -75,6 +162,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mint_batches_reject_empty_and_oversized_arrays_during_deserialization() {
+        assert!(serde_json::from_str::<BlindMessageBatch>("[]").is_err());
+        assert!(
+            serde_json::from_value::<BlindMessageBatch>(serde_json::json!(vec![
+                "aa";
+                MAX_MINT_BATCH_SIZE
+                    + 1
+            ]))
+            .is_err()
+        );
+
+        let maximum = BlindMessageBatch::try_from(vec!["aa".to_string(); MAX_MINT_BATCH_SIZE])
+            .expect("the documented maximum is accepted");
+        assert_eq!(maximum.len(), MAX_MINT_BATCH_SIZE);
+        assert_eq!(
+            BlindMessageBatch::try_from(Vec::new())
+                .unwrap_err()
+                .actual(),
+            0
+        );
+    }
+
+    #[test]
+    fn signature_batches_use_the_same_nonempty_bound() {
+        let batch = BlindSignatureBatch::try_from(vec!["bb".to_string(), "cc".to_string()])
+            .expect("bounded response");
+        let json = serde_json::to_string(&batch).unwrap();
+        assert_eq!(json, r#"["bb","cc"]"#);
+        assert_eq!(
+            serde_json::from_str::<BlindSignatureBatch>(&json).unwrap(),
+            batch
+        );
+        assert!(BlindSignatureBatch::try_from(Vec::new()).is_err());
+    }
+
+    #[test]
     fn checkout_response_wire_shape_is_a_single_opaque_reference() {
         // The shared DTO both clients (nil-provision, desktop TokenClient) and the Portal use. It
         // must carry ONLY the opaque reference — no identity fields — and round-trip by field name
@@ -99,12 +222,16 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).expect("serialize");
         for forbidden in ["card", "email", "name", "amount", "cardholder", "billing"] {
-            assert!(!json.contains(forbidden), "WebhookEvent must not carry {forbidden:?}");
+            assert!(
+                !json.contains(forbidden),
+                "WebhookEvent must not carry {forbidden:?}"
+            );
         }
         // And it round-trips by field name from a processor body.
-        let back: WebhookEvent =
-            serde_json::from_str(r#"{"event_type":"refund","transaction_id":"t","payment_reference":"r"}"#)
-                .expect("parse");
+        let back: WebhookEvent = serde_json::from_str(
+            r#"{"event_type":"refund","transaction_id":"t","payment_reference":"r"}"#,
+        )
+        .expect("parse");
         assert_eq!(back.event_type, "refund");
     }
 }

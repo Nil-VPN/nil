@@ -156,14 +156,17 @@ mod tests {
         store
             .insert(AccountRecord {
                 account_number: *derived.account_number.as_bytes(),
-                recovery_code_hash: derived.recovery_code_hash,
                 entitlement: Entitlement::None,
                 auth_pubkey: derived.auth_public_key,
             })
             .await
             .expect("insert");
         let kp = AuthKeypair::from_phrase(&derived.recovery_phrase).expect("derive");
-        (AppState::new(store), hex(derived.account_number.as_bytes()), kp)
+        (
+            AppState::new(store),
+            hex(derived.account_number.as_bytes()),
+            kp,
+        )
     }
 
     fn signed(challenge: &str, account_number: &str, kp: &AuthKeypair) -> AccountAuth {
@@ -179,7 +182,9 @@ mod tests {
         let (state, acct, kp) = seeded_account(1).await;
         let challenge = state.challenges.issue(1000).expect("issue");
         let auth = signed(&challenge, &acct, &kp);
-        let rec = authenticate(&state, &auth, 1001).await.expect("authenticates");
+        let rec = authenticate(&state, &auth, 1001)
+            .await
+            .expect("authenticates");
         assert_eq!(hex(&rec.account_number), acct);
     }
 
@@ -190,7 +195,10 @@ mod tests {
         let auth = signed(&challenge, &acct, &kp);
         assert!(authenticate(&state, &auth, 1000).await.is_ok());
         // The same proof replayed is rejected — the nonce was consumed.
-        assert_eq!(authenticate(&state, &auth, 1000).await, Err(AuthError::Unauthorized));
+        assert_eq!(
+            authenticate(&state, &auth, 1000).await,
+            Err(AuthError::Unauthorized)
+        );
     }
 
     #[tokio::test]
@@ -199,7 +207,10 @@ mod tests {
         let challenge = state.challenges.issue(1000).expect("issue");
         let auth = signed(&challenge, &acct, &kp);
         let later = 1000 + CHALLENGE_TTL_SECS + 1;
-        assert_eq!(authenticate(&state, &auth, later).await, Err(AuthError::Unauthorized));
+        assert_eq!(
+            authenticate(&state, &auth, later).await,
+            Err(AuthError::Unauthorized)
+        );
     }
 
     #[tokio::test]
@@ -207,7 +218,10 @@ mod tests {
         let (state, acct, kp) = seeded_account(4).await;
         // A nonce we never issued (client-fabricated) must fail.
         let auth = signed(&"ab".repeat(32), &acct, &kp);
-        assert_eq!(authenticate(&state, &auth, 1000).await, Err(AuthError::Unauthorized));
+        assert_eq!(
+            authenticate(&state, &auth, 1000).await,
+            Err(AuthError::Unauthorized)
+        );
     }
 
     #[tokio::test]
@@ -217,7 +231,10 @@ mod tests {
         let attacker = AuthKeypair::from_phrase(&create_account_os().recovery_phrase).unwrap();
         let challenge = state.challenges.issue(1000).expect("issue");
         let auth = signed(&challenge, &acct, &attacker);
-        assert_eq!(authenticate(&state, &auth, 1000).await, Err(AuthError::Unauthorized));
+        assert_eq!(
+            authenticate(&state, &auth, 1000).await,
+            Err(AuthError::Unauthorized)
+        );
     }
 
     #[tokio::test]
@@ -226,7 +243,10 @@ mod tests {
         let challenge = state.challenges.issue(1000).expect("issue");
         // A well-formed proof for an account number that isn't stored → Unauthorized (no oracle).
         let auth = signed(&challenge, &"cd".repeat(32), &kp);
-        assert_eq!(authenticate(&state, &auth, 1000).await, Err(AuthError::Unauthorized));
+        assert_eq!(
+            authenticate(&state, &auth, 1000).await,
+            Err(AuthError::Unauthorized)
+        );
     }
 
     #[tokio::test]
@@ -235,11 +255,17 @@ mod tests {
         let challenge = state.challenges.issue(1000).expect("issue");
         let mut auth = signed(&challenge, &acct, &kp);
         auth.signature = "not-hex".to_string();
-        assert_eq!(authenticate(&state, &auth, 1000).await, Err(AuthError::Malformed));
+        assert_eq!(
+            authenticate(&state, &auth, 1000).await,
+            Err(AuthError::Malformed)
+        );
 
         let mut auth2 = signed(&challenge, "zz", &kp);
         auth2.account_number = "zz".to_string();
-        assert_eq!(authenticate(&state, &auth2, 1000).await, Err(AuthError::Malformed));
+        assert_eq!(
+            authenticate(&state, &auth2, 1000).await,
+            Err(AuthError::Malformed)
+        );
     }
 
     #[test]

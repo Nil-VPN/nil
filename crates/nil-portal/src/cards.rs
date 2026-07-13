@@ -14,7 +14,7 @@
 //!
 //! ## Honest limits (PD-8)
 //! - Card payment is *pseudonymity*, not anonymity: the MoR knows the payer. Monero remains the
-//!   unlinkable rail. Marketing must not claim card payments are anonymous.
+//!   blind-token rail. Marketing must not claim card payments or later use are uncorrelatable.
 //! - Revocation blocks FUTURE issuance for a refunded/charged-back reference; an already-issued
 //!   bearer token cannot be recalled (a property of Privacy Pass). The revoked set is durable.
 
@@ -51,7 +51,11 @@ pub struct CardWatcher {
 
 impl CardWatcher {
     pub fn new(pending: Arc<TimedDurableSet>, revoked: Arc<DurableSet>) -> Self {
-        Self { confirmed: Mutex::new(HashSet::new()), revoked, pending }
+        Self {
+            confirmed: Mutex::new(HashSet::new()),
+            revoked,
+            pending,
+        }
     }
 
     /// Mark a checkout reference paid — ONLY if it was actually minted by `/v1/billing/checkout`
@@ -96,7 +100,10 @@ impl PaymentWatcher for CardWatcher {
         if self.revoked.contains(payment_id) {
             return false;
         }
-        self.confirmed.lock().map(|c| c.contains(payment_id)).unwrap_or(false)
+        self.confirmed
+            .lock()
+            .map(|c| c.contains(payment_id))
+            .unwrap_or(false)
     }
 }
 
@@ -155,7 +162,10 @@ pub fn cards_router(card: Arc<CardWatcher>, secret: Vec<u8>) -> Router {
     Router::new()
         .route("/v1/billing/webhook", post(webhook))
         .layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT))
-        .with_state(CardState { card, secret: Arc::new(secret) })
+        .with_state(CardState {
+            card,
+            secret: Arc::new(secret),
+        })
 }
 
 /// HMAC-verify the raw body, then mark the reference paid (confirmed) or revoked
@@ -189,7 +199,9 @@ async fn webhook(State(state): State<CardState>, headers: HeaderMap, body: Bytes
                 StatusCode::OK
             }
             Err(e) => {
-                tracing::error!("card revoke persist failed: {e} — returning 500 so the processor retries");
+                tracing::error!(
+                    "card revoke persist failed: {e} — returning 500 so the processor retries"
+                );
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         }
@@ -202,10 +214,7 @@ async fn webhook(State(state): State<CardState>, headers: HeaderMap, body: Bytes
 fn is_confirm_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        "confirmed"
-            | "payment_succeeded"
-            | "order_completed"
-            | "subscription_payment_success"
+        "confirmed" | "payment_succeeded" | "order_completed" | "subscription_payment_success"
     )
 }
 
@@ -229,7 +238,10 @@ mod tests {
     #[test]
     fn confirm_only_works_for_a_minted_reference() {
         let w = watcher_with_minted("ref-minted");
-        assert!(!w.confirm("ref-unminted"), "fail closed: unminted reference is not confirmed");
+        assert!(
+            !w.confirm("ref-unminted"),
+            "fail closed: unminted reference is not confirmed"
+        );
         assert!(!w.is_confirmed("ref-unminted"));
         assert!(w.confirm("ref-minted"), "a minted reference is accepted");
         assert!(w.is_confirmed("ref-minted"));
@@ -241,11 +253,17 @@ mod tests {
         assert!(w.confirm("ref"));
         assert!(w.is_confirmed("ref"));
         w.revoke("ref").expect("revoke persists");
-        assert!(!w.is_confirmed("ref"), "a refunded reference is no longer confirmed");
+        assert!(
+            !w.is_confirmed("ref"),
+            "a refunded reference is no longer confirmed"
+        );
         // Revocation is sticky: a replayed confirm is rejected outright (fail-closed) and cannot
         // re-confirm a revoked reference.
         assert!(!w.confirm("ref"), "confirm() rejects a revoked reference");
-        assert!(!w.is_confirmed("ref"), "revocation wins over a replayed confirm");
+        assert!(
+            !w.is_confirmed("ref"),
+            "revocation wins over a replayed confirm"
+        );
     }
 
     #[test]
@@ -266,7 +284,10 @@ mod tests {
         let empty = Arc::new(watcher_with_minted("other"));
         let composite =
             CompositeWatcher::new(vec![empty.clone() as Arc<dyn PaymentWatcher>, card.clone()]);
-        assert!(composite.is_confirmed("ref"), "card rail confirms → composite confirms");
+        assert!(
+            composite.is_confirmed("ref"),
+            "card rail confirms → composite confirms"
+        );
         assert!(!composite.is_confirmed("nope"));
     }
 
@@ -280,11 +301,26 @@ mod tests {
         let good = mac.finalize().into_bytes();
         let good_hex: String = good.iter().map(|b| format!("{b:02x}")).collect();
 
-        assert!(verify_hmac(secret, body, &good_hex), "correct signature verifies");
-        assert!(!verify_hmac(secret, body, &"00".repeat(32)), "wrong signature is rejected");
-        assert!(!verify_hmac(b"other-secret", body, &good_hex), "wrong key is rejected");
-        assert!(!verify_hmac(secret, b"tampered body", &good_hex), "tampered body is rejected");
-        assert!(!verify_hmac(secret, body, "not-hex!!"), "malformed hex is rejected");
+        assert!(
+            verify_hmac(secret, body, &good_hex),
+            "correct signature verifies"
+        );
+        assert!(
+            !verify_hmac(secret, body, &"00".repeat(32)),
+            "wrong signature is rejected"
+        );
+        assert!(
+            !verify_hmac(b"other-secret", body, &good_hex),
+            "wrong key is rejected"
+        );
+        assert!(
+            !verify_hmac(secret, b"tampered body", &good_hex),
+            "tampered body is rejected"
+        );
+        assert!(
+            !verify_hmac(secret, body, "not-hex!!"),
+            "malformed hex is rejected"
+        );
     }
 
     #[test]
@@ -327,17 +363,31 @@ mod tests {
         let pending = Arc::new(TimedDurableSet::in_memory());
         pending.insert("ref-1", 0).unwrap();
         let card = Arc::new(CardWatcher::new(pending, Arc::new(DurableSet::in_memory())));
-        let state = CardState { card: card.clone(), secret: Arc::new(secret.clone()) };
-        let body = br#"{"event_type":"confirmed","transaction_id":"t","payment_reference":"ref-1"}"#.to_vec();
+        let state = CardState {
+            card: card.clone(),
+            secret: Arc::new(secret.clone()),
+        };
+        let body =
+            br#"{"event_type":"confirmed","transaction_id":"t","payment_reference":"ref-1"}"#
+                .to_vec();
         let sign = |b: &[u8]| -> String {
             let mut mac = Hmac::<Sha256>::new_from_slice(&secret).unwrap();
             mac.update(b);
-            mac.finalize().into_bytes().iter().map(|x| format!("{x:02x}")).collect()
+            mac.finalize()
+                .into_bytes()
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect()
         };
 
         // No signature header → 400, and nothing is confirmed.
         assert_eq!(
-            webhook(State(state.clone()), HeaderMap::new(), Bytes::from(body.clone())).await,
+            webhook(
+                State(state.clone()),
+                HeaderMap::new(),
+                Bytes::from(body.clone())
+            )
+            .await,
             StatusCode::BAD_REQUEST
         );
         assert!(!card.is_confirmed("ref-1"));
@@ -358,13 +408,27 @@ mod tests {
             webhook(State(state.clone()), good, Bytes::from(body.clone())).await,
             StatusCode::OK
         );
-        assert!(card.is_confirmed("ref-1"), "a correctly-signed confirm event marks the reference paid");
+        assert!(
+            card.is_confirmed("ref-1"),
+            "a correctly-signed confirm event marks the reference paid"
+        );
 
         // A correctly-signed refund event → 200 and revokes it (future issuance blocked).
-        let refund = br#"{"event_type":"refunded","transaction_id":"t","payment_reference":"ref-1"}"#.to_vec();
+        let refund =
+            br#"{"event_type":"refunded","transaction_id":"t","payment_reference":"ref-1"}"#
+                .to_vec();
         let mut rh = HeaderMap::new();
-        rh.insert("x-signature", HeaderValue::from_str(&sign(&refund)).unwrap());
-        assert_eq!(webhook(State(state.clone()), rh, Bytes::from(refund)).await, StatusCode::OK);
-        assert!(!card.is_confirmed("ref-1"), "a signed refund event revokes the reference");
+        rh.insert(
+            "x-signature",
+            HeaderValue::from_str(&sign(&refund)).unwrap(),
+        );
+        assert_eq!(
+            webhook(State(state.clone()), rh, Bytes::from(refund)).await,
+            StatusCode::OK
+        );
+        assert!(
+            !card.is_confirmed("ref-1"),
+            "a signed refund event revokes the reference"
+        );
     }
 }

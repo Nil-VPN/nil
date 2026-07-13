@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "NIL VPN client provisioning helper: acquire an unlinkable Privacy Pass token from the Portal."
+description = "NIL VPN client provisioning helper: acquire a blind-signed Privacy Pass token from the Portal."
 
 [dependencies]
 nil-core = { workspace = true }     # shared TLS/loopback guard + safe env-flag parsing

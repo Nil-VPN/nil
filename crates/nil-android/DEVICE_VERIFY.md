@@ -1,103 +1,102 @@
-# Android — on-device verification (Epic 9)
+# Android device-verification record (Epic 9)
 
-> **Status: VERIFIED on an arm64 emulator (2026-06-28), including a live real-SEV-SNP attested connect.**
-> The APK builds end-to-end (engine compiled from source by Gradle, not a committed binary — see
-> below) and the datapath was exercised on an `arm64-v8a` AVD against a local node. What was proven
-> live on the emulator:
->
-> - **Build is reproducible:** `libnil_android.so` is built by `cargo-ndk` wired into Gradle
->   (`nil-android.gradle.kts`, applied via `client/src-tauri/build.rs`), not a committed prebuilt.
->   A clean (emptied) `jniLibs/` is repopulated by the build; APK assembles, installs, launches.
-> - **Datapath works:** consent → `establish()` → `detachFd` → `nativeStart` → `nil-android tunnel
->   up`. `tun_rs::AsyncDevice::from_fd` works on `target_os="android"`; the `protect()` JNI upcall
->   succeeds; `spawn_pumps` moves packets. The exit node's data-plane counters showed bidirectional
->   flow (`from_client_pkts`/`to_client_pkts` increment, `to_client_drop_pkts=0`); `ping 1.1.1.1`
->   and `ping example.com` (DNS-through-tunnel) returned 0% loss with the node's egress TTL.
-> - **Attestation gate is wired and fails closed:** the ONLY change of flipping `allowUnattested`
->   to `false` (with a pinned measurement) turned a working tunnel into
->   `attestation failed: unsupported TEE tag: 0xff` → `nativeStart handle=0` → no tunnel. A release
->   client (no `synthetic` feature) correctly refuses a synthetic/unverifiable node — no packet ever
->   egresses unattested (Pillar 2).
-> - **Real SEV-SNP acceptance (live):** with `allowUnattested=false` + the client's pinned live
->   measurement, the engine attested the live alpha node (genuine AMD vendor-root chain + measurement
->   match) → tunnel up; egress confirmed (ping/DNS 0% loss, with RTT consistent with the real remote
->   node vs the local one). Token redeemed at the live Coordinator (the alpha hop is ungranted, so
->   `grantHex=""`).
-> - **No leak:** IPv4 egresses through the tunnel; IPv6 (`ping6`) is 100% blackholed (engine is
->   IPv4-only; `::/0` is captured into the TUN and dropped) so the device's real address can't leak.
->
-> **Hardening landed (Phase C/D), verified on the arm64 emulator unless noted:**
-> - **C1 independent attestation pin** — the mobile redeem (`extension.rs`) cross-checks the
->   Coordinator-provided measurement against the client's own pin (`client_pins_from_env`),
->   fail-closed on mismatch (`PinMismatch`). Unit-tested (8/8). Closes the Coordinator-trust gap (PD-5).
-> - **C2 real status channel** — `nativeStatus` reports `up|dead|down` from `Tunnel::is_up()`; the
->   service publishes connecting→up (only after the gate passes) →dead to a shared-`filesDir` file via
->   a poll thread, with honest FGS notification text; `commands.ts` reports connected ONLY on `up`.
->   Verified: connect→up; killing the node flips →dead (the TUN keeps blackholing throughout).
-> - **C3 consent preflight** — `prepareVPN` obtains VPN consent BEFORE `extension_connect` redeems,
->   so a denied/pending permission never burns a single-use token. (The token store is already
->   privacy-correct — only `{msg,token}`, `0600`, atomic, fail-closed; Keystore-at-rest encryption is
->   deferred defense-in-depth on non-identity data, not a privacy gap.)
-> - **C4 honest Always-on** — `openVpnSettings` deep-links to the OS VPN settings (verified resolves
->   to `Settings$VpnSettingsActivity`); a Settings row states the app cannot enable Always-on /
->   "Block without VPN" itself (PD-8). No-PII log audit: PASS (lengths/states only; no analytics SDKs).
-> - **D4 JNI symbol guard / D3 START_STICKY / D1 foreground service** — present (the datapath runs as
->   an FGS; a build-time guard binds the JNI symbols), but see the design-gated items below.
->
-> **Remaining before Android *ships* (design-gated or device-bound — deliberately NOT rushed):**
-> - **Reconnect-with-backoff (Wi-Fi↔LTE handoff, D2)** — a dead tunnel currently blackholes + reports
->   `dead` honestly, but does NOT auto-reconnect. True reconnect needs design: the grant/token is
->   single-use, so re-establishing requires a FRESH token redeemed in the app process and re-armed
->   across to the `:vpn` service (or QUIC connection migration). `START_STICKY` restart is also a
->   no-op today (null intent + spent token) — honest auto-restart needs the same design.
-> - **Dead-tunnel detection latency** — bounded by the QUIC `max_idle_timeout` (30s), set to a
->   **browser-plausible** value on purpose (Pillar 1 anti-fingerprinting). Lowering it for mobile
->   responsiveness/battery is a fingerprint tradeoff that needs a deliberate decision, not a tweak.
-> - **Real-device behaviors** (Doze deep-sleep network limits, carrier MTU, boot Always-on) an
->   emulator can't exercise.
+> **Current status (2026-07-12): not release-validated.** The Android native engine is a one-hop
+> debug/device-integration harness. A packaged non-debug client refuses with
+> `NativeMultiHopUnavailable` before a pass is removed from the encrypted vault or sent to the
+> Coordinator. No current APK/device run, production multi-hop run, signed artifact, or retained
+> evidence bundle establishes release readiness.
 
-## Leak protection (what enforces no-leak on Android)
-On Android the **routes are the kill-switch**: `NilVpnService` routes both `0.0.0.0/0` and now
-**`::/0`** into the TUN. The Rust engine is IPv4-only, so IPv6 packets entering the TUN are dropped —
-this closes the IPv6 leak where the device's ISP-assigned v6 address would otherwise bypass the
-tunnel. Honest tradeoff: **IPv6 connectivity is disabled while connected** (surface this in the UI).
+## How to read the older record
 
-## "Block connections without VPN" (honest)
-This is a **user setting**, not something the app can enable programmatically:
-**Settings → Network → VPN → NIL VPN → Always-on VPN + Block connections without VPN.** The app must
-direct users there. (`VpnService.Builder.setBlocking(true)` is only the fd's blocking I/O mode, not
-the system kill-switch.) The Rust `StartArgs.block_without_vpn` flag is the app-side intent to show
-that guidance / gate connect on it.
+The observations below were recorded on 2026-06-28. They remain useful for locating integration
+risks, but their APK, build logs, node logs, packet captures, configuration, and artifact hashes were
+not retained in this repository. They therefore cannot be independently repeated or treated as
+current release evidence.
 
-## Sync to the APK project (now automatic — `build.rs`)
-`crates/nil-android/android/*.kt` is the **source of truth**, but the Gradle project lives in the
-git-ignored `client/src-tauri/gen/android/` (created by `tauri android init`). A build compiles
-`gen/`, NOT `crates/` — so a stale `gen/` would ship the OLD Kotlin (e.g. WITHOUT the IPv6 leak
-fix or the logcat sanitisation), silently re-opening the leak.
+The historical report stated that:
 
-`client/src-tauri/build.rs` now mirrors the canonical `android/*.kt` into `gen/android/...` on
-**every** build (`tauri android build` runs the src-tauri `cargo build` first), so the two can no
-longer diverge — no manual step. It is best-effort (no-ops on a desktop build with no `gen/` tree,
-and a copy failure only emits a `cargo:warning`). If you ever need to force a sync by hand:
-```
-cp crates/nil-android/android/*.kt \
-   client/src-tauri/gen/android/app/src/main/java/com/nilvpn/
+- Gradle rebuilt `libnil_android.so` from source with `cargo-ndk`, repopulated an emptied
+  `jniLibs/` directory, assembled an APK, and installed it on an `arm64-v8a` emulator.
+- The debug harness followed consent → `establish()` → `detachFd()` → JNI start → tunnel up. A
+  local node reported bidirectional counters, and IPv4 ping and DNS traffic were reported through
+  the node.
+- A synthetic/unverifiable node was reported rejected after the harness was placed in pinned,
+  fail-closed attestation mode. A separate live alpha-node run was reported to accept an AMD
+  SEV-SNP attestation and carry traffic.
+- IPv6 was reported captured by the TUN and dropped while the IPv4-only engine was active, rather
+  than bypassing the VPN.
+- The status path was reported to move from connecting to up and then dead after the node was
+  killed, while the TUN continued to blackhole traffic.
+
+These notes predate the current release gate and do not establish multi-hop behavior, the current
+trust bundle, a current production deployment, or real-device behavior.
+
+## Current code-backed controls
+
+- `client/src-tauri/src/extension.rs` checks the supported connection profile before token-vault
+  mutation or Coordinator redemption. Debug-assertion builds retain the one-hop harness; non-debug
+  builds fail closed until native multi-hop exists.
+- The app-facing start contract contains the node endpoint, server name, pinned measurement,
+  transparency-log key, TEE name, and opaque grant/nonce. It exposes no user-selectable attestation
+  bypass and no per-connection persistent kill-switch flag. Because it does not yet contain the
+  complete TDX workload policy, both bridge and JNI reject TDX before engine startup; this harness
+  is SEV-SNP-only.
+- `prepareVpn` obtains Android VPN consent before the app invokes the native connection path. The
+  consent activity and `NilVpnService` are not exported. Any external test launcher must be a
+  separate debug-only harness, not a production manifest exception.
+- Auth material and passes share an encrypted, versioned vault. Android Keystore generates and
+  retains the non-exportable AES key used by the private Rust-to-native bridge. The app has no
+  plaintext fallback, and Android backup/device-transfer rules exclude the private data tree.
+- `nativeStatus` reports the engine state to the service/UI. This is implemented source behavior;
+  it still needs retained device evidence under failure and lifecycle conditions.
+
+## Leak and persistent-blocking model
+
+While the service is active, `NilVpnService` routes both `0.0.0.0/0` and `::/0` into the TUN. The
+current engine carries IPv4; captured IPv6 is intentionally dropped. A dead engine must leave the
+TUN in a blocking state rather than allowing clear-network fallback.
+
+Blocking traffic when the VPN process is not active is an Android system policy: the user enables
+**Always-on VPN** and **Block connections without VPN** in system VPN settings. The app can open
+those settings and explain the requirement, but it cannot silently enable that policy.
+
+## Source synchronization and build
+
+`crates/nil-android/android/*.kt` is the source of truth. The generated Gradle tree under
+`client/src-tauri/gen/android/` is ignored and may be regenerated. `client/src-tauri/build.rs`
+mirrors the Kotlin sources, applies the native Gradle integration, injects the manifest posture,
+and installs backup rules during Android builds.
+
+```sh
+rustup target add aarch64-linux-android
+export ANDROID_HOME=$HOME/Library/Android/sdk
+export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018
+export NDK_HOME=$ANDROID_NDK_HOME
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+cargo ndk -t arm64-v8a -t x86_64 -P 21 \
+  -o client/src-tauri/gen/android/app/src/main/jniLibs \
+  build -p nil-android --release
 ```
 
-## Build + verify
-```
-rustup target add aarch64-linux-android      # + the NDK; configure cargo linkers
-cargo build -p nil-android --target aarch64-linux-android --release   # libnil_android.so
-# re-sync android/*.kt into gen/ (above), then assemble the APK (Gradle), install on a device
-```
-On device:
-1. Grant the VPN consent prompt (`VpnConsentActivity`), connect.
-2. **No leak:** check a v4 AND a v6 "what's my IP" — both must show the node exit (or v6 must be
-   unreachable, i.e. blackholed), never the device's real address.
-3. **Tunnel-dead hold:** when the engine reports down, confirm traffic blackholes (routes still via
-   the TUN) rather than leaking; the app should transition to Disconnected.
-4. Record the result here, then drop the README's Android caveat.
+## Future acceptance record
 
-## Follow-up (not done here)
-A `nativeStatus` poll that keeps the TUN fd open on a dead tunnel (active blackhole) is a small
-Kotlin coroutine left for the on-device pass — it needs the SDK to compile/verify.
+Do not run this as a release-readiness checklist until native multi-hop is implemented and the
+non-debug refusal is intentionally removed through security review. Then retain the signed
+artifact hash, source revision, toolchain versions, sanitized logs, node deployment identity, and
+the result of every check below:
+
+1. A clean build rebuilds all native libraries from source and installs the signed APK/AAB.
+2. Before VPN consent is granted, connection preflight leaves the pass count unchanged and sends no
+   redemption request.
+3. The accepted connection uses the required multi-hop path and validates each required trust
+   input; malformed, synthetic, unpinned, or transparency-invalid evidence fails closed.
+4. IPv4, IPv6, and DNS tests show the intended exit or an intentional blackhole, never the device's
+   clear-network address.
+5. Killing the node and VPN process exercises both active-TUN blackholing and the documented
+   Android Always-on/Block-without-VPN posture.
+6. A real device covers Doze, reboot, Wi-Fi/mobile handoff, carrier MTU, notification/foreground
+   service behavior, and recovery with fresh single-use credentials.
+
+| Date | Commit/artifact | Device/Android | Multi-hop | Trust rejection | v4/v6/DNS | Dead tunnel | Lifecycle | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| _pending_ | | | | | | | | |

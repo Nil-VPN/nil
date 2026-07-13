@@ -55,7 +55,9 @@ fn security_txt_body(now: u64) -> String {
     body.push_str(&format!("Expires: {expires}\n"));
     // Only advertise the key when we actually serve one (no dead references).
     if pgp_key_path().is_some() {
-        body.push_str(&format!("Encryption: {base}/.well-known/nil-security.asc\n"));
+        body.push_str(&format!(
+            "Encryption: {base}/.well-known/nil-security.asc\n"
+        ));
     }
     body.push_str(&format!("Canonical: {base}/.well-known/security.txt\n"));
     body.push_str("Preferred-Languages: en\n");
@@ -73,9 +75,7 @@ async fn security_txt() -> impl IntoResponse {
 async fn pgp_key() -> impl IntoResponse {
     match pgp_key_path() {
         Some(path) => match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                ([(header::CONTENT_TYPE, "application/pgp-keys")], bytes).into_response()
-            }
+            Ok(bytes) => ([(header::CONTENT_TYPE, "application/pgp-keys")], bytes).into_response(),
             // Configured but unreadable → fail closed rather than serve nothing silently.
             Err(_) => (StatusCode::NOT_FOUND, "PGP key not available").into_response(),
         },
@@ -128,7 +128,10 @@ mod tests {
         // now = 1e9 → Expires must be strictly later, well-formed, and present with Contact/Canonical.
         let now = 1_000_000_000u64;
         let body = security_txt_body(now);
-        assert!(body.contains("Contact: mailto:security@nilvpn.net"), "default contact present");
+        assert!(
+            body.contains("Contact: mailto:security@nilvpn.net"),
+            "default contact present"
+        );
         assert!(body.contains("Canonical: https://nilvpn.net/.well-known/security.txt"));
         let expires_line = body
             .lines()
@@ -136,7 +139,10 @@ mod tests {
             .expect("Expires field is mandatory (RFC 9116)");
         let expires = expires_line.trim_start_matches("Expires: ");
         assert_eq!(expires, iso8601_utc(now + EXPIRES_WINDOW_SECS));
-        assert!(expires > iso8601_utc(now).as_str(), "Expires is in the future");
+        assert!(
+            expires > iso8601_utc(now).as_str(),
+            "Expires is in the future"
+        );
     }
 
     #[test]

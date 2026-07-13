@@ -25,8 +25,8 @@ pub fn verify(
     let report = AttestationReport::from_bytes(report_bytes)
         .map_err(|e| AttestError::Malformed(format!("SEV-SNP report decode: {e}")))?;
 
-    let vek = Certificate::from_der(vcek_der)
-        .map_err(|e| AttestError::Cert(format!("VCEK DER: {e}")))?;
+    let vek =
+        Certificate::from_der(vcek_der).map_err(|e| AttestError::Cert(format!("VCEK DER: {e}")))?;
 
     // The report doesn't cheaply self-describe its CPU generation, so try each built-in AMD
     // root in turn; the correct one verifies ARK→ASK→VCEK→report and the rest fail fast.
@@ -107,8 +107,13 @@ fn verifying_chain(vek: &Certificate, report: &AttestationReport) -> Result<Chai
     ];
     let mut last = String::from("no built-in AMD generation matched");
     for (name, ark, ask) in cas {
-        let (Ok(ark), Ok(ask)) = (ark, ask) else { continue };
-        let chain = Chain { ca: ca::Chain { ark, ask }, vek: vek.clone() };
+        let (Ok(ark), Ok(ask)) = (ark, ask) else {
+            continue;
+        };
+        let chain = Chain {
+            ca: ca::Chain { ark, ask },
+            vek: vek.clone(),
+        };
         match (&chain, report).verify() {
             Ok(()) => return Ok(chain),
             Err(e) => last = format!("{name}: {e}"),
@@ -162,7 +167,9 @@ mod tests {
         report.policy.set_migrate_ma_allowed(true);
         match appraise_report(&report, None) {
             Err(AttestError::PolicyViolation(_)) => {}
-            other => panic!("MIGRATE_MA-enabled guest policy must be a PolicyViolation, got {other:?}"),
+            other => {
+                panic!("MIGRATE_MA-enabled guest policy must be a PolicyViolation, got {other:?}")
+            }
         }
     }
 
@@ -172,9 +179,13 @@ mod tests {
         // current_tcb rolled back below committed_tcb: a superseded (vulnerable) patch level.
         report.committed_tcb = TcbVersion::new(None, 5, 0, 10, 20);
         report.current_tcb = TcbVersion::new(None, 5, 0, 10, 19);
-        let ev = appraise_report(&report, None).expect("a down-revved report still appraises (classified)");
+        let ev = appraise_report(&report, None)
+            .expect("a down-revved report still appraises (classified)");
         // Parity with TDX: surfaced as OutOfDate so `appraise` rejects it under default policy.
-        assert!(matches!(ev.tcb_status, TcbStatus::OutOfDate(_)), "down-revved TCB must be OutOfDate");
+        assert!(
+            matches!(ev.tcb_status, TcbStatus::OutOfDate(_)),
+            "down-revved TCB must be OutOfDate"
+        );
     }
 
     #[test]
@@ -182,7 +193,13 @@ mod tests {
         // Baseline microcode is 20; require 21. current_tcb is NOT below committed_tcb (no rollback),
         // so only the pinned floor catches it — exactly the fleet-wide-minimum case.
         let report = baseline_report();
-        let floor = SevSnpTcbFloor { fmc: None, bootloader: 5, tee: 0, snp: 10, microcode: 21 };
+        let floor = SevSnpTcbFloor {
+            fmc: None,
+            bootloader: 5,
+            tee: 0,
+            snp: 10,
+            microcode: 21,
+        };
         let ev = appraise_report(&report, Some(floor)).expect("still appraises (classified)");
         assert!(
             matches!(ev.tcb_status, TcbStatus::OutOfDate(_)),
@@ -194,7 +211,13 @@ mod tests {
     fn at_pinned_min_tcb_floor_is_uptodate() {
         // Floor exactly equals the baseline TCB — every component is met.
         let report = baseline_report();
-        let floor = SevSnpTcbFloor { fmc: None, bootloader: 5, tee: 0, snp: 10, microcode: 20 };
+        let floor = SevSnpTcbFloor {
+            fmc: None,
+            bootloader: 5,
+            tee: 0,
+            snp: 10,
+            microcode: 20,
+        };
         let ev = appraise_report(&report, Some(floor)).expect("at-floor report must appraise");
         assert_eq!(ev.tcb_status, TcbStatus::UpToDate);
     }
@@ -205,7 +228,13 @@ mod tests {
         // pass (bootloader 5 > 4 dominates), but a lagging microcode can be the one with the fix —
         // so the component-wise check must FAIL closed.
         let report = baseline_report();
-        let floor = SevSnpTcbFloor { fmc: None, bootloader: 4, tee: 0, snp: 10, microcode: 21 };
+        let floor = SevSnpTcbFloor {
+            fmc: None,
+            bootloader: 4,
+            tee: 0,
+            snp: 10,
+            microcode: 21,
+        };
         let ev = appraise_report(&report, Some(floor)).expect("still appraises (classified)");
         assert!(
             matches!(ev.tcb_status, TcbStatus::OutOfDate(_)),
@@ -218,7 +247,13 @@ mod tests {
         // A pre-Turin node reports no FMC (fmc = None → treated as 0); a floor requiring FMC >= 3
         // cannot be satisfied, so it must fail closed rather than silently pass.
         let report = baseline_report(); // fmc is None on the default report
-        let floor = SevSnpTcbFloor { fmc: Some(3), bootloader: 5, tee: 0, snp: 10, microcode: 20 };
+        let floor = SevSnpTcbFloor {
+            fmc: Some(3),
+            bootloader: 5,
+            tee: 0,
+            snp: 10,
+            microcode: 20,
+        };
         let ev = appraise_report(&report, Some(floor)).expect("still appraises (classified)");
         assert!(
             matches!(ev.tcb_status, TcbStatus::OutOfDate(_)),

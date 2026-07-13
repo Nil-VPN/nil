@@ -1,29 +1,86 @@
-//! Privacy Pass unlinkable blind tokens (architecture spec §7) — RFC 9474 blind RSA
+//! Privacy Pass blind bearer tokens (architecture spec §7) — RFC 9474 blind RSA
 //! signatures (RSABSSA-SHA384-PSS) under the RFC 9578 token model.
 //!
 //! Trust split (Pillar 4): the **issuer** (in `nil-portal`) holds the RSA *private* key and
 //! blind-signs; the **verifier** (in `nil-coordinator`) holds only the *public* key and checks
-//! redeemed tokens. The blinding makes redemption **unlinkable** to issuance — the issuer only
-//! ever sees a blinded message, never the token it is later asked to (cannot) link, and the
-//! verifier can check but not mint. The two never share the private key.
+//! redeemed tokens. Blinding prevents a direct cryptographic join from the issuer's blinded
+//! transcript to the later unblinded credential: the issuer never sees the message it signs, and
+//! the verifier can check but not mint. This does not remove timing, network, batch-size, payment,
+//! or small-population correlation; see `THREAT_MODEL.md`.
 //!
 //! Flow: client picks a random token message → `blind` → issuer `blind_sign` → client
 //! `finalize` (unblind) → presents `(msg, token)` to the verifier → `verify`. The Coordinator
 //! additionally keeps a spent-token nullifier set (no identity) to stop double-spends.
 
 use blind_rsa_signatures::{
-    BlindSignature, BlindingResult, DefaultRng, Error as RsaError, Signature,
-    KeyPairSha384PSSDeterministic as KeyPair, PublicKeySha384PSSDeterministic as PublicKey,
-    SecretKeySha384PSSDeterministic as SecretKey,
+    BlindMessage, BlindSignature, BlindingResult, DefaultRng, Error as RsaError,
+    KeyPairSha384PSSDeterministic as KeyPair, MessageRandomizer,
+    PublicKeySha384PSSDeterministic as PublicKey, Secret,
+    SecretKeySha384PSSDeterministic as SecretKey, Signature,
 };
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// RSA modulus size for the token key (RFC 9474 requires ≥ 2048).
 pub const TOKEN_MODULUS_BITS: usize = 2048;
+/// Versioned token-message prefix. The expiry is inside the blinded message, so the issuer never
+/// learns it but the Coordinator can enforce a bounded bearer lifetime at redemption.
+pub const V2_MAGIC: [u8; 4] = *b"NTV2";
+pub const V2_VALIDITY_SECS: u64 = 24 * 60 * 60;
+pub const V2_EPOCH_SECS: u64 = 60 * 60;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("blind-rsa error: {0}")]
     Rsa(String),
+}
+
+/// Create a v2 token message with a one-day coarse expiry and 20 bytes of fresh entropy.
+pub fn new_v2_message() -> Result<[u8; 32], TokenError> {
+    let mut messages = new_v2_message_batch(1)?;
+    messages
+        .pop()
+        .ok_or_else(|| TokenError::Rsa("token batch unexpectedly empty".to_string()))
+}
+
+/// Create a batch whose messages all use one expiry calculated from one clock read. This keeps an
+/// issuance batch in a single coarse anonymity cohort even if generation crosses an hourly
+/// boundary; every message still carries independent OS-generated entropy.
+pub fn new_v2_message_batch(count: usize) -> Result<Vec<[u8; 32]>, TokenError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| TokenError::Rsa(format!("clock: {e}")))?
+        .as_secs();
+    let expiry = ((now / V2_EPOCH_SECS) + (V2_VALIDITY_SECS / V2_EPOCH_SECS)) * V2_EPOCH_SECS;
+    let mut messages = Vec::new();
+    messages
+        .try_reserve_exact(count)
+        .map_err(|e| TokenError::Rsa(format!("token batch allocation: {e}")))?;
+    for _ in 0..count {
+        let mut msg = [0u8; 32];
+        msg[..4].copy_from_slice(&V2_MAGIC);
+        msg[4..12].copy_from_slice(&expiry.to_be_bytes());
+        getrandom::getrandom(&mut msg[12..])
+            .map_err(|e| TokenError::Rsa(format!("token entropy: {e}")))?;
+        messages.push(msg);
+    }
+    Ok(messages)
+}
+
+pub fn is_v2_message(msg: &[u8]) -> bool {
+    msg.len() == 32 && msg[..4] == V2_MAGIC
+}
+
+/// Validate a v2 expiry at redemption. A client may choose an expiry within the configured window,
+/// but cannot create a token valid arbitrarily far in the future.
+pub fn v2_message_is_current(msg: &[u8], now: u64) -> bool {
+    if !is_v2_message(msg) {
+        return false;
+    }
+    let Ok(expiry_bytes) = <[u8; 8]>::try_from(&msg[4..12]) else {
+        return false;
+    };
+    let expiry = u64::from_be_bytes(expiry_bytes);
+    expiry >= now && expiry <= now.saturating_add(V2_VALIDITY_SECS + V2_EPOCH_SECS)
 }
 
 fn map_rsa(e: RsaError) -> TokenError {
@@ -46,7 +103,9 @@ impl Issuer {
     pub fn from_secret_der(der: &[u8]) -> Result<Self, TokenError> {
         let sk = SecretKey::from_der(der).map_err(map_rsa)?;
         let pk = sk.public_key().map_err(map_rsa)?;
-        Ok(Self { kp: KeyPair { pk, sk } })
+        Ok(Self {
+            kp: KeyPair { pk, sk },
+        })
     }
 
     /// Export the private key (DER) — Portal-only; never leaves the issuer trust domain.
@@ -59,10 +118,15 @@ impl Issuer {
         self.kp.pk.to_der().map_err(map_rsa)
     }
 
-    /// Blind-sign a client's blinded token request. The issuer never sees the unblinded token,
-    /// so it cannot later link the redeemed token to this issuance.
+    /// Blind-sign a client's blinded token request. The issuer never sees the unblinded token, so
+    /// this transcript contains no direct cryptographic join key for a later redemption. External
+    /// timing/network observations remain outside this primitive's guarantee.
     pub fn blind_sign(&self, blind_msg: &[u8]) -> Result<Vec<u8>, TokenError> {
-        self.kp.sk.blind_sign(blind_msg).map(|s| s.0).map_err(map_rsa)
+        self.kp
+            .sk
+            .blind_sign(blind_msg)
+            .map(|s| s.0)
+            .map_err(map_rsa)
     }
 }
 
@@ -109,7 +173,9 @@ impl Verifier {
     /// A single-key verifier (epoch derived from the key).
     pub fn from_public_der(der: &[u8]) -> Result<Self, TokenError> {
         let key = PublicKey::from_der(der).map_err(map_rsa)?;
-        Ok(Self { keys: vec![(key_epoch(der), key)] })
+        Ok(Self {
+            keys: vec![(key_epoch(der), key)],
+        })
     }
 
     /// A multi-key verifier (rotation window): a token verifies if ANY held key accepts it. Each
@@ -117,11 +183,17 @@ impl Verifier {
     /// to the same epoch (same partition), so attribution and GC stay consistent.
     pub fn from_public_ders(ders: &[Vec<u8>]) -> Result<Self, TokenError> {
         if ders.is_empty() {
-            return Err(TokenError::Rsa("verifier needs at least one public key".into()));
+            return Err(TokenError::Rsa(
+                "verifier needs at least one public key".into(),
+            ));
         }
         let keys = ders
             .iter()
-            .map(|d| PublicKey::from_der(d).map(|k| (key_epoch(d), k)).map_err(map_rsa))
+            .map(|d| {
+                PublicKey::from_der(d)
+                    .map(|k| (key_epoch(d), k))
+                    .map_err(map_rsa)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self { keys })
     }
@@ -137,7 +209,10 @@ impl Verifier {
     /// verify can never re-enter the nullifier set). A token is signed by exactly one key.
     pub fn verify_with_epoch(&self, token_sig: &[u8], msg: &[u8]) -> Option<u32> {
         let sig = Signature(token_sig.to_vec());
-        self.keys.iter().find(|(_, pk)| pk.verify(&sig, None, msg).is_ok()).map(|(e, _)| *e)
+        self.keys
+            .iter()
+            .find(|(_, pk)| pk.verify(&sig, None, msg).is_ok())
+            .map(|(e, _)| *e)
     }
 
     /// The set of (key-derived) epochs this verifier currently accepts. The Coordinator unions this
@@ -162,15 +237,83 @@ pub struct TokenRequest {
     state: BlindingResult,
 }
 
+/// Serializable-equivalent client blinding state. Persistence policy belongs to the caller; every
+/// field is secret/bearer-adjacent and is eagerly scrubbed on drop.
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
+pub struct PersistedTokenRequest {
+    pub blind_msg: Vec<u8>,
+    pub msg: Vec<u8>,
+    pub secret: Vec<u8>,
+    pub msg_randomizer: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for PersistedTokenRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PersistedTokenRequest([REDACTED])")
+    }
+}
+
+impl TokenRequest {
+    pub fn export_persisted(&self) -> PersistedTokenRequest {
+        PersistedTokenRequest {
+            blind_msg: self.blind_msg.clone(),
+            msg: self.msg.clone(),
+            secret: self.state.secret.0.clone(),
+            msg_randomizer: self.state.msg_randomizer.map(|value| value.0),
+        }
+    }
+
+    pub fn from_persisted(persisted: &PersistedTokenRequest) -> Result<Self, TokenError> {
+        let modulus_bytes = TOKEN_MODULUS_BITS / 8;
+        if persisted.blind_msg.len() != modulus_bytes
+            || persisted.secret.len() != modulus_bytes
+            || persisted.msg.len() != 32
+        {
+            return Err(TokenError::Rsa(
+                "persisted token request has invalid field lengths".to_string(),
+            ));
+        }
+        Ok(Self {
+            blind_msg: persisted.blind_msg.clone(),
+            msg: persisted.msg.clone(),
+            state: BlindingResult {
+                blind_message: BlindMessage(persisted.blind_msg.clone()),
+                secret: Secret(persisted.secret.clone()),
+                msg_randomizer: persisted.msg_randomizer.map(MessageRandomizer),
+            },
+        })
+    }
+}
+
+impl Drop for TokenRequest {
+    fn drop(&mut self) {
+        self.blind_msg.zeroize();
+        self.msg.zeroize();
+        self.state.blind_message.0.zeroize();
+        self.state.secret.0.zeroize();
+        if let Some(randomizer) = self.state.msg_randomizer.as_mut() {
+            randomizer.0.zeroize();
+        }
+    }
+}
+
 /// Client: blind a fresh random token `msg` under the issuer's public key.
 pub fn blind(public_der: &[u8], msg: &[u8]) -> Result<TokenRequest, TokenError> {
     let pk = PublicKey::from_der(public_der).map_err(map_rsa)?;
     let result = pk.blind(&mut DefaultRng, msg).map_err(map_rsa)?;
-    Ok(TokenRequest { blind_msg: result.blind_message.0.clone(), msg: msg.to_vec(), state: result })
+    Ok(TokenRequest {
+        blind_msg: result.blind_message.0.clone(),
+        msg: msg.to_vec(),
+        state: result,
+    })
 }
 
 /// Client: unblind the issuer's blind signature into the final token signature.
-pub fn finalize(public_der: &[u8], req: &TokenRequest, blind_sig: &[u8]) -> Result<Vec<u8>, TokenError> {
+pub fn finalize(
+    public_der: &[u8],
+    req: &TokenRequest,
+    blind_sig: &[u8],
+) -> Result<Vec<u8>, TokenError> {
     let pk = PublicKey::from_der(public_der).map_err(map_rsa)?;
     let sig = pk
         .finalize(&BlindSignature(blind_sig.to_vec()), &req.state, &req.msg)
@@ -191,7 +334,10 @@ mod tests {
         // The PSK module already pulls an OS RNG transitively; use a simple counter+hash here
         // to avoid an extra dep — randomness only needs to differ per token for the test.
         use sha2::{Digest, Sha256};
-        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let h = Sha256::digest(seed.to_le_bytes());
         b.copy_from_slice(&h[..b.len().min(32)]);
     }
@@ -210,8 +356,36 @@ mod tests {
         // Verifier (public key only) accepts the redeemed token.
         let verifier = Verifier::from_public_der(&pub_der).unwrap();
         assert!(verifier.verify(&token, &msg), "issued token must verify");
-        assert!(!verifier.verify(&token, b"a different message"), "token must not verify for another msg");
-        assert!(!verifier.verify(&vec![0u8; token.len()], &msg), "a forged signature must not verify");
+        assert!(
+            !verifier.verify(&token, b"a different message"),
+            "token must not verify for another msg"
+        );
+        assert!(
+            !verifier.verify(&vec![0u8; token.len()], &msg),
+            "a forged signature must not verify"
+        );
+    }
+
+    #[test]
+    fn exported_blinding_state_reconstructs_the_exact_request() {
+        let issuer = Issuer::generate().unwrap();
+        let public = issuer.public_der().unwrap();
+        let msg = token_msg();
+        let original = blind(&public, &msg).unwrap();
+        let persisted = original.export_persisted();
+        let restored = TokenRequest::from_persisted(&persisted).unwrap();
+        assert_eq!(restored.blind_msg, original.blind_msg);
+        assert_eq!(restored.msg, original.msg);
+
+        let blind_signature = issuer.blind_sign(&original.blind_msg).unwrap();
+        assert_eq!(
+            finalize(&public, &original, &blind_signature).unwrap(),
+            finalize(&public, &restored, &blind_signature).unwrap()
+        );
+        assert_eq!(
+            format!("{persisted:?}"),
+            "PersistedTokenRequest([REDACTED])"
+        );
     }
 
     #[test]
@@ -225,13 +399,56 @@ mod tests {
         let req = blind(&pub_der, &msg).unwrap();
         let blind_sig = issuer.blind_sign(&req.blind_msg).unwrap();
         let token = finalize(&pub_der, &req, &blind_sig).unwrap();
-        assert_ne!(req.blind_msg, token, "the issuer's blinded view differs from the token");
-        assert_ne!(blind_sig, token, "the blind signature differs from the unblinded token");
+        assert_ne!(
+            req.blind_msg, token,
+            "the issuer's blinded view differs from the token"
+        );
+        assert_ne!(
+            blind_sig, token,
+            "the blind signature differs from the unblinded token"
+        );
     }
 
     #[test]
     fn verifier_cannot_be_built_from_a_bad_key() {
         assert!(Verifier::from_public_der(b"not a der key").is_err());
+    }
+
+    #[test]
+    fn v2_message_has_a_bounded_future_expiry() {
+        let msg = new_v2_message().expect("v2 message");
+        assert!(is_v2_message(&msg));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        assert!(v2_message_is_current(&msg, now));
+        assert!(!v2_message_is_current(
+            &msg,
+            now + V2_VALIDITY_SECS + V2_EPOCH_SECS + 1
+        ));
+    }
+
+    #[test]
+    fn v2_batch_shares_one_coarse_expiry_and_has_fresh_entropy() {
+        let messages = new_v2_message_batch(8).expect("v2 batch");
+        assert_eq!(messages.len(), 8);
+        let expiry = &messages[0][4..12];
+        assert!(messages.iter().all(|message| &message[4..12] == expiry));
+        for (index, message) in messages.iter().enumerate() {
+            assert!(is_v2_message(message));
+            assert!(messages[index + 1..]
+                .iter()
+                .all(|other| other[12..] != message[12..]));
+        }
+    }
+
+    #[test]
+    fn v2_message_rejects_far_future_expiry() {
+        let mut msg = [0u8; 32];
+        msg[..4].copy_from_slice(&V2_MAGIC);
+        msg[4..12].copy_from_slice(&(u64::MAX - 1).to_be_bytes());
+        assert!(!v2_message_is_current(&msg, 1));
     }
 
     #[test]
@@ -250,11 +467,17 @@ mod tests {
         // The verifier holding BOTH keys still accepts it (zero-downtime rotation).
         let rotating = Verifier::from_public_ders(&[old_pk.clone(), new_pk.clone()]).unwrap();
         assert_eq!(rotating.key_count(), 2);
-        assert!(rotating.verify(&token, &msg), "old-key token must verify during the rotation window");
+        assert!(
+            rotating.verify(&token, &msg),
+            "old-key token must verify during the rotation window"
+        );
 
         // Once the old key is retired (verifier holds only the new key), the old token is refused.
         let new_only = Verifier::from_public_ders(&[new_pk]).unwrap();
-        assert!(!new_only.verify(&token, &msg), "after rotation completes, old-key tokens are refused");
+        assert!(
+            !new_only.verify(&token, &msg),
+            "after rotation completes, old-key tokens are refused"
+        );
     }
 
     #[test]
@@ -267,7 +490,10 @@ mod tests {
         let ea = key_epoch(&a_pk);
         let eb = key_epoch(&b_pk);
         assert_ne!(ea, eb, "distinct keys derive distinct epochs");
-        assert_ne!(ea, LEGACY_EPOCH, "a derived epoch is never the reserved legacy 0");
+        assert_ne!(
+            ea, LEGACY_EPOCH,
+            "a derived epoch is never the reserved legacy 0"
+        );
 
         let msg = token_msg();
         let req = blind(&a_pk, &msg).unwrap();
@@ -290,7 +516,11 @@ mod tests {
 
         // The epoch is STABLE per key: re-adding the SAME key (cannot be "renumbered") yields the
         // same partition, so its live nullifiers are never dropped while the key is held.
-        assert_eq!(key_epoch(&a_pk), ea, "key_epoch is a stable function of the key");
+        assert_eq!(
+            key_epoch(&a_pk),
+            ea,
+            "key_epoch is a stable function of the key"
+        );
         let re_added = Verifier::from_public_der(&a_pk).unwrap();
         assert_eq!(re_added.verify_with_epoch(&token, &msg), Some(ea));
     }

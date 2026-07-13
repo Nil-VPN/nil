@@ -142,8 +142,8 @@ mod tests {
         let mut pkt = vec![
             0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, // IP hdr
             10, 0, 0, 2, 1, 1, 1, 1, // src 10.0.0.2, dst 1.1.1.1
-            0xd4, 0x31, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0x00, 0x00, 0x00,
-            0x00,
+            0xd4, 0x31, 0x01, 0xbb, 0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x02, 0xff, 0xff, 0x00, 0x00,
+            0x00, 0x00,
         ];
         fix_ipv4_checksums(&mut pkt);
         // IP header checksum must now verify (full-header sum == 0).
@@ -205,6 +205,10 @@ mod tests {
             1, 1, 1, 0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00,
         ];
         fix_l4_checksums(&mut v4);
-        assert_eq!(ones_complement(&v4[..20], 0), 0, "IPv4 header checksum verifies");
+        assert_eq!(
+            ones_complement(&v4[..20], 0),
+            0,
+            "IPv4 header checksum verifies"
+        );
     }
 }

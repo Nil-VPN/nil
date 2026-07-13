@@ -173,7 +173,9 @@ pub fn decode_datagram(buf: &[u8]) -> Result<(u64, DatagramPayload<'_>)> {
     match ctx {
         CONTEXT_ID_IP_PACKET => Ok((flow_id, DatagramPayload::Ip(payload))),
         CONTEXT_ID_PADDING => Ok((flow_id, DatagramPayload::Padding)),
-        other => Err(Error::InvalidPacket(format!("unsupported context id {other}"))),
+        other => Err(Error::InvalidPacket(format!(
+            "unsupported context id {other}"
+        ))),
     }
 }
 
@@ -300,7 +302,10 @@ mod tests {
         }
         // A real IP datagram is NOT mistaken for padding.
         let ip = encode_datagram(7, b"\x45\x00 real");
-        assert!(matches!(decode_datagram(&ip).unwrap().1, DatagramPayload::Ip(_)));
+        assert!(matches!(
+            decode_datagram(&ip).unwrap().1,
+            DatagramPayload::Ip(_)
+        ));
     }
 
     #[test]
