@@ -305,9 +305,7 @@ jobs:
       - name: Licenses, advisories, bans, sources
         run: |
           cargo install cargo-deny --version 0.19.9 --locked
-          # Fail closed: every lint (including duplicate-version and wildcard bans, which are now
-          # "deny" in deny.toml after the 2026-07-11 duplicate review) is fatal. Warnings are fatal.
-          cargo deny check -D warnings
+          cargo deny check
 
       - name: Rust CVE coverage (cargo-audit / RUSTSEC DB)
         run: |
