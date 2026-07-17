@@ -814,11 +814,19 @@ fn authorize_connect(
     let Some(verifier) = cfg.grant_verifier.as_ref() else {
         #[cfg(debug_assertions)]
         {
+            // Dev/non-strict bypass: on a private, host-isolated bridge with synthetic attestation
+            // and a single pinned measurement (the deploy/ verify-*.sh harnesses), accept ungranted
+            // CONNECT-IP for every role so the host-safe data-plane harnesses can exercise the full
+            // nested onion without a Coordinator. Production posture stays locked: this branch is
+            // compiled out under `hw-attest`/release (debug_assertions == false), and `config.rs`
+            // refuses NW_ALLOW_UNGRANTED outright in strict mode, so a real node can never serve an
+            // ungranted intermediate hop. The attestation nonce is still required (below), so the
+            // client must still pin the node's measurement and the node must still attest.
             if cfg.allow_ungranted {
-                if cfg.role != crate::config::NodeRole::Exit {
-                    return Err("ungranted intermediate has no exact next-hop policy");
-                }
-                tracing::warn!("accepting grantless CONNECT-IP in development mode");
+                tracing::warn!(
+                    role = ?cfg.role,
+                    "accepting grantless CONNECT-IP in development mode (strict/prod posture refuses)"
+                );
                 return Ok(PacketPolicy::Exit);
             }
         }

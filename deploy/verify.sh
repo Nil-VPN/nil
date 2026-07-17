@@ -16,7 +16,10 @@ echo; echo "==> baseline egress IP (client, NO tunnel)"
 echo "  $(docker compose exec -T client curl -s --max-time 8 https://ifconfig.me 2>/dev/null || echo '(failed)')"
 
 echo; echo "==> starting the tunnel (nil-cli) in the client"
-docker compose exec -d client sh -c 'nil-cli > /tmp/cli.log 2>&1'
+# Pin the node's synthetic measurement (matches NW_NODE_MEASUREMENT in compose.yaml) so the client
+# brings up the attested MASQUE tunnel instead of refusing "no pinned measurement".
+M="000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f"
+docker compose exec -e NW_EXPECTED_MEASUREMENT="$M" -e NW_EXPECTED_TEE=sev-snp -d client sh -c 'nil-cli > /tmp/cli.log 2>&1'
 
 echo "==> waiting for 'tunnel up' (max 15s)"
 up=0
