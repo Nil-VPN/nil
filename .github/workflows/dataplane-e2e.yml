@@ -1,14 +1,17 @@
 name: dataplane-e2e
 
-# Full-stack data-plane e2e: brings up the Dockerized Portal + Coordinator + entry/middle/exit
-# nodes + client (synthetic-attest), then proves the whole pipeline — token issue → redeem
-# (200 then 409 single-use) → 3-hop attested MASQUE onion → real egress. The synthetic RA-TLS
-# report stands in for real TEE hardware (the nil-attest KATs cover the genuine vendor chains).
-# Heavy (full image build), so it runs on main pushes + nightly + on demand, NOT on every PR —
-# release-attest.yml (tags) and reproducibility.yml stay the other native gates.
+# Full-stack Dockerized data-plane end-to-end gates. Each job checks out the repo, builds the
+# harness images (deploy/Dockerfile* → gated on the `synthetic-attest,dev-trace,dev-fallbacks`
+# features, so the synthetic RA-TLS report stands in for real TEE hardware — the nil-attest KATs
+# cover the genuine vendor-root chains), brings the Compose topology up, runs the verify-*.sh
+# harness, and asserts the harness exits zero (every script prints "RESULT: … PASSED ✅" and
+# `exit "$fail"`). The harnesses run on every push and PR so a data-plane regression is caught
+# before merge, plus nightly and on demand. release-attest.yml (tags) and reproducibility.yml
+# stay the other native gates.
 on:
   push:
     branches: [main]
+  pull_request:
   schedule:
     - cron: "41 6 * * *"   # nightly ~06:41 UTC
   workflow_dispatch:
@@ -22,16 +25,74 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e:
+  # Phase 1 single-hop: traffic flows through the MASQUE tunnel and the kill-switch blocks
+  # fail-closed when the node stops (deploy/verify.sh, compose.yaml).
+  single-hop:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: token -> redeem(200/409) -> 3-hop attested onion -> egress
+      - name: single-hop MASQUE tunnel + fail-closed kill-switch
+        run: bash deploy/verify.sh
+
+  # Phase 3 trust-split multi-hop: three nested attested MASQUE tunnels (entry → middle → exit),
+  # per-node visibility asserted, and a rogue middle refused fail-closed (deploy/verify-trustsplit.sh,
+  # compose.trustsplit.yaml).
+  trust-split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: trust-split 3-hop onion + per-hop attestation (rogue middle rejected)
+        run: bash deploy/verify-trustsplit.sh
+
+  # Phase 2 nested PQ-WireGuard over MASQUE: the node attests AND runs the PQ-WireGuard responder;
+  # real traffic flows IP → PQ-WG → MASQUE → PQ-WG → IP → NAT → internet
+  # (deploy/verify-nested.sh, compose.yaml + compose.pqwg.yaml).
+  nested-pqwg:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: nested PQ-WireGuard-over-MASQUE attestation datapath
+        run: bash deploy/verify-nested.sh
+
+  # Cascade rung 3 fallback: with the MASQUE rung blocked (UDP 443 dropped) the client steps down
+  # to the wstunnel rung (WireGuard over WebSocket-over-TLS) and still carries traffic
+  # (deploy/verify-wstunnel.sh, compose.wstunnel.yaml).
+  wstunnel-fallback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: wstunnel failover fallback carries traffic
+        run: bash deploy/verify-wstunnel.sh
+
+  # All-PQ trust-split: every hop is a PQ-WireGuard responder — proves a 2-hop all-PQ onion carries
+  # traffic with trust-split intact, and asserts the 3-hop all-PQ path fails closed on the MTU floor
+  # (deploy/verify-trustsplit-pq.sh, compose.trustsplit.yaml + compose.trustsplit-pq.yaml).
+  trust-split-pq:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: all-PQ trust-split (2-hop live; 3-hop fails closed on MTU)
+        run: bash deploy/verify-trustsplit-pq.sh
+
+  # Full-stack control + data plane: token issue → redeem (200 then exact-retry) → coordinator-granted
+  # 3-hop attested MASQUE onion → real egress, plus the client-side measurement-pin cross-check
+  # (deploy/verify-e2e.sh, compose.e2e.yaml).
+  full-stack-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: token -> redeem(200/exact-retry) -> 3-hop attested onion -> egress
         run: bash deploy/verify-e2e.sh
 
-  # ADR-0005 concurrency proof: one node, three concurrent clients, each assigned a unique inner
-  # IP (ADDRESS_ASSIGN) with replies routed by inner destination IP — no collision, no cross-talk.
+  # ADR-0005 concurrency proof: one node, three concurrent clients, each assigned a unique inner IP
+  # with replies routed by inner destination IP — no collision, no cross-talk
+  # (deploy/verify-multiclient.sh, compose.multiclient.yaml).
   multiclient:
     runs-on: ubuntu-latest
     timeout-minutes: 40
