@@ -309,7 +309,10 @@ jobs:
 
       - name: Rust CVE coverage (cargo-audit / RUSTSEC DB)
         run: |
-          cargo install cargo-audit --version 0.21.1 --locked
+          # 0.22.x is required: the RustSec advisory DB now ships CVSS v4.0 vectors
+          # (e.g. RUSTSEC-2026-0041), which cargo-audit < 0.22 cannot parse and would
+          # hard-fail the whole job before it ever reaches our dependency graph.
+          cargo install cargo-audit --version 0.22.2 --locked
           # `cargo audit` consults the RustSec advisory database independently of cargo-deny's
           # embedded feed, and flags known-vulnerable crate versions. The ignored IDs in deny.toml
           # (RUSTSEC-2023-0071, RUSTSEC-2026-0194/0195) are documented, unreachable-in-prod debt; we
