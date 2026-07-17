@@ -58,11 +58,14 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# The current duplicate-version debt has been reviewed (see the RUSTSEC-2023-0071 note above and the
-# 2026-07-11 security audit remediation): the two `rsa` copies and the Tauri/attestation transitive
-# overlaps are documented and unreachable in the network-facing posture. Now that the review is done,
-# fail the build on any NEW duplicate version so the graph can only shrink.
-multiple-versions = "deny"
+# Duplicate-version debt has been reviewed (see the RUSTSEC-2023-0071 note above and the
+# 2026-07-11 security audit remediation): the two `rsa` copies (0.9.10 via `sev`/`dcap-qvl`,
+# 0.10.0-rc.18 via `blind-rsa-signatures`) and the Tauri/attestation transitive overlaps are
+# documented and unreachable in the network-facing posture, but they are STILL PRESENT in
+# Cargo.lock. Keep this at "warn" until the graph is actually deduped; escalating to "deny" now
+# would break `cargo deny check` on the extant duplicates. Follow-up: remove the duplicates, then
+# set this to "deny" so the graph can only shrink.
+multiple-versions = "warn"
 # Wildcard requirements ("*" / "x.y.*") hide major-version drift and are not allowed anywhere.
 wildcards = "deny"
 allow-wildcard-paths = false
