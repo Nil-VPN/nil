@@ -75,4 +75,5 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Replacing crates.io with a non-registry mirror (e.g. a git source or a filesystem path) would
 # silently redirect dependency resolution off the audited index. Deny any `source.replace` that does
 # not resolve to the allowed crates.io registry URL so the supply chain can't be re-pointed out of band.
-allow-org = false
+# No VCS organizations are allow-listed (allow-org is empty), so any org-sourced git crate is denied
+# by `unknown-git = "deny"` above.
