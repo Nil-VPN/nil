@@ -49,12 +49,14 @@ jobs:
         run: pnpm --dir client build
 
       - name: Build Tauri client (Linux)
+        env:
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
         run: pnpm --dir client tauri build
 
       - name: Client npm SBOM (CycloneDX)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-linux-sbom.cdx.json
           upload-artifact: false
@@ -97,13 +99,18 @@ jobs:
       - name: Build frontend (tsc + vite)
         run: pnpm --dir client build
 
+      - name: Add universal Apple Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
       - name: Build Tauri client (macOS)
-        run: pnpm --dir client tauri build
+        env:
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
+        run: pnpm --dir client tauri build --target universal-apple-darwin
 
       - name: Client npm SBOM (CycloneDX)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-macos-sbom.cdx.json
           upload-artifact: false
@@ -146,12 +153,14 @@ jobs:
         run: pnpm --dir client build
 
       - name: Build Tauri client (Windows)
+        env:
+          NIL_TRUST_BUNDLE_JSON: ${{ vars.NIL_TRUST_BUNDLE_JSON }}
         run: pnpm --dir client tauri build
 
       - name: Client npm SBOM (CycloneDX)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-windows-sbom.cdx.json
           upload-artifact: false
