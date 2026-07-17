@@ -6,7 +6,7 @@
 //! Coordinator configured, release builds refuse to connect. Debug builds retain an explicitly
 //! labelled in-memory loopback seam for local integration only.
 
-// `pub` so the headless e2e harness (src/bin/nil-client-e2e.rs) can drive the EXACT same
+// `pub` so the headless e2e harness (examples/nil-client-e2e.rs) can drive the EXACT same
 // account → token → engine path the Tauri commands use (no GUI), closing the "test the engine,
 // not just nil-cli" gap.
 pub mod account;
@@ -119,7 +119,7 @@ use tokenstore::TokenStore;
 /// Derive the cacheable auth material (account number + Ed25519 auth seed) from a recovery phrase,
 /// so the background batch refiller can authenticate while subscribed WITHOUT re-entering the
 /// phrase. We cache the derived seed, never the phrase itself. Used on create + recover ("login").
-/// `pub` so the headless e2e harness (`bin/nil-client-e2e.rs`) derives auth material the SAME way.
+/// `pub` so the headless e2e harness (`examples/nil-client-e2e.rs`) derives auth material the SAME way.
 pub fn derive_auth_material(phrase: &[String]) -> Result<AccountAuthMaterial, String> {
     let parsed = nil_crypto::account::Phrase::parse(phrase).map_err(|e| e.to_string())?;
     let account_number =

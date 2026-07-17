@@ -60,10 +60,10 @@ jobs:
           export NIL_TRUST_BUNDLE_JSON
           pnpm --dir client tauri build
 
-      - name: Client npm SBOM (CycloneDX)
+      - name: Client SBOM (CycloneDX, npm + Rust)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-linux-sbom.cdx.json
           upload-artifact: false
@@ -73,9 +73,9 @@ jobs:
         with:
           name: nil-client-linux
           path: |
-            client/src-tauri/target/release/bundle/deb/*.deb
-            client/src-tauri/target/release/bundle/rpm/*.rpm
-            client/src-tauri/target/release/bundle/appimage/*.AppImage
+            target/release/bundle/deb/*.deb
+            target/release/bundle/rpm/*.rpm
+            target/release/bundle/appimage/*.AppImage
           if-no-files-found: error
 
       - name: Upload Linux SBOM
@@ -119,10 +119,10 @@ jobs:
           export NIL_TRUST_BUNDLE_JSON
           pnpm --dir client tauri build --target universal-apple-darwin
 
-      - name: Client npm SBOM (CycloneDX)
+      - name: Client SBOM (CycloneDX, npm + Rust)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-macos-sbom.cdx.json
           upload-artifact: false
@@ -132,8 +132,8 @@ jobs:
         with:
           name: nil-client-macos
           path: |
-            client/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app
-            client/src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            target/universal-apple-darwin/release/bundle/macos/*.app
+            target/universal-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
       - name: Upload macOS SBOM
@@ -185,10 +185,10 @@ jobs:
           export NIL_TRUST_BUNDLE_JSON
           pnpm --dir client tauri build
 
-      - name: Client npm SBOM (CycloneDX)
+      - name: Client SBOM (CycloneDX, npm + Rust)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6
         with:
-          path: client
+          path: .
           format: cyclonedx-json
           output-file: client-windows-sbom.cdx.json
           upload-artifact: false
@@ -198,8 +198,8 @@ jobs:
         with:
           name: nil-client-windows
           path: |
-            client/src-tauri/target/release/bundle/msi/*.msi
-            client/src-tauri/target/release/bundle/nsis/*.exe
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
       - name: Upload Windows SBOM

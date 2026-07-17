@@ -32,7 +32,7 @@ EGRESS_URL="${NW_E2E_EGRESS_URL:-https://api.ipify.org}"
 # Optimized local-integration profile: release-like performance with debug assertions, which keep
 # the explicitly labelled loopback/direct E2E paths available. A true release client compiles those
 # paths out and must never be used for the local subscription leg below.
-BIN="$ROOT/target/e2e/nil-client-e2e"
+BIN="$ROOT/target/e2e/examples/nil-client-e2e"
 PORTAL_BIN="$ROOT/target/e2e/nil-portal"
 
 # Subscription e2e mode (NW_SUBSCRIBE=1): exercise subscribe -> activate -> batch prefetch
@@ -41,7 +41,7 @@ PORTAL_BIN="$ROOT/target/e2e/nil-portal"
 # node, NO comp-id. Proves the subscription path on macOS with one command, fully headless.
 if [ "${NW_SUBSCRIBE:-0}" = "1" ]; then
   echo "== NIL macOS subscription e2e (local mock-paid portal, loopback connect) =="
-  ( cd "$ROOT" && cargo build --profile e2e --bin nil-client-e2e --bin nil-portal ) || { echo "FAIL: build"; exit 1; }
+  ( cd "$ROOT" && cargo build --profile e2e --example nil-client-e2e --bin nil-portal ) || { echo "FAIL: build"; exit 1; }
   SUB_PORT="${NW_SUB_PORT:-8088}"
   NW_ALLOW_DEV_FALLBACKS=1 NW_MOCK_PAID_ALL=1 \
     NW_PORTAL_ADDR="127.0.0.1:$SUB_PORT" RUST_LOG=warn "$PORTAL_BIN" \
@@ -91,7 +91,7 @@ fi
 # only to deliberately test an already-built binary.
 if [ "${NW_E2E_NO_REBUILD:-0}" != "1" ] || [ ! -x "$BIN" ]; then
   echo "building nil-client-e2e (optimized e2e profile) from the current checkout…"
-  ( cd "$ROOT" && cargo build --profile e2e --bin nil-client-e2e ) \
+  ( cd "$ROOT" && cargo build --profile e2e --example nil-client-e2e ) \
     || { echo "FAIL: cargo build"; exit 1; }
 fi
 
