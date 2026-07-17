@@ -5,7 +5,7 @@ name: ci
 # first cargo invocation, so the gate uses the exact compiler the project builds with.
 on:
   push:
-    branches: [main]
+    branches: ["**"]
   pull_request:
   workflow_call:
 
@@ -305,10 +305,25 @@ jobs:
       - name: Licenses, advisories, bans, sources
         run: |
           cargo install cargo-deny --version 0.19.9 --locked
-          # Warnings are fatal. Duplicate transitive versions are the one explicitly reviewed
-          # debt class; allowing that lint removes warning-only behavior without pretending the
-          # current Tauri/attestation graph can be collapsed locally.
-          cargo deny check -D warnings -A duplicate
+          # Fail closed: every lint (including duplicate-version and wildcard bans, which are now
+          # "deny" in deny.toml after the 2026-07-11 duplicate review) is fatal. Warnings are fatal.
+          cargo deny check -D warnings
+
+      - name: Rust CVE coverage (cargo-audit / RUSTSEC DB)
+        run: |
+          cargo install cargo-audit --version 0.21.1 --locked
+          # `cargo audit` consults the RustSec advisory database independently of cargo-deny's
+          # embedded feed, and flags known-vulnerable crate versions. The ignored IDs in deny.toml
+          # (RUSTSEC-2023-0071, RUSTSEC-2026-0194/0195) are documented, unreachable-in-prod debt; we
+          # honor the same review here so the two gates stay consistent instead of diverging.
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2023-0071 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
+
+      - name: Source-replacement supply-chain guard
+        run: |
+          bash deploy/verify-no-source-replace.sh
 
       - name: Workspace SBOM (CycloneDX; Rust and lockfile-discovered packages)
         uses: anchore/sbom-action@9246b90769f852b3a8921f330c59e0b3f439d6e9 # v0.20.6

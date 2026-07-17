@@ -58,12 +58,21 @@ allow = [
 confidence-threshold = 0.8
 
 [bans]
-# Warn (don't fail) on duplicate versions during early development; tighten later.
-multiple-versions = "warn"
-wildcards = "warn"
-allow-wildcard-paths = true
+# The current duplicate-version debt has been reviewed (see the RUSTSEC-2023-0071 note above and the
+# 2026-07-11 security audit remediation): the two `rsa` copies and the Tauri/attestation transitive
+# overlaps are documented and unreachable in the network-facing posture. Now that the review is done,
+# fail the build on any NEW duplicate version so the graph can only shrink.
+multiple-versions = "deny"
+# Wildcard requirements ("*" / "x.y.*") hide major-version drift and are not allowed anywhere.
+wildcards = "deny"
+allow-wildcard-paths = false
 
 [sources]
+# Only crates.io is an allowed source. Any other registry or git source is denied.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# Replacing crates.io with a non-registry mirror (e.g. a git source or a filesystem path) would
+# silently redirect dependency resolution off the audited index. Deny any `source.replace` that does
+# not resolve to the allowed crates.io registry URL so the supply chain can't be re-pointed out of band.
+allow-org = false
