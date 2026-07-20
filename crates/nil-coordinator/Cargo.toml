@@ -27,7 +27,7 @@ async-trait = { workspace = true }  # the swappable NullifierStore trait
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
-aes-gcm = { version = "0.10", features = ["zeroize"] }
+aes-gcm = { version = "0.11", features = ["zeroize"] }
 # Clustered redemption ledger (PgNullifierStore), behind the `postgres` feature.
 tokio-postgres = { workspace = true, optional = true }
 
