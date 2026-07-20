@@ -62,7 +62,7 @@ sha2 = { workspace = true }
 libc = { workspace = true }
 # The vault ciphertext is file-backed, while its 256-bit key lives in the OS credential service.
 # AES-GCM authenticates both ciphertext and the fixed vault domain/version AAD.
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 # Non-synchronizable, ThisDeviceOnly master key. The encrypted vault itself stays in app-local data.
