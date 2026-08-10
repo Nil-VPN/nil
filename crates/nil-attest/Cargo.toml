@@ -18,7 +18,7 @@ subtle = { workspace = true }                   # constant-time measurement/nonc
 thiserror = { workspace = true }
 # Synthetic attestation signer/verifier (Ed25519) — only compiled with the `synthetic`
 # feature; the node enables it for the Docker harness, never a release client.
-ed25519-dalek = { version = "2", optional = true }
+ed25519-dalek = { version = "3", optional = true }
 
 [features]
 # Test-only synthetic attestation: a report signed by an Ed25519 CA we control, so the Docker
@@ -31,7 +31,7 @@ hex = "0.4"
 data-encoding = { workspace = true }            # BASE64 for building synthetic transparency checkpoints
 serde_json = { workspace = true }
 chrono = "0.4"
-x509-cert = "0.2"
-der = "0.7"
+x509-cert = "0.3"
+der = "0.8"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { workspace = true }
