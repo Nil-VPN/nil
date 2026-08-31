@@ -34,23 +34,23 @@ rust-version = "1.77"
 [workspace.dependencies]
 # --- Active in Phase 0 ---
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
+axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 libc = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tower-http = { version = "0.5", features = ["trace"] }
+tower-http = { version = "0.6", features = ["trace"] }
 
 # Crypto (nil-crypto, Phase 0 account derivation)
 bip39 = "2"
-sha2 = "0.10"
-hmac = "0.12"                  # HMAC-SHA256 for the card (MoR) webhook signature (nil-portal)
-hkdf = "0.12"
-ed25519-dalek = { version = "2", features = ["zeroize"] }
+sha2 = "0.11"
+hmac = "0.13"                  # HMAC-SHA256 for the card (MoR) webhook signature (nil-portal)
+hkdf = "0.13"
+ed25519-dalek = { version = "3", features = ["zeroize"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
@@ -61,17 +61,17 @@ data-encoding = "2"            # Crockford base32 for account numbers / recovery
 # `Config::with_boring_ssl_ctx_builder`, which the client uses to shape the outer TLS ClientHello
 # toward a real browser fingerprint (PQ X25519MLKEM768 key share + TLS GREASE). Same BoringSSL,
 # sourced via the `boring` crate so the SslContextBuilder type matches.
-quiche     = { version = "0.22", default-features = false, features = ["boringssl-boring-crate"] }
+quiche     = { version = "0.29", default-features = false, features = ["boringssl-boring-crate"] }
 boring     = { version = "4", features = ["pq-experimental"] }  # BoringSSL ctx + X25519MLKEM768 for outer-ClientHello shaping
 tun-rs     = { version = "2", features = ["async_tokio"] }  # TUN device (Linux/macOS)
-rcgen      = "0.13"                    # self-signed dev TLS cert for nil-node (Phase 1)
+rcgen      = "0.14"                    # self-signed dev TLS cert for nil-node (Phase 1)
 tokio-util = { version = "0.7", features = ["rt"] }          # CancellationToken for pumps
-getrandom  = "0.2"                     # QUIC source connection IDs
+getrandom  = "0.4"                     # QUIC source connection IDs
 
 # --- Phase 2: TEE attestation (nil-attest) — pure-Rust, no extra system libs ---
-sev         = { version = "7", default-features = false, features = ["snp", "crypto_nossl"] }  # SEV-SNP report + AMD ARK/ASK chain (builtin roots, offline, pure-Rust)
+sev         = { version = "8", default-features = false, features = ["snp", "crypto_nossl"] }  # SEV-SNP report + AMD ARK/ASK chain (builtin roots, offline, pure-Rust)
 dcap-qvl    = { version = "0.5", default-features = false, features = ["std", "rustcrypto", "default-x509"] }  # Intel TDX DCAP quote verify (pure-Rust, no ring, offline)
-x509-parser = "0.16"                   # parse the RA-TLS leaf cert + custom report extension
+x509-parser = "0.18"                   # parse the RA-TLS leaf cert + custom report extension
 
 # --- Phase 2: PQ hybrid PSK (nil-crypto) — pure-Rust KEMs ---
 ml-kem = "0.3"                         # ML-KEM-1024 (FIPS 203), forward secrecy half
@@ -85,7 +85,7 @@ blind-rsa-signatures = "0.17"          # RFC 9474 blind RSA signatures (issuer p
 # quinn = "0.11"                       # prototyping alt QUIC
 
 # --- Phase 4: wstunnel cascade rung (WireGuard over WebSocket-over-TLS) ---
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }  # WebSocket client/server
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }  # WebSocket client/server
 tokio-rustls = "0.26"                  # TLS for the WS envelope (rustls, the project standard)
 rustls = "0.23"                        # custom no-verify config (security is the inner WireGuard)
 futures-util = "0.3"                   # split the WebSocket stream for the bidirectional pump
