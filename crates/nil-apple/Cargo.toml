@@ -20,4 +20,4 @@ tracing = { workspace = true }
 getrandom = { workspace = true }   # per-connection attestation freshness nonce
 
 [build-dependencies]
-cbindgen = "0.27"
+cbindgen = "0.29"
