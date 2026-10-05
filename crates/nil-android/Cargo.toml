@@ -19,5 +19,5 @@ nil-datapath = { workspace = true }                            # Tunnel::up_with
 tokio = { workspace = true }
 anyhow = { workspace = true }
 log = "0.4"
-jni = "0.21"
-android_logger = "0.14"
+jni = "0.22"
+android_logger = "0.15"
