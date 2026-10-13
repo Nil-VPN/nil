@@ -24,8 +24,8 @@ blind-rsa-signatures = { workspace = true }
 # Account auth key (ADR-0007): an Ed25519 keypair derived from the account secret. The client
 # signs a Portal challenge; the Portal stores only the public half. `zeroize` clears the signing
 # key on drop. Same major version already used by `nil-attest`.
-ed25519-dalek = { version = "2", features = ["zeroize"] }
+ed25519-dalek = { version = "3", features = ["zeroize"] }
 
 [dev-dependencies]
-rand_chacha = "0.3"
+rand_chacha = "0.9"
 hex = "0.4"
